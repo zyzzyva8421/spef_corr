@@ -307,29 +307,33 @@ def _aggregate(values: List[float], mode: str) -> Optional[float]:
 
 def compare_spef(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison]]:
     common_nets = sorted(set(s1.nets.keys()) & set(s2.nets.keys()))
-
+    print("common_nets are sorted")
     cap_rows: List[CapComparison] = []
     res_rows: List[ResComparison] = []
-
+ 
     for net_name in common_nets:
         n1 = s1.nets[net_name]
         n2 = s2.nets[net_name]
         cap_rows.append(CapComparison(net=net_name, c1=n1.total_cap, c2=n2.total_cap))
-
+ 
         dr1 = n1.driver_sink_resistances()
         dr2 = n2.driver_sink_resistances()
         common_sinks = sorted(set(dr1.keys()) & set(dr2.keys()))
         if not common_sinks:
             continue
-        vals1 = [dr1[s] for s in common_sinks]
-        vals2 = [dr2[s] for s in common_sinks]
-        agg1 = _aggregate(vals1, r_agg)
-        agg2 = _aggregate(vals2, r_agg)
-        if agg1 is None or agg2 is None:
-            continue
-        res_rows.append(ResComparison(net=net_name, r1=agg1, r2=agg2))
-
-    return cap_rows, res_rows
+ 
+        for s in common_sinks:
+            val1 = dr1[s]
+            val2 = dr2[s]
+            res_rows.append(ResComparison(net=net_name, driver=n1.driver, load=s, r1=val1, r2=val2))
+ 
+        # 计算偏差并找出最大的10个
+        cap_rows_with_deviation = [(abs(row.c1 - row.c2), row) for row in cap_rows]
+        res_rows_with_deviation = [(abs(row.r1 - row.r2), row) for row in res_rows]
+        top_10_cap = [row for _, row in nlargest(10, cap_rows_with_deviation, key=lambda x: x[0])]
+        top_10_res = [row for _, row in nlargest(10, res_rows_with_deviation, key=lambda x: x[0])]
+ 
+        return cap_rows, res_rows, top_10_cap, top_10_res
 
 
 def write_caps_csv(path: str, caps: List[CapComparison]) -> None:
