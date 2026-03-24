@@ -744,7 +744,7 @@ class TestGuiCliWiring:
     def test_main_without_args_launches_gui_with_empty_preload(self, monkeypatch):
         calls = []
 
-        def fake_launch_gui(preload_paths=None, auto_run=False):
+        def fake_launch_gui(preload_paths=None, auto_run=False, **kwargs):
             calls.append((list(preload_paths or []), auto_run))
 
         monkeypatch.setattr(spef_mod, "launch_gui", fake_launch_gui)
@@ -753,3 +753,145 @@ class TestGuiCliWiring:
         spef_mod.main()
 
         assert calls == [([], False)]
+
+    # ---- data-file + GUI wiring ----
+
+    def test_main_data_gui_forwards_cap_data(self, monkeypatch):
+        """--net-cap-data with --gui should call launch_gui with preload_cap_data."""
+        calls = []
+
+        def fake_launch_gui(preload_paths=None, auto_run=False,
+                            preload_cap_data=None, preload_res_data=None):
+            calls.append({
+                "preload_paths": list(preload_paths or []),
+                "auto_run": auto_run,
+                "preload_cap_data": preload_cap_data,
+                "preload_res_data": preload_res_data,
+            })
+
+        monkeypatch.setattr(spef_mod, "launch_gui", fake_launch_gui)
+
+        with tempfile.NamedTemporaryFile(suffix=".data", mode="w",
+                                         delete=False, encoding="utf-8") as f:
+            f.write("net_A 1.0 2.0\n")
+            cap_path = f.name
+
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "spef_rc_correlation.py",
+                "--net-cap-data", cap_path,
+                "--gui",
+            ])
+            spef_mod.main()
+        finally:
+            os.unlink(cap_path)
+
+        assert len(calls) == 1
+        assert calls[0]["preload_cap_data"] == cap_path
+        assert calls[0]["preload_res_data"] is None
+        assert calls[0]["auto_run"] is False
+
+    def test_main_data_gui_forwards_res_data(self, monkeypatch):
+        """--net-res-data with --gui should call launch_gui with preload_res_data."""
+        calls = []
+
+        def fake_launch_gui(preload_paths=None, auto_run=False,
+                            preload_cap_data=None, preload_res_data=None):
+            calls.append({
+                "preload_paths": list(preload_paths or []),
+                "auto_run": auto_run,
+                "preload_cap_data": preload_cap_data,
+                "preload_res_data": preload_res_data,
+            })
+
+        monkeypatch.setattr(spef_mod, "launch_gui", fake_launch_gui)
+
+        with tempfile.NamedTemporaryFile(suffix=".data", mode="w",
+                                         delete=False, encoding="utf-8") as f:
+            f.write("net_A drv:Z sink:A 10.0 15.0\n")
+            res_path = f.name
+
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "spef_rc_correlation.py",
+                "--net-res-data", res_path,
+                "--gui",
+            ])
+            spef_mod.main()
+        finally:
+            os.unlink(res_path)
+
+        assert len(calls) == 1
+        assert calls[0]["preload_cap_data"] is None
+        assert calls[0]["preload_res_data"] == res_path
+
+    def test_main_data_gui_both_files_with_auto_run(self, monkeypatch):
+        """Both data files + --gui --gui-auto-run passes all args correctly."""
+        calls = []
+
+        def fake_launch_gui(preload_paths=None, auto_run=False,
+                            preload_cap_data=None, preload_res_data=None):
+            calls.append({
+                "preload_paths": list(preload_paths or []),
+                "auto_run": auto_run,
+                "preload_cap_data": preload_cap_data,
+                "preload_res_data": preload_res_data,
+            })
+
+        monkeypatch.setattr(spef_mod, "launch_gui", fake_launch_gui)
+
+        with tempfile.NamedTemporaryFile(suffix=".data", mode="w",
+                                         delete=False, encoding="utf-8") as fc:
+            fc.write("net_A 1.0 2.0\n")
+            cap_path = fc.name
+        with tempfile.NamedTemporaryFile(suffix=".data", mode="w",
+                                         delete=False, encoding="utf-8") as fr:
+            fr.write("net_A drv:Z sink:A 10.0 15.0\n")
+            res_path = fr.name
+
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "spef_rc_correlation.py",
+                "--net-cap-data", cap_path,
+                "--net-res-data", res_path,
+                "--gui",
+                "--gui-auto-run",
+            ])
+            spef_mod.main()
+        finally:
+            os.unlink(cap_path)
+            os.unlink(res_path)
+
+        assert len(calls) == 1
+        assert calls[0]["preload_cap_data"] == cap_path
+        assert calls[0]["preload_res_data"] == res_path
+        assert calls[0]["auto_run"] is True
+
+    def test_main_data_no_gui_still_does_cli(self, monkeypatch, capsys):
+        """--net-cap-data without --gui should NOT call launch_gui (CLI mode)."""
+        calls = []
+
+        def fake_launch_gui(**kwargs):
+            calls.append(kwargs)
+
+        monkeypatch.setattr(spef_mod, "launch_gui", fake_launch_gui)
+
+        with tempfile.NamedTemporaryFile(suffix=".data", mode="w",
+                                         delete=False, encoding="utf-8") as f:
+            f.write("net_A 1.0 2.0\nnet_B 0.5 0.8\n")
+            cap_path = f.name
+
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "spef_rc_correlation.py",
+                "--net-cap-data", cap_path,
+            ])
+            spef_mod.main()
+        finally:
+            os.unlink(cap_path)
+
+        # GUI must NOT have been launched
+        assert calls == []
+        # CLI output should mention the correlation
+        out = capsys.readouterr().out
+        assert "correlation" in out.lower() or "cap" in out.lower()

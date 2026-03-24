@@ -722,7 +722,9 @@ def collect_spef_paths(inputs: Iterable[str]) -> List[str]:
     return spef_paths
 
 
-def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = False) -> None:
+def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = False,
+               preload_cap_data: Optional[str] = None,
+               preload_res_data: Optional[str] = None) -> None:
     """Launch an interactive GUI for multi-SPEF correlation analysis."""
 
     try:
@@ -737,12 +739,18 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
     class RcCorrApp:
         def __init__(self, root: "tk.Tk", preload_paths: Optional[Iterable[str]] = None,
-                     auto_run: bool = False) -> None:
+                     auto_run: bool = False,
+                     preload_cap_data: Optional[str] = None,
+                     preload_res_data: Optional[str] = None) -> None:
             self.root = root
             self.root.title("SPEF RC Correlation")
 
             # name -> SpefFile
             self.spefs: Dict[str, SpefFile] = {}
+
+            # data loaded from .data files
+            self._data_caps: List[CapComparison] = []
+            self._data_ress: List[ResComparison] = []
 
             # selection & filter state
             self.ref_var = tk.StringVar()
@@ -764,11 +772,17 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
             if preload_paths:
                 self._preload_spefs(preload_paths)
-            elif self._auto_run_requested:
-                self._auto_run_requested = False
+            if preload_cap_data:
+                self._load_cap_data_file(preload_cap_data)
+            if preload_res_data:
+                self._load_res_data_file(preload_res_data)
 
-            if self._auto_run_requested and len(self.spefs) >= 2:
-                self.root.after(0, self._auto_select_and_run)
+            if self._auto_run_requested:
+                if self._data_caps or self._data_ress:
+                    self.root.after(0, self._run_analysis_from_data)
+                elif len(self.spefs) >= 2:
+                    self.root.after(0, self._auto_select_and_run)
+                self._auto_run_requested = False
 
         # ----------------------------- UI building -----------------------------
 
@@ -798,6 +812,29 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
             ttk.Button(btn_frame, text="Add SPEF", command=self._add_spef).pack(fill="x", pady=2)
             ttk.Button(btn_frame, text="Remove", command=self._remove_selected).pack(fill="x", pady=2)
+
+            # Data Files frame
+            data_frame = ttk.LabelFrame(self.root, text="Data Files")
+            data_frame.pack(fill="x", padx=5, pady=5)
+
+            cap_row = ttk.Frame(data_frame)
+            cap_row.pack(fill="x", padx=5, pady=2)
+            ttk.Label(cap_row, text="Cap Data File:").pack(side="left")
+            self.cap_data_label = ttk.Label(cap_row, text="(none)", foreground="gray", anchor="w")
+            self.cap_data_label.pack(side="left", padx=5, fill="x", expand=True)
+            ttk.Button(cap_row, text="Load Cap Data...", command=self._add_cap_data).pack(side="right")
+
+            res_row = ttk.Frame(data_frame)
+            res_row.pack(fill="x", padx=5, pady=2)
+            ttk.Label(res_row, text="Res Data File:").pack(side="left")
+            self.res_data_label = ttk.Label(res_row, text="(none)", foreground="gray", anchor="w")
+            self.res_data_label.pack(side="left", padx=5, fill="x", expand=True)
+            ttk.Button(res_row, text="Load Res Data...", command=self._add_res_data).pack(side="right")
+
+            data_btn_row = ttk.Frame(data_frame)
+            data_btn_row.pack(fill="x", padx=5, pady=(0, 4))
+            ttk.Button(data_btn_row, text="Run from Data Files",
+                       command=self._run_analysis_from_data).pack(side="left")
 
             # Settings & filters frame
             opts_frame = ttk.LabelFrame(self.root, text="Settings & Filters")
@@ -984,6 +1021,100 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                     "Preload warning",
                     "Some SPEF files could not be loaded at startup:\n\n" + "\n".join(errors),
                 )
+
+        # ----------------------------- Data file loading --------------------------
+
+        def _add_cap_data(self) -> None:
+            path = filedialog.askopenfilename(
+                title="Select net_cap.data file",
+                filetypes=[("Data files", "*.data"), ("All files", "*.*")],
+            )
+            if path:
+                self._load_cap_data_file(path)
+
+        def _add_res_data(self) -> None:
+            path = filedialog.askopenfilename(
+                title="Select net_res.data file",
+                filetypes=[("Data files", "*.data"), ("All files", "*.*")],
+            )
+            if path:
+                self._load_res_data_file(path)
+
+        def _load_cap_data_file(self, path: str) -> None:
+            try:
+                self._data_caps = parse_net_cap_data(path)
+            except Exception as exc:
+                messagebox.showerror("Parse error", f"Failed to parse cap data file:\n{exc}")
+                return
+            label = os.path.basename(path)
+            self.cap_data_label.config(text=f"{label}  ({len(self._data_caps)} nets)", foreground="black")
+            print(f"Cap data loaded: {path} ({len(self._data_caps)} entries)")
+
+        def _load_res_data_file(self, path: str) -> None:
+            try:
+                self._data_ress = parse_net_res_data(path)
+            except Exception as exc:
+                messagebox.showerror("Parse error", f"Failed to parse res data file:\n{exc}")
+                return
+            label = os.path.basename(path)
+            self.res_data_label.config(text=f"{label}  ({len(self._data_ress)} pairs)", foreground="black")
+            print(f"Res data loaded: {path} ({len(self._data_ress)} entries)")
+
+        def _run_analysis_from_data(self) -> None:
+            if not self._data_caps and not self._data_ress:
+                messagebox.showwarning("No Data", "Please load at least one data file (cap or res).")
+                return
+
+            flt = self._parse_filters()
+            if flt is None:
+                return
+
+            mc = flt["min_c"]
+            xc = flt["max_c"]
+            mr = flt["min_r"]
+            xr = flt["max_r"]
+
+            points_cap: List[Dict[str, float]] = []
+            for c in self._data_caps:
+                if mc is not None and c.c1 < mc:
+                    continue
+                if xc is not None and c.c1 > xc:
+                    continue
+                points_cap.append({"net": c.net, "c_ref": c.c1, "c_fit": c.c2})
+
+            points_res: List[Dict[str, float]] = []
+            for r in self._data_ress:
+                if mr is not None and r.r1 < mr:
+                    continue
+                if xr is not None and r.r1 > xr:
+                    continue
+                points_res.append({"net": r.net, "r_ref": r.r1, "r_fit": r.r2})
+
+            self.points_cap = points_cap
+            self.points_res = points_res
+
+            if not points_cap and not points_res:
+                self.corr_label.config(text="No data after filtering")
+                self._clear_axes()
+                return
+
+            xs_c = [p["c_ref"] for p in points_cap]
+            ys_c = [p["c_fit"] for p in points_cap]
+            xs_r = [p["r_ref"] for p in points_res]
+            ys_r = [p["r_fit"] for p in points_res]
+
+            corr_c = pearson_corr(xs_c, ys_c)
+            corr_r = pearson_corr(xs_r, ys_r)
+
+            c_text = "C corr: N/A"
+            if corr_c is not None:
+                c_text = f"C corr ({len(points_cap)} nets): {corr_c:.4f}"
+            r_text = "R corr: N/A"
+            if corr_r is not None:
+                r_text = f"R corr ({len(points_res)} pin pairs): {corr_r:.4f}"
+            self.corr_label.config(text=f"{c_text} | {r_text}")
+
+            self._update_plot("tool1", "tool2", corr_c, corr_r)
 
         def _remove_selected(self) -> None:
             for item in self.tree.selection():
@@ -1315,7 +1446,8 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                     self.canvas.draw_idle()
 
     root = tk.Tk()
-    RcCorrApp(root, preload_paths=preload_paths, auto_run=auto_run)
+    RcCorrApp(root, preload_paths=preload_paths, auto_run=auto_run,
+              preload_cap_data=preload_cap_data, preload_res_data=preload_res_data)
     root.mainloop()
 
 
@@ -1408,6 +1540,17 @@ def main() -> None:
     # Data-file mode: at least one of --net-cap-data / --net-res-data
     # ------------------------------------------------------------------
     if args.net_cap_data or args.net_res_data:
+        if args.gui:
+            # GUI mode with data files: pass data paths to the GUI
+            gui_inputs = collect_spef_paths([p for p in [args.spef1, args.spef2] if p])
+            launch_gui(
+                gui_inputs,
+                auto_run=args.gui_auto_run,
+                preload_cap_data=args.net_cap_data,
+                preload_res_data=args.net_res_data,
+            )
+            return
+
         caps: List[CapComparison] = []
         ress: List[ResComparison] = []
 
