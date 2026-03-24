@@ -89,6 +89,7 @@ class NetRC:
         if src == dst:
             return 0.0
 
+        # print(f"Computing shortest resistance from {src} to {dst} in net {self.name}...")
         # Standard Dijkstra with a min-heap
         dist: Dict[str, float] = {src: 0.0}
         visited: Set[str] = set()
@@ -123,7 +124,6 @@ class NetRC:
             return result
 
         driver_node = self._find_best_node_name(self.driver) or self.driver
-
         for sink in self.sinks:
             sink_node = self._find_best_node_name(sink) or sink
             r = self._shortest_resistance(driver_node, sink_node)
@@ -257,7 +257,6 @@ class SpefFile:
                     code_part    = line
                     comment_part = ""
                 raw = code_part.strip()
-
                 if not raw:
                     if comment_part:
                         body = comment_part.lstrip()
@@ -270,14 +269,6 @@ class SpefFile:
                                     layer_map[lp[0]] = lp[1]
                         elif body.startswith("*LAYER_MAP"):
                             in_layer_map = True
-                    continue
-
-                # All SPEF directives start with '*'
-                if raw[0] != '*':
-                    if in_name_map:
-                        in_name_map = False
-                    if in_port_map:
-                        in_port_map = False
                     continue
 
                 c1 = raw[1] if len(raw) > 1 else '\x00'
@@ -309,10 +300,12 @@ class SpefFile:
                                     assign_level(current_net, node2, to_lvl or lvl)
                         else:
                             # Single-token line → must be a section header
-                            if   c1 == 'E':                     current_net = None; section = SEC_NONE
+                            if   c1 == 'E' and raw[2:4] == 'ND':                     current_net = None; section = SEC_NONE
                             elif c1 == 'C' and raw[2:4] == 'AP': section = SEC_CAP
-                            elif c1 == 'C':                     section = SEC_CONN
-                            elif c1 == 'R':                     section = SEC_RES
+                            elif c1 == 'C' and raw[2:5] == 'ONN':                     section = SEC_CONN
+                            elif c1 == 'R' and raw[2:4] == 'ES': 
+                                #print(f"Warning: unexpected line in RES section of net {current_net.name} (missing END header): '{raw}'")
+                                section = SEC_RES
                         continue
 
                     if section == SEC_CONN:
@@ -333,16 +326,20 @@ class SpefFile:
                                 assign_level(current_net, pin_name, lvl)
                         else:
                             if   c1 == 'C' and raw[2:4] == 'AP': section = SEC_CAP
-                            elif c1 == 'C':                     section = SEC_CONN
-                            elif c1 == 'R':                     section = SEC_RES
-                            elif c1 == 'E':                     current_net = None; section = SEC_NONE
+                            elif c1 == 'C' and raw[2:5] == 'ONN': section = SEC_CONN
+                            elif c1 == 'R' and raw[2:4] == 'ES': 
+                                #print(f"Warning: unexpected line in CONN section of net {current_net.name} (missing END header): '{raw}'")
+                                section = SEC_RES
+                            elif c1 == 'E' and raw[2:4] == 'ND': current_net = None; section = SEC_NONE
                         continue
 
                     # section == SEC_NONE or SEC_CAP: scan for next section header
                     if   c1 == 'C' and raw[2:5] == 'ONN': section = SEC_CONN
                     elif c1 == 'C' and raw[2:4] == 'AP':  section = SEC_CAP
-                    elif c1 == 'R':                        section = SEC_RES
-                    elif c1 == 'E':                        current_net = None; section = SEC_NONE
+                    elif c1 == 'R' and raw[2:4] == 'ES': 
+                        #print(f"Warning: unexpected line in net {current_net.name} outside of CONN/RES sections (missing CONN header?): '{raw}'")
+                        section = SEC_RES
+                    elif c1 == 'E' and raw[2:4] == 'ND':  current_net = None; section = SEC_NONE
                     continue
 
                 # ============================================================
@@ -350,7 +347,7 @@ class SpefFile:
                 # ============================================================
 
                 # *D_NET — most frequent outside-net line once headers are done
-                if c1 == 'D':
+                if c1 == 'D' and raw.startswith("*D_NET"):
                     parts = raw.split(None, 3)
                     if len(parts) >= 3:
                         in_port_map = False
@@ -496,7 +493,7 @@ def process_net_batch(net_names_batch):
         dr1 = n1.driver_sink_resistances()
         dr2 = n2.driver_sink_resistances()
         common_sinks = sorted(set(dr1.keys()) & set(dr2.keys()))
-        
+        # print(f"Processing net: {net_name}, common sinks: {len(common_sinks)}")
         res_rows = [
             ResComparison(net=net_name, driver=n1.driver, load=s, r1=dr1[s], r2=dr2[s])
             for s in common_sinks
@@ -528,6 +525,7 @@ def compare_spef1(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapCompa
             cap_rows.append(cap_row)
             res_rows.extend(res_row_list)
     print("start to find top 10")
+    print(f"total cap rows: {len(cap_rows)}, total res rows: {len(res_rows)}")
     # 计算偏差并找出最大的10个
     cap_rows_with_deviation = [(abs(row.c1 - row.c2), row) for row in cap_rows]
     res_rows_with_deviation = [(abs(row.r1 - row.r2), row) for row in res_rows]
@@ -691,14 +689,15 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
             self.fit_var = tk.StringVar()
             self.r_agg_var = tk.StringVar(value="max")
 
-            self.min_fanout_var = tk.StringVar()
-            self.max_fanout_var = tk.StringVar()
-            self.min_c_var = tk.StringVar()
-            self.max_c_var = tk.StringVar()
-            self.min_r_var = tk.StringVar()
-            self.max_r_var = tk.StringVar()
+            self.min_fanout_var = tk.StringVar(value="1")
+            self.max_fanout_var = tk.StringVar(value="99999")
+            self.min_c_var = tk.StringVar(value="0.001")
+            self.max_c_var = tk.StringVar(value="2")
+            self.min_r_var = tk.StringVar(value="1")
+            self.max_r_var = tk.StringVar(value="1000000")
 
-            self.points: List[Dict[str, float]] = []  # per-net data after filtering
+            self.points_cap: List[Dict[str, float]] = []  # per-net data after filtering
+            self.points_res: List[Dict[str, float]] = []  # per-pin-pair data after filtering
             self._auto_run_requested = auto_run
 
             self._build_ui()
@@ -988,19 +987,21 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
             if xf is not None and p["fanout"] > xf:
                 return False
 
-            mc = flt["min_c"]
-            xc = flt["max_c"]
-            if mc is not None and p["c_ref"] < mc:
-                return False
-            if xc is not None and p["c_ref"] > xc:
-                return False
+            if "c_ref" in p:
+                mc = flt["min_c"]
+                xc = flt["max_c"]
+                if mc is not None and p["c_ref"] < mc:
+                    return False
+                if xc is not None and p["c_ref"] > xc:
+                    return False
 
-            mr = flt["min_r"]
-            xr = flt["max_r"]
-            if mr is not None and p["r_ref"] < mr:
-                return False
-            if xr is not None and p["r_ref"] > xr:
-                return False
+            if "r_ref" in p: 
+                mr = flt["min_r"]
+                xr = flt["max_r"]
+                if mr is not None and p["r_ref"] < mr:
+                    return False
+                if xr is not None and p["r_ref"] > xr:
+                    return False
 
             return True
 
@@ -1031,49 +1032,68 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                 return
 
             r_agg = self.r_agg_var.get()
-            caps, ress, _top_10_cap, _top_10_res = compare_spef(ref, fit, r_agg)
+            caps, ress, _top_10_cap, _top_10_res = compare_spef1(ref, fit, r_agg)
 
-            cap_map = {c.net: c for c in caps}
-            res_map = {r.net: r for r in ress}
-            nets = sorted(set(cap_map.keys()) & set(res_map.keys()))
+            print(f"{len(caps)} nets caps compared")
+            print(f"{len(ress)} pin pair res compared")
+            print('cap deviation top 10 (ref : fit)')
+            for cap_com in _top_10_cap:
+                print(f"net:{cap_com.net} ({cap_com.c1} : {cap_com.c2})")
+            print('res deviation top 10 (ref : fit)')
+            for res_com in _top_10_res:
+                print(f"net:{res_com.net} driver:{res_com.driver} load:{res_com.load} ({res_com.r1} : {res_com.r2})")
 
-            points: List[Dict[str, float]] = []
-            for net in nets:
-                c = cap_map[net]
-                r = res_map[net]
+            points_cap: List[Dict[str, float]] = []
+            for c in caps:
+                # r = res_map[net]
+                net = c.net
                 fanout = len(ref.nets[net].sinks) if net in ref.nets else 0
                 p = {
                     "net": net,
                     "fanout": float(fanout),
                     "c_ref": c.c1,
                     "c_fit": c.c2,
-                    "r_ref": r.r1,
-                    "r_fit": r.r2,
                 }
                 if self._passes_filters(p, flt):
-                    points.append(p)
+                    points_cap.append(p)
+            
 
-            self.points = points
+            points_res: List[Dict[str, float]] = []
+            for pin_pair in ress:
+                net = pin_pair.net
+                fanout = len(ref.nets[net].sinks) if net in ref.nets else 0
+                p = {
+                    "net": net,
+                    "fanout": float(fanout),
+                    "r_ref": pin_pair.r1,
+                    "r_fit": pin_pair.r2,
+                }
+                if self._passes_filters(p, flt):
+                    points_res.append(p)
 
-            if not points:
+
+            self.points_cap = points_cap
+            self.points_res = points_res
+
+            if not points_cap:
                 self.corr_label.config(text="No nets after filtering")
                 self._clear_axes()
                 return
 
-            xs_c = [p["c_ref"] for p in points]
-            ys_c = [p["c_fit"] for p in points]
-            xs_r = [p["r_ref"] for p in points]
-            ys_r = [p["r_fit"] for p in points]
+            xs_c = [p["c_ref"] for p in points_cap]
+            ys_c = [p["c_fit"] for p in points_cap]
+            xs_r = [p["r_ref"] for p in points_res]
+            ys_r = [p["r_fit"] for p in points_res]
 
             corr_c = pearson_corr(xs_c, ys_c)
             corr_r = pearson_corr(xs_r, ys_r)
 
             c_text = "C corr: N/A"
             if corr_c is not None:
-                c_text = f"C corr ({len(points)} nets): {corr_c:.4f}"
+                c_text = f"C corr ({len(points_cap)} nets): {corr_c:.4f}"
             r_text = "R corr: N/A"
             if corr_r is not None:
-                r_text = f"R corr ({len(points)} nets, {r_agg}): {corr_r:.4f}"
+                r_text = f"R corr ({len(points_res)} pin pairs): {corr_r:.4f}"
             self.corr_label.config(text=f"{c_text} | {r_text}")
 
             self._update_plot(ref_name, fit_name, corr_c, corr_r)
@@ -1091,8 +1111,8 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
             self.ax_r.clear()
 
             # Capacitance plot
-            xs_c = [p["c_ref"] for p in self.points]
-            ys_c = [p["c_fit"] for p in self.points]
+            xs_c = [p["c_ref"] for p in self.points_cap]
+            ys_c = [p["c_fit"] for p in self.points_cap]
             if xs_c and ys_c:
                 min_c = min(xs_c + ys_c)
                 max_c = max(xs_c + ys_c)
@@ -1115,8 +1135,8 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
             self.ax_c.set_ylabel(f"{fit_name} C")
 
             # Resistance plot
-            xs_r = [p["r_ref"] for p in self.points]
-            ys_r = [p["r_fit"] for p in self.points]
+            xs_r = [p["r_ref"] for p in self.points_res]
+            ys_r = [p["r_fit"] for p in self.points_res]
             if xs_r and ys_r:
                 min_r = min(xs_r + ys_r)
                 max_r = max(xs_r + ys_r)
@@ -1131,7 +1151,7 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                 self.ax_r.set_xlim(vmin_r, vmax_r)
                 self.ax_r.set_ylim(vmin_r, vmax_r)
 
-            title_r = f"Driver->sink R ({self.r_agg_var.get()}): {ref_name} (X) vs {fit_name} (Y)"
+            title_r = f"Driver->sink R: {ref_name} (X) vs {fit_name} (Y)"
             if corr_r is not None:
                 title_r += f"  (corr={corr_r:.4f})"
             self.ax_r.set_title(title_r)
@@ -1159,7 +1179,7 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
             return annot
 
         def _on_motion(self, event) -> None:
-            if not self.points:
+            if not self.points_cap and not self.points_res:
                 return
 
             ax = event.inaxes
@@ -1180,12 +1200,12 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                 return
 
             if ax is self.ax_c:
-                xs = [p["c_ref"] for p in self.points]
-                ys = [p["c_fit"] for p in self.points]
+                xs = [p["c_ref"] for p in self.points_cap]
+                ys = [p["c_fit"] for p in self.points_cap]
                 annot = self.annot_c
             else:
-                xs = [p["r_ref"] for p in self.points]
-                ys = [p["r_fit"] for p in self.points]
+                xs = [p["r_ref"] for p in self.points_res]
+                ys = [p["r_fit"] for p in self.points_res]
                 annot = self.annot_r
 
             x0, y0 = float(event.xdata), float(event.ydata)
@@ -1212,13 +1232,19 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
             # Threshold in normalized space; tweak if needed
             if best_d2 is not None and best_d2 < 0.005:
-                p = self.points[best_i]
+                if ax is self.ax_c:
+                    p = self.points_cap[best_i]
+                    text = (
+                        f"net: {p['net']}\n"
+                        f"C_ref={p['c_ref']:.3g}, C_fit={p['c_fit']:.3g}"
+                    )
+                else:
+                    p = self.points_res[best_i]
+                    text = (
+                        f"net: {p['net']}\n"
+                        f"R_ref={p['r_ref']:.3g}, R_fit={p['r_fit']:.3g}"
+                    )
                 annot.xy = (xs[best_i], ys[best_i])
-                text = (
-                    f"net: {p['net']}\n"
-                    f"C_ref={p['c_ref']:.3g}, C_fit={p['c_fit']:.3g}\n"
-                    f"R_ref={p['r_ref']:.3g}, R_fit={p['r_fit']:.3g}"
-                )
                 annot.set_text(text)
                 annot.get_bbox_patch().set_facecolor("#ffffcc")
                 annot.set_visible(True)
@@ -1309,7 +1335,7 @@ def main() -> None:
 
     s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
 
-    caps, ress, _top_10_cap, _top_10_res = compare_spef(s1, s2, args.r_agg)
+    caps, ress, _top_10_cap, _top_10_res = compare_spef1(s1, s2, args.r_agg)
     summarize_and_print(caps, ress, s1, s2, args.r_agg)
 
     if args.csv_prefix:
