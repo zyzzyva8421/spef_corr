@@ -575,6 +575,66 @@ def compare_spef(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapCompar
 
     return cap_rows, res_rows, top_10_cap, top_10_res
 
+def parse_net_cap_data(path: str) -> List[CapComparison]:
+    """Parse a net_cap.data file into a list of CapComparison objects.
+
+    File format (whitespace-separated, one entry per line):
+        net_name  total_c_spef1  total_c_spef2
+
+    Lines starting with '#' and blank lines are ignored.
+    """
+    caps: List[CapComparison] = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                print(f"[warn] {path}:{lineno}: expected 3 fields, got {len(parts)}, skipping")
+                continue
+            net_name = parts[0]
+            try:
+                c1 = float(parts[1])
+                c2 = float(parts[2])
+            except ValueError:
+                print(f"[warn] {path}:{lineno}: non-numeric capacitance value, skipping")
+                continue
+            caps.append(CapComparison(net=net_name, c1=c1, c2=c2))
+    return caps
+
+
+def parse_net_res_data(path: str) -> List[ResComparison]:
+    """Parse a net_res.data file into a list of ResComparison objects.
+
+    File format (whitespace-separated, one entry per line):
+        net_name  driver_pin  sink_pin  r_spef1  r_spef2
+
+    Lines starting with '#' and blank lines are ignored.
+    """
+    ress: List[ResComparison] = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                print(f"[warn] {path}:{lineno}: expected 5 fields, got {len(parts)}, skipping")
+                continue
+            net_name = parts[0]
+            driver = parts[1]
+            sink = parts[2]
+            try:
+                r1 = float(parts[3])
+                r2 = float(parts[4])
+            except ValueError:
+                print(f"[warn] {path}:{lineno}: non-numeric resistance value, skipping")
+                continue
+            ress.append(ResComparison(net=net_name, driver=driver, load=sink, r1=r1, r2=r2))
+    return ress
+
+
 def write_caps_csv(path: str, caps: List[CapComparison]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -662,7 +722,9 @@ def collect_spef_paths(inputs: Iterable[str]) -> List[str]:
     return spef_paths
 
 
-def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = False) -> None:
+def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = False,
+               preload_cap_data: Optional[str] = None,
+               preload_res_data: Optional[str] = None) -> None:
     """Launch an interactive GUI for multi-SPEF correlation analysis."""
 
     try:
@@ -677,12 +739,18 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
     class RcCorrApp:
         def __init__(self, root: "tk.Tk", preload_paths: Optional[Iterable[str]] = None,
-                     auto_run: bool = False) -> None:
+                     auto_run: bool = False,
+                     preload_cap_data: Optional[str] = None,
+                     preload_res_data: Optional[str] = None) -> None:
             self.root = root
             self.root.title("SPEF RC Correlation")
 
             # name -> SpefFile
             self.spefs: Dict[str, SpefFile] = {}
+
+            # data loaded from .data files
+            self._data_caps: List[CapComparison] = []
+            self._data_ress: List[ResComparison] = []
 
             # selection & filter state
             self.ref_var = tk.StringVar()
@@ -704,11 +772,17 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
             if preload_paths:
                 self._preload_spefs(preload_paths)
-            elif self._auto_run_requested:
-                self._auto_run_requested = False
+            if preload_cap_data:
+                self._load_cap_data_file(preload_cap_data)
+            if preload_res_data:
+                self._load_res_data_file(preload_res_data)
 
-            if self._auto_run_requested and len(self.spefs) >= 2:
-                self.root.after(0, self._auto_select_and_run)
+            if self._auto_run_requested:
+                if self._data_caps or self._data_ress:
+                    self.root.after(0, self._run_analysis_from_data)
+                elif len(self.spefs) >= 2:
+                    self.root.after(0, self._auto_select_and_run)
+                self._auto_run_requested = False
 
         # ----------------------------- UI building -----------------------------
 
@@ -738,6 +812,29 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
             ttk.Button(btn_frame, text="Add SPEF", command=self._add_spef).pack(fill="x", pady=2)
             ttk.Button(btn_frame, text="Remove", command=self._remove_selected).pack(fill="x", pady=2)
+
+            # Data Files frame
+            data_frame = ttk.LabelFrame(self.root, text="Data Files")
+            data_frame.pack(fill="x", padx=5, pady=5)
+
+            cap_row = ttk.Frame(data_frame)
+            cap_row.pack(fill="x", padx=5, pady=2)
+            ttk.Label(cap_row, text="Cap Data File:").pack(side="left")
+            self.cap_data_label = ttk.Label(cap_row, text="(none)", foreground="gray", anchor="w")
+            self.cap_data_label.pack(side="left", padx=5, fill="x", expand=True)
+            ttk.Button(cap_row, text="Load Cap Data...", command=self._add_cap_data).pack(side="right")
+
+            res_row = ttk.Frame(data_frame)
+            res_row.pack(fill="x", padx=5, pady=2)
+            ttk.Label(res_row, text="Res Data File:").pack(side="left")
+            self.res_data_label = ttk.Label(res_row, text="(none)", foreground="gray", anchor="w")
+            self.res_data_label.pack(side="left", padx=5, fill="x", expand=True)
+            ttk.Button(res_row, text="Load Res Data...", command=self._add_res_data).pack(side="right")
+
+            data_btn_row = ttk.Frame(data_frame)
+            data_btn_row.pack(fill="x", padx=5, pady=(0, 4))
+            ttk.Button(data_btn_row, text="Run from Data Files",
+                       command=self._run_analysis_from_data).pack(side="left")
 
             # Settings & filters frame
             opts_frame = ttk.LabelFrame(self.root, text="Settings & Filters")
@@ -924,6 +1021,100 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                     "Preload warning",
                     "Some SPEF files could not be loaded at startup:\n\n" + "\n".join(errors),
                 )
+
+        # ----------------------------- Data file loading --------------------------
+
+        def _add_cap_data(self) -> None:
+            path = filedialog.askopenfilename(
+                title="Select net_cap.data file",
+                filetypes=[("Data files", "*.data"), ("All files", "*.*")],
+            )
+            if path:
+                self._load_cap_data_file(path)
+
+        def _add_res_data(self) -> None:
+            path = filedialog.askopenfilename(
+                title="Select net_res.data file",
+                filetypes=[("Data files", "*.data"), ("All files", "*.*")],
+            )
+            if path:
+                self._load_res_data_file(path)
+
+        def _load_cap_data_file(self, path: str) -> None:
+            try:
+                self._data_caps = parse_net_cap_data(path)
+            except Exception as exc:
+                messagebox.showerror("Parse error", f"Failed to parse cap data file:\n{exc}")
+                return
+            label = os.path.basename(path)
+            self.cap_data_label.config(text=f"{label}  ({len(self._data_caps)} nets)", foreground="black")
+            print(f"Cap data loaded: {path} ({len(self._data_caps)} entries)")
+
+        def _load_res_data_file(self, path: str) -> None:
+            try:
+                self._data_ress = parse_net_res_data(path)
+            except Exception as exc:
+                messagebox.showerror("Parse error", f"Failed to parse res data file:\n{exc}")
+                return
+            label = os.path.basename(path)
+            self.res_data_label.config(text=f"{label}  ({len(self._data_ress)} pairs)", foreground="black")
+            print(f"Res data loaded: {path} ({len(self._data_ress)} entries)")
+
+        def _run_analysis_from_data(self) -> None:
+            if not self._data_caps and not self._data_ress:
+                messagebox.showwarning("No Data", "Please load at least one data file (cap or res).")
+                return
+
+            flt = self._parse_filters()
+            if flt is None:
+                return
+
+            mc = flt["min_c"]
+            xc = flt["max_c"]
+            mr = flt["min_r"]
+            xr = flt["max_r"]
+
+            points_cap: List[Dict[str, float]] = []
+            for c in self._data_caps:
+                if mc is not None and c.c1 < mc:
+                    continue
+                if xc is not None and c.c1 > xc:
+                    continue
+                points_cap.append({"net": c.net, "c_ref": c.c1, "c_fit": c.c2})
+
+            points_res: List[Dict[str, float]] = []
+            for r in self._data_ress:
+                if mr is not None and r.r1 < mr:
+                    continue
+                if xr is not None and r.r1 > xr:
+                    continue
+                points_res.append({"net": r.net, "r_ref": r.r1, "r_fit": r.r2})
+
+            self.points_cap = points_cap
+            self.points_res = points_res
+
+            if not points_cap and not points_res:
+                self.corr_label.config(text="No data after filtering")
+                self._clear_axes()
+                return
+
+            xs_c = [p["c_ref"] for p in points_cap]
+            ys_c = [p["c_fit"] for p in points_cap]
+            xs_r = [p["r_ref"] for p in points_res]
+            ys_r = [p["r_fit"] for p in points_res]
+
+            corr_c = pearson_corr(xs_c, ys_c)
+            corr_r = pearson_corr(xs_r, ys_r)
+
+            c_text = "C corr: N/A"
+            if corr_c is not None:
+                c_text = f"C corr ({len(points_cap)} nets): {corr_c:.4f}"
+            r_text = "R corr: N/A"
+            if corr_r is not None:
+                r_text = f"R corr ({len(points_res)} pin pairs): {corr_r:.4f}"
+            self.corr_label.config(text=f"{c_text} | {r_text}")
+
+            self._update_plot("tool1", "tool2", corr_c, corr_r)
 
         def _remove_selected(self) -> None:
             for item in self.tree.selection():
@@ -1255,7 +1446,8 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                     self.canvas.draw_idle()
 
     root = tk.Tk()
-    RcCorrApp(root, preload_paths=preload_paths, auto_run=auto_run)
+    RcCorrApp(root, preload_paths=preload_paths, auto_run=auto_run,
+              preload_cap_data=preload_cap_data, preload_res_data=preload_res_data)
     root.mainloop()
 
 
@@ -1321,9 +1513,115 @@ def main() -> None:
         action="store_true",
         help="In GUI mode, auto-select the first two loaded SPEFs and run analysis once",
     )
+    parser.add_argument(
+        "--net-cap-data",
+        metavar="FILE",
+        help=(
+            "Path to a pre-computed net_cap.data file. "
+            "Each line: net_name  c_tool1  c_tool2. "
+            "When supplied, capacitance correlation is computed from this file "
+            "instead of parsing two SPEF files."
+        ),
+    )
+    parser.add_argument(
+        "--net-res-data",
+        metavar="FILE",
+        help=(
+            "Path to a pre-computed net_res.data file. "
+            "Each line: net_name  driver_pin  sink_pin  r_tool1  r_tool2. "
+            "When supplied, resistance correlation is computed from this file "
+            "instead of parsing two SPEF files."
+        ),
+    )
 
     args = parser.parse_args()
 
+    # ------------------------------------------------------------------
+    # Data-file mode: at least one of --net-cap-data / --net-res-data
+    # ------------------------------------------------------------------
+    if args.net_cap_data or args.net_res_data:
+        if args.gui:
+            # GUI mode with data files: pass data paths to the GUI
+            gui_inputs = collect_spef_paths([p for p in [args.spef1, args.spef2] if p])
+            launch_gui(
+                gui_inputs,
+                auto_run=args.gui_auto_run,
+                preload_cap_data=args.net_cap_data,
+                preload_res_data=args.net_res_data,
+            )
+            return
+
+        caps: List[CapComparison] = []
+        ress: List[ResComparison] = []
+
+        if args.net_cap_data:
+            print(f"Parsing cap data from {args.net_cap_data} ...")
+            caps = parse_net_cap_data(args.net_cap_data)
+            print(f"  {len(caps)} cap entries loaded")
+
+        if args.net_res_data:
+            print(f"Parsing res data from {args.net_res_data} ...")
+            ress = parse_net_res_data(args.net_res_data)
+            print(f"  {len(ress)} res entries loaded")
+
+        print("=== SPEF RC Correlation Summary (from data files) ===")
+        if args.net_cap_data:
+            print(f"Cap data file: {args.net_cap_data}")
+        if args.net_res_data:
+            print(f"Res data file: {args.net_res_data}")
+
+        xs_c = [c.c1 for c in caps]
+        ys_c = [c.c2 for c in caps]
+        corr_c = pearson_corr(xs_c, ys_c)
+        if caps:
+            if corr_c is not None:
+                print(f"Total C correlation (Pearson, per-net): {corr_c:.6f} over {len(caps)} nets")
+            else:
+                print("Total C correlation: N/A (not enough data or zero variance)")
+
+        xs_r = [r.r1 for r in ress]
+        ys_r = [r.r2 for r in ress]
+        corr_r = pearson_corr(xs_r, ys_r)
+        if ress:
+            if corr_r is not None:
+                print(
+                    f"Driver->sink R correlation (Pearson): "
+                    f"{corr_r:.6f} over {len(ress)} (net, sink) pairs"
+                )
+            else:
+                print("Driver->sink R correlation: N/A (not enough data or zero variance)")
+
+        cap_devs = [(abs(row.c1 - row.c2), row) for row in caps]
+        res_devs = [(abs(row.r1 - row.r2), row) for row in ress]
+        top_10_cap = [row for _, row in nlargest(10, cap_devs, key=lambda x: x[0])]
+        top_10_res = [row for _, row in nlargest(10, res_devs, key=lambda x: x[0])]
+
+        if top_10_cap:
+            print("Cap deviation top 10 (tool1 : tool2):")
+            for cap_com in top_10_cap:
+                print(f"  net:{cap_com.net} ({cap_com.c1} : {cap_com.c2})")
+        if top_10_res:
+            print("Res deviation top 10 (tool1 : tool2):")
+            for res_com in top_10_res:
+                print(
+                    f"  net:{res_com.net} driver:{res_com.driver} "
+                    f"load:{res_com.load} ({res_com.r1} : {res_com.r2})"
+                )
+
+        if args.csv_prefix:
+            if caps:
+                caps_path = f"{args.csv_prefix}_caps.csv"
+                write_caps_csv(caps_path, caps)
+                print(f"\nCSV written: {caps_path}")
+            if ress:
+                res_path = f"{args.csv_prefix}_res_{args.r_agg}.csv"
+                write_res_csv(res_path, ress, args.r_agg)
+                print(f"CSV written: {res_path}")
+        return
+
+    # ------------------------------------------------------------------
+    # Normal SPEF mode
+    # ------------------------------------------------------------------
     gui_inputs = collect_spef_paths([p for p in [args.spef1, args.spef2] if p])
 
     if args.gui or (args.spef1 is None and args.spef2 is None):
