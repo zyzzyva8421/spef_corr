@@ -35,10 +35,15 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Iterable, Set
 import heapq
 
+import re
+from heapq import nlargest
+import multiprocessing
+from functools import partial
 
 @dataclass
 class NetRC:
@@ -49,9 +54,10 @@ class NetRC:
     # resistance graph: node -> list of (neighbor, R)
     res_graph: Dict[str, List[Tuple[str, float]]] = field(default_factory=dict)
 
+    node_levels: Dict[str, int] = field(default_factory=dict)
+    node_layers: Dict[str, str] = field(default_factory=dict)
     # cache for driver->sink resistance
     _driver_sink_res_cache: Optional[Dict[str, float]] = field(default=None, init=False, repr=False)
-    # cache for mapping pin prefix (before ':') to an existing node name
     _node_prefix_map: Optional[Dict[str, str]] = field(default=None, init=False, repr=False)
 
     def _find_best_node_name(self, pin: str) -> Optional[str]:
@@ -126,136 +132,279 @@ class NetRC:
         self._driver_sink_res_cache = result
         return result
 
-
 class SpefFile:
     def __init__(self, path: str) -> None:
         self.path = path
         self.name_map: Dict[str, str] = {}
+        self.layer_map: Dict[str, str] = {}
+        self.port_map: Dict[str, Dict] = {}
+        self.level_to_layer: Dict[str, str] = {}
         self.nets: Dict[str, NetRC] = {}
+        self.t_unit = 'NS'
+        self.c_unit = 'PF'
+        self.r_unit = 'OHM'
+        self.l_unit = 'HENRY'
 
     # -------------------------- parsing helpers --------------------------
+    @staticmethod
+    def _parse_level_from_comment(comment: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+        lvl = from_lvl = to_lvl = None
+        for tok in comment.split():
+            if tok.startswith("$lvl="):
+                try:
+                    lvl = int(tok[len("$lvl="):])
+                except ValueError:
+                    pass
+            elif tok.startswith("$from_lvl="):
+                try:
+                    from_lvl = int(tok[len("$from_lvl="):])
+                except ValueError:
+                    pass
+            elif tok.startswith("$to_lvl="):
+                try:
+                    to_lvl = int(tok[len("$to_lvl="):])
+                except ValueError:
+                    pass
+        return lvl, from_lvl, to_lvl
+
+    def _assign_node_level(self, net: NetRC, node_name: str, level: Optional[int]) -> None:
+        if level is None:
+            return
+        if node_name in net.node_levels:
+            return
+        net.node_levels[node_name] = level
+        layer_name = self.level_to_layer.get(level)
+        if layer_name is not None and node_name not in net.node_layers:
+            net.node_layers[node_name] = layer_name
+
 
     def _resolve_name(self, tok: str) -> str:
         """Resolve a token via *NAME_MAP if it starts with '*'."""
         if tok.startswith("\"") and tok.endswith("\"") and len(tok) >= 2:
             return tok[1:-1]
+        pin = ''
+        if ":" in tok:
+            parts = tok.split(':')
+            pin = parts[1]
+            tok = parts[0]
         if tok.startswith("*") and tok in self.name_map:
-            return self.name_map[tok]
+            return self.name_map[tok] + f':{pin}' if pin else self.name_map[tok]
         return tok
 
     def parse(self) -> None:
-        with open(self.path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
+        # ---- bind frequently accessed attributes to locals ----
+        # Python attribute lookup (self.x) is slower than reading a local variable.
+        name_map     = self.name_map
+        nets_dict    = self.nets
+        layer_map    = self.layer_map
+        port_map     = self.port_map
+        path         = self.path
+        assign_level = self._assign_node_level
+        parse_level  = self._parse_level_from_comment
 
-        i = 0
-        n = len(lines)
-        in_name_map = False
+        # Pre-compile the float fallback regex once per parse call (not per line)
+        _re_nonnum = re.compile(r'[^\d.\-+eE]')
+
+        def _pf(s: str) -> float:
+            """Float parse with graceful fallback for strings with unit suffixes."""
+            try:
+                return float(s)
+            except ValueError:
+                c = _re_nonnum.sub('', s)
+                return float(c) if c else 0.0
+
+        # Inline _resolve_name as a closure to avoid per-call method dispatch overhead
+        def _resolve(tok: str) -> str:
+            if not tok:
+                return tok
+            c = tok[0]
+            if c == '"':
+                return tok[1:-1] if tok[-1] == '"' else tok[1:]
+            if ':' in tok:
+                idx  = tok.index(':')
+                base = tok[:idx]
+                pin  = tok[idx + 1:]
+                if base and base[0] == '*' and base in name_map:
+                    r = name_map[base]
+                    return f"{r}:{pin}" if pin else r
+                return base   # no name-map match: return base, dropping pin suffix
+            if c == '*':
+                return name_map.get(tok, tok)
+            return tok
+
+        # Integer section constants — int comparison is faster than str comparison
+        SEC_NONE = 0
+        SEC_CONN = 1
+        SEC_CAP  = 2
+        SEC_RES  = 3
+
+        in_name_map  = False
+        in_layer_map = False
+        in_port_map  = False
         current_net: Optional[NetRC] = None
-        section: Optional[str] = None  # None, "CONN", "CAP", "RES"
+        section      = SEC_NONE
+        net_count    = 0
+        r_is_kohm    = False   # set True when *R_UNIT KOHM is seen
 
-        while i < n:
-            raw = lines[i].strip()
-            i += 1
-            if not raw or raw.startswith("//"):
-                continue
-
-            # NAME_MAP section
-            if raw.startswith("*NAME_MAP"):
-                in_name_map = True
-                continue
-            if in_name_map:
-                if raw.startswith("*"):
-                    # *<id> <name>
-                    parts = raw.split()
-                    if len(parts) >= 2:
-                        key = parts[0]
-                        name = parts[1].strip("\"")
-                        self.name_map[key] = name
-                    continue
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                # ---- split code / inline comment using find() instead of split() ----
+                ci = line.find("//")
+                if ci >= 0:
+                    code_part    = line[:ci]
+                    comment_part = line[ci + 2:].strip()
                 else:
-                    # End of name map when a non-* line appears
-                    in_name_map = False
+                    code_part    = line
+                    comment_part = ""
+                raw = code_part.strip()
 
-            # New net
-            if raw.startswith("*D_NET"):
-                parts = raw.split()
-                if len(parts) < 3:
+                if not raw:
+                    if comment_part:
+                        body = comment_part.lstrip()
+                        if in_layer_map:
+                            if not body or body[0] != '*':
+                                in_layer_map = False
+                            else:
+                                lp = body.split(None, 2)
+                                if len(lp) >= 2:
+                                    layer_map[lp[0]] = lp[1]
+                        elif body.startswith("*LAYER_MAP"):
+                            in_layer_map = True
                     continue
-                net_name = self._resolve_name(parts[1])
-                try:
-                    total_cap = float(parts[2])
-                except ValueError:
-                    # Some tools may add units, handle basic case like 1.23e-12
-                    num = parts[2]
-                    # strip potential trailing chars (e.g., pF, fF)
-                    num = ''.join(ch for ch in num if (ch.isdigit() or ch in ".-+eE"))
-                    total_cap = float(num) if num else 0.0
-                current_net = NetRC(name=net_name, total_cap=total_cap)
-                self.nets[net_name] = current_net
-                section = None
-                continue
 
-            if current_net is None:
-                continue
-
-            if raw.startswith("*CONN"):
-                section = "CONN"
-                continue
-            if raw.startswith("*CAP"):
-                section = "CAP"
-                continue
-            if raw.startswith("*RES"):
-                section = "RES"
-                continue
-            if raw.startswith("*END"):
-                current_net = None
-                section = None
-                continue
-
-            # Inside sections
-            if section == "CONN":
-                # Example: *I U1/Z O ; *P A I
-                parts = raw.split()
-                if len(parts) < 3:
+                # All SPEF directives start with '*'
+                if raw[0] != '*':
+                    if in_name_map:
+                        in_name_map = False
+                    if in_port_map:
+                        in_port_map = False
                     continue
-                # parts[0] = *I or *P, parts[1] = pin, parts[2] = direction
-                pin_tok = parts[1]
-                dir_tok = parts[2]
-                pin_name = self._resolve_name(pin_tok)
-                if dir_tok.upper().startswith("O") or dir_tok.upper().startswith("B"):
-                    # Assume first O/B is driver
-                    if current_net.driver is None:
-                        current_net.driver = pin_name
-                elif dir_tok.upper().startswith("I"):
-                    current_net.sinks.append(pin_name)
 
-            elif section == "RES":
-                # Example: *1 node1 node2 R
-                parts = raw.split()
-                if len(parts) < 4:
-                    continue
-                node1 = self._resolve_name(parts[1])
-                node2 = self._resolve_name(parts[2])
-                try:
-                    rval = float(parts[3])
-                except ValueError:
-                    num = parts[3]
-                    num = ''.join(ch for ch in num if (ch.isdigit() or ch in ".-+eE"))
-                    try:
-                        rval = float(num) if num else 0.0
-                    except ValueError:
+                c1 = raw[1] if len(raw) > 1 else '\x00'
+
+                # ============================================================
+                # HOT PATH — inside a net (handles the vast majority of lines)
+                # ============================================================
+                if current_net is not None:
+                    if section == SEC_RES:
+                        # Typical line: *idx node1 node2 R_value [...]
+                        # split(None, 4): bounded split avoids splitting the tail
+                        parts = raw.split(None, 4)
+                        if len(parts) >= 4:
+                            node1 = _resolve(parts[1])
+                            node2 = _resolve(parts[2])
+                            rval  = _pf(parts[3])
+                            if r_is_kohm:
+                                rval *= 1000.0
+                            g = current_net.res_graph
+                            g.setdefault(node1, []).append((node2, rval))
+                            g.setdefault(node2, []).append((node1, rval))
+                            if comment_part:
+                                lvl, from_lvl, to_lvl = parse_level(comment_part)
+                                if "via" not in comment_part:
+                                    assign_level(current_net, node1, lvl)
+                                    assign_level(current_net, node2, lvl)
+                                else:
+                                    assign_level(current_net, node1, from_lvl or lvl)
+                                    assign_level(current_net, node2, to_lvl or lvl)
+                        else:
+                            # Single-token line → must be a section header
+                            if   c1 == 'E':                     current_net = None; section = SEC_NONE
+                            elif c1 == 'C' and raw[2:4] == 'AP': section = SEC_CAP
+                            elif c1 == 'C':                     section = SEC_CONN
+                            elif c1 == 'R':                     section = SEC_RES
                         continue
 
-                g = current_net.res_graph
-                g.setdefault(node1, []).append((node2, rval))
-                g.setdefault(node2, []).append((node1, rval))
+                    if section == SEC_CONN:
+                        # Typical line: *I|*P pin direction [...]
+                        # split(None, 3): we only need the first three tokens
+                        parts = raw.split(None, 3)
+                        if len(parts) >= 3:
+                            pin_name = _resolve(parts[1])
+                            # Use first-char set membership instead of upper().startswith()
+                            d0 = parts[2][0]
+                            if d0 in 'OoBb':
+                                if current_net.driver is None:
+                                    current_net.driver = pin_name
+                            elif d0 in 'Ii':
+                                current_net.sinks.append(pin_name)
+                            if comment_part:
+                                lvl, from_lvl, to_lvl = parse_level(comment_part)
+                                assign_level(current_net, pin_name, lvl)
+                        else:
+                            if   c1 == 'C' and raw[2:4] == 'AP': section = SEC_CAP
+                            elif c1 == 'C':                     section = SEC_CONN
+                            elif c1 == 'R':                     section = SEC_RES
+                            elif c1 == 'E':                     current_net = None; section = SEC_NONE
+                        continue
+
+                    # section == SEC_NONE or SEC_CAP: scan for next section header
+                    if   c1 == 'C' and raw[2:5] == 'ONN': section = SEC_CONN
+                    elif c1 == 'C' and raw[2:4] == 'AP':  section = SEC_CAP
+                    elif c1 == 'R':                        section = SEC_RES
+                    elif c1 == 'E':                        current_net = None; section = SEC_NONE
+                    continue
+
+                # ============================================================
+                # LOWER-FREQUENCY PATH — outside a net (headers, *D_NET)
+                # ============================================================
+
+                # *D_NET — most frequent outside-net line once headers are done
+                if c1 == 'D':
+                    parts = raw.split(None, 3)
+                    if len(parts) >= 3:
+                        in_port_map = False
+                        net_name    = _resolve(parts[1])
+                        total_cap   = _pf(parts[2])
+                        current_net = NetRC(name=net_name, total_cap=total_cap)
+                        nets_dict[net_name] = current_net
+                        section   = SEC_NONE
+                        net_count += 1
+                        if net_count % 5000 == 0:
+                            print(f"[{path}] parsed {net_count} nets...")
+                    continue
+
+                # *NAME_MAP entries
+                if in_name_map:
+                    if c1 == 'P' and raw.startswith("*PORTS"):
+                        in_name_map = False
+                        in_port_map = True
+                    else:
+                        parts = raw.split(None, 2)
+                        if len(parts) >= 2:
+                            name_map[parts[0]] = parts[1].strip('"')
+                    continue
+
+                # *PORTS entries
+                if in_port_map:
+                    parts = raw.split(None, 5)
+                    if len(parts) >= 5:
+                        port_map[parts[0]] = {'I/O': parts[1], 'x': parts[3], 'y': parts[4]}
+                    continue
+
+                # File-level headers (encountered only a handful of times)
+                if   c1 == 'N' and raw.startswith("*NAME_MAP"): in_name_map = True
+                elif c1 == 'P' and raw.startswith("*PORTS"):    in_port_map = True
+                elif '_UNIT 1 ' in raw:
+                    # *R_UNIT 1 OHM / *C_UNIT 1 PF / *L_UNIT 1 HENRY / *T_UNIT 1 NS
+                    # Avoid regex: split is enough since format is fixed
+                    uparts = raw.split(None, 3)
+                    if len(uparts) >= 3:
+                        obj  = c1          # 'R', 'C', 'L', or 'T'
+                        unit = uparts[2]
+                        if obj == 'R':
+                            self.r_unit = unit
+                            r_is_kohm   = (unit == 'KOHM')
+                        elif obj == 'C':
+                            self.c_unit = unit
+                        elif obj == 'L':
+                            self.l_unit = unit
+                        elif obj == 'T':
+                            self.t_unit = unit
 
             # CAP section is not needed for this tool beyond total_cap in *D_NET
 
-
 # ------------------------ correlation & statistics ------------------------
-
-
 def pearson_corr(xs: Iterable[float], ys: Iterable[float]) -> Optional[float]:
     xs = list(xs)
     ys = list(ys)
@@ -282,9 +431,10 @@ class CapComparison:
 @dataclass
 class ResComparison:
     net: str
+    driver: str
+    load: str
     r1: float
     r2: float
-
 
 def _aggregate(values: List[float], mode: str) -> Optional[float]:
     """Aggregate a list of resistances into a single value per net.
@@ -304,37 +454,128 @@ def _aggregate(values: List[float], mode: str) -> Optional[float]:
         return sum(values)
     return None
 
+def init_worker(s1_global, s2_global):
+    global s1, s2
+    s1 = s1_global
+    s2 = s2_global
+
+def process_net(net_name):
+    """处理单个网络的对比"""
+    n1 = s1.nets[net_name]
+    n2 = s2.nets[net_name]
+    
+    # cap_rows 数据
+    cap_row = CapComparison(net=net_name, c1=n1.total_cap, c2=n2.total_cap)
+    
+    # res_rows 数据
+    res_rows = []
+    dr1 = n1.driver_sink_resistances()
+    dr2 = n2.driver_sink_resistances()
+    common_sinks = sorted(set(dr1.keys()) & set(dr2.keys()))
+    
+    for s in common_sinks:
+        res_rows.append(ResComparison(
+            net=net_name, 
+            driver=n1.driver, 
+            load=s, 
+            r1=dr1[s], 
+            r2=dr2[s]
+        ))
+    
+    return cap_row, res_rows
+
+def process_net_batch(net_names_batch):
+    """批量处理多个网络，减少对象访问开销"""
+    results = []
+    for net_name in net_names_batch:
+        n1 = s1.nets[net_name]
+        n2 = s2.nets[net_name]
+        
+        cap_row = CapComparison(net=net_name, c1=n1.total_cap, c2=n2.total_cap)
+        
+        dr1 = n1.driver_sink_resistances()
+        dr2 = n2.driver_sink_resistances()
+        common_sinks = sorted(set(dr1.keys()) & set(dr2.keys()))
+        
+        res_rows = [
+            ResComparison(net=net_name, driver=n1.driver, load=s, r1=dr1[s], r2=dr2[s])
+            for s in common_sinks
+        ]
+        
+        results.append((cap_row, res_rows))
+    
+    return results
+
+def compare_spef1(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison]]:
+    common_nets = sorted(set(s1.nets.keys()) & set(s2.nets.keys()))
+    print("common_nets are sorted")
+    cap_rows: List[CapComparison] = []
+    res_rows: List[ResComparison] = []
+    batch_size = 16
+    batches = [common_nets[i:i+batch_size] for i in range(0, len(common_nets), batch_size)]
+    with multiprocessing.Pool(
+        # processes=num_processes,
+        initializer=init_worker,
+        initargs=(s1, s2)
+    ) as pool:
+        batch_results = pool.map(process_net_batch, batches)
+    
+    # 展平结果
+    cap_rows = []
+    res_rows = []
+    for batch in batch_results:
+        for cap_row, res_row_list in batch:
+            cap_rows.append(cap_row)
+            res_rows.extend(res_row_list)
+    print("start to find top 10")
+    # 计算偏差并找出最大的10个
+    cap_rows_with_deviation = [(abs(row.c1 - row.c2), row) for row in cap_rows]
+    res_rows_with_deviation = [(abs(row.r1 - row.r2), row) for row in res_rows]
+    
+    top_10_cap = [row for _, row in nlargest(10, cap_rows_with_deviation, key=lambda x: x[0])]
+    top_10_res = [row for _, row in nlargest(10, res_rows_with_deviation, key=lambda x: x[0])]
+
+    return cap_rows, res_rows, top_10_cap, top_10_res
 
 def compare_spef(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison]]:
     common_nets = sorted(set(s1.nets.keys()) & set(s2.nets.keys()))
     print("common_nets are sorted")
     cap_rows: List[CapComparison] = []
     res_rows: List[ResComparison] = []
- 
-    for net_name in common_nets:
-        n1 = s1.nets[net_name]
-        n2 = s2.nets[net_name]
-        cap_rows.append(CapComparison(net=net_name, c1=n1.total_cap, c2=n2.total_cap))
- 
-        dr1 = n1.driver_sink_resistances()
-        dr2 = n2.driver_sink_resistances()
-        common_sinks = sorted(set(dr1.keys()) & set(dr2.keys()))
-        if not common_sinks:
-            continue
- 
-        for s in common_sinks:
-            val1 = dr1[s]
-            val2 = dr2[s]
-            res_rows.append(ResComparison(net=net_name, driver=n1.driver, load=s, r1=val1, r2=val2))
- 
-        # 计算偏差并找出最大的10个
-        cap_rows_with_deviation = [(abs(row.c1 - row.c2), row) for row in cap_rows]
-        res_rows_with_deviation = [(abs(row.r1 - row.r2), row) for row in res_rows]
-        top_10_cap = [row for _, row in nlargest(10, cap_rows_with_deviation, key=lambda x: x[0])]
-        top_10_res = [row for _, row in nlargest(10, res_rows_with_deviation, key=lambda x: x[0])]
- 
-        return cap_rows, res_rows, top_10_cap, top_10_res
 
+    i = 0
+    with open("net_cap.data", 'w', encoding='utf-8') as fc, \
+         open("net_res.data", 'w', encoding='utf-8') as fr:
+        for net_name in common_nets:
+            n1 = s1.nets[net_name]
+            n2 = s2.nets[net_name]
+            cap_rows.append(CapComparison(net=net_name, c1=n1.total_cap, c2=n2.total_cap))
+            print(f"{net_name} {n1.total_cap} {n2.total_cap}", file=fc)
+
+            dr1 = n1.driver_sink_resistances()
+            dr2 = n2.driver_sink_resistances()
+            common_sinks = sorted(set(dr1.keys()) & set(dr2.keys()))
+            if not common_sinks:
+                continue
+
+            for s in common_sinks:
+                val1 = dr1[s]
+                val2 = dr2[s]
+                res_rows.append(ResComparison(net=net_name, driver=n1.driver, load=s, r1=val1, r2=val2))
+                print(f"{net_name} {n1.driver} {s} {val1} {val2}", file=fr)
+            i += 1
+            if i % 1000 == 0:
+                print(f"{i} nets compared")
+
+    print("start to find top 10")
+    # 计算偏差并找出最大的10个
+    cap_rows_with_deviation = [(abs(row.c1 - row.c2), row) for row in cap_rows]
+    res_rows_with_deviation = [(abs(row.r1 - row.r2), row) for row in res_rows]
+    
+    top_10_cap = [row for _, row in nlargest(10, cap_rows_with_deviation, key=lambda x: x[0])]
+    top_10_res = [row for _, row in nlargest(10, res_rows_with_deviation, key=lambda x: x[0])]
+
+    return cap_rows, res_rows, top_10_cap, top_10_res
 
 def write_caps_csv(path: str, caps: List[CapComparison]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -344,7 +585,6 @@ def write_caps_csv(path: str, caps: List[CapComparison]) -> None:
             ratio = (row.c2 / row.c1) if row.c1 != 0 else "inf"
             delta = row.c2 - row.c1
             w.writerow([row.net, row.c1, row.c2, ratio, delta])
-
 
 def write_res_csv(path: str, ress: List[ResComparison], r_agg: str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -390,11 +630,41 @@ def summarize_and_print(caps: List[CapComparison], ress: List[ResComparison],
     else:
         print("Driver->sink R correlation: N/A (not enough data or zero variance)")
 
-
 # ----------------------------- GUI (Tkinter) -----------------------------
 
 
-def launch_gui() -> None:
+def collect_spef_paths(inputs: Iterable[str]) -> List[str]:
+    """Expand file and directory inputs into a SPEF path list.
+
+    Duplicates are preserved so the same SPEF can be loaded twice for testing.
+    """
+    spef_paths: List[str] = []
+
+    for raw_path in inputs:
+        if not raw_path:
+            continue
+        path = os.path.abspath(raw_path)
+        if os.path.isdir(path):
+            try:
+                names = sorted(os.listdir(path))
+            except OSError:
+                continue
+            for name in names:
+                child = os.path.join(path, name)
+                if not os.path.isfile(child):
+                    continue
+                if not name.lower().endswith(".spef"):
+                    continue
+                spef_paths.append(child)
+            continue
+
+        if os.path.isfile(path) and path.lower().endswith(".spef"):
+            spef_paths.append(path)
+
+    return spef_paths
+
+
+def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = False) -> None:
     """Launch an interactive GUI for multi-SPEF correlation analysis."""
 
     try:
@@ -408,7 +678,8 @@ def launch_gui() -> None:
         return
 
     class RcCorrApp:
-        def __init__(self, root: "tk.Tk") -> None:
+        def __init__(self, root: "tk.Tk", preload_paths: Optional[Iterable[str]] = None,
+                     auto_run: bool = False) -> None:
             self.root = root
             self.root.title("SPEF RC Correlation")
 
@@ -428,8 +699,17 @@ def launch_gui() -> None:
             self.max_r_var = tk.StringVar()
 
             self.points: List[Dict[str, float]] = []  # per-net data after filtering
+            self._auto_run_requested = auto_run
 
             self._build_ui()
+
+            if preload_paths:
+                self._preload_spefs(preload_paths)
+            elif self._auto_run_requested:
+                self._auto_run_requested = False
+
+            if self._auto_run_requested and len(self.spefs) >= 2:
+                self.root.after(0, self._auto_select_and_run)
 
         # ----------------------------- UI building -----------------------------
 
@@ -566,6 +846,86 @@ def launch_gui() -> None:
             self.tree.insert("", "end", iid=name, values=(name, len(spef.nets), path))
             self._refresh_spef_choices()
 
+        def _load_spef_path(self, path: str, name: Optional[str] = None) -> None:
+            if not path:
+                return
+
+            if name is None:
+                base_name = os.path.splitext(os.path.basename(path))[0] or "spef"
+                name = base_name
+                suffix = 2
+                while name in self.spefs:
+                    name = f"{base_name}_{suffix}"
+                    suffix += 1
+
+            self.root.config(cursor="watch")
+            self.root.update_idletasks()
+            try:
+                spef = SpefFile(path)
+                spef.parse()
+            finally:
+                self.root.config(cursor="")
+                self.root.update_idletasks()
+
+            self.spefs[name] = spef
+            self.tree.insert("", "end", iid=name, values=(name, len(spef.nets), path))
+            self._refresh_spef_choices()
+
+        def _preload_spefs(self, preload_paths: Iterable[str]) -> None:
+            paths = list(preload_paths)
+            errors: List[str] = []
+
+            # When there are 2+ paths, parse them in parallel to halve the wait time
+            if len(paths) >= 2:
+                from concurrent.futures import ProcessPoolExecutor
+                try:
+                    self.root.config(cursor="watch")
+                    self.root.update_idletasks()
+                    with ProcessPoolExecutor(max_workers=len(paths)) as ex:
+                        futures = {ex.submit(_parse_one, p): p for p in paths}
+                    spefs_loaded: List[Tuple[str, "SpefFile"]] = []
+                    for fut, p in futures.items():
+                        try:
+                            spefs_loaded.append((p, fut.result()))
+                        except Exception as exc:
+                            errors.append(f"{p}: {exc}")
+                except Exception as exc:
+                    errors.append(f"parallel preload failed: {exc}; retrying sequentially")
+                    spefs_loaded = []
+                    for p in paths:
+                        try:
+                            spef = SpefFile(p)
+                            spef.parse()
+                            spefs_loaded.append((p, spef))
+                        except Exception as e2:
+                            errors.append(f"{p}: {e2}")
+                finally:
+                    self.root.config(cursor="")
+                    self.root.update_idletasks()
+
+                for p, spef in spefs_loaded:
+                    base_name = os.path.splitext(os.path.basename(p))[0] or "spef"
+                    name = base_name
+                    suffix = 2
+                    while name in self.spefs:
+                        name = f"{base_name}_{suffix}"
+                        suffix += 1
+                    self.spefs[name] = spef
+                    self.tree.insert("", "end", iid=name, values=(name, len(spef.nets), p))
+                    self._refresh_spef_choices()
+            else:
+                for path in paths:
+                    try:
+                        self._load_spef_path(path)
+                    except Exception as exc:
+                        errors.append(f"{path}: {exc}")
+
+            if errors:
+                messagebox.showwarning(
+                    "Preload warning",
+                    "Some SPEF files could not be loaded at startup:\n\n" + "\n".join(errors),
+                )
+
         def _remove_selected(self) -> None:
             for item in self.tree.selection():
                 self.tree.delete(item)
@@ -582,6 +942,15 @@ def launch_gui() -> None:
                 self.ref_var.set(names[0] if names else "")
             if self.fit_var.get() not in names:
                 self.fit_var.set(names[1] if len(names) > 1 else (names[0] if len(names) == 1 else ""))
+
+        def _auto_select_and_run(self) -> None:
+            names = list(self.tree.get_children())
+            if len(names) < 2:
+                return
+            self.ref_var.set(names[0])
+            self.fit_var.set(names[1])
+            self._auto_run_requested = False
+            self._run_analysis()
 
         # -------------------------- filtering helpers --------------------------
 
@@ -662,7 +1031,7 @@ def launch_gui() -> None:
                 return
 
             r_agg = self.r_agg_var.get()
-            caps, ress = compare_spef(ref, fit, r_agg)
+            caps, ress, _top_10_cap, _top_10_res = compare_spef(ref, fit, r_agg)
 
             cap_map = {c.net: c for c in caps}
             res_map = {r.net: r for r in ress}
@@ -860,8 +1229,46 @@ def launch_gui() -> None:
                     self.canvas.draw_idle()
 
     root = tk.Tk()
-    RcCorrApp(root)
+    RcCorrApp(root, preload_paths=preload_paths, auto_run=auto_run)
     root.mainloop()
+
+
+# ---------------------------- parallel parse helpers --------------------
+
+
+def _parse_one(path: str) -> "SpefFile":
+    """Top-level worker: parse a single SPEF and return the SpefFile.
+
+    Must be a module-level function so multiprocessing can pickle it.
+    """
+    spef = SpefFile(path)
+    spef.parse()
+    return spef
+
+
+def parse_spefs_parallel(path1: str, path2: str) -> Tuple["SpefFile", "SpefFile"]:
+    """Parse two SPEF files concurrently in separate processes.
+
+    Returns (spef1, spef2) after both have finished.
+    Falls back to sequential parsing if the subprocess pool fails for any reason.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+
+    print(f"Parsing {path1} and {path2} in parallel ...")
+    try:
+        with ProcessPoolExecutor(max_workers=2) as ex:
+            f1 = ex.submit(_parse_one, path1)
+            f2 = ex.submit(_parse_one, path2)
+            s1 = f1.result()
+            s2 = f2.result()
+        return s1, s2
+    except Exception as exc:  # pragma: no cover
+        print(f"[warn] parallel parse failed ({exc}), falling back to sequential")
+        s1 = SpefFile(path1)
+        s1.parse()
+        s2 = SpefFile(path2)
+        s2.parse()
+        return s1, s2
 
 
 # ---------------------------- CLI entry point ----------------------------
@@ -883,25 +1290,26 @@ def main() -> None:
         action="store_true",
         help="Launch GUI for interactive multi-SPEF correlation analysis",
     )
+    parser.add_argument(
+        "--gui-auto-run",
+        action="store_true",
+        help="In GUI mode, auto-select the first two loaded SPEFs and run analysis once",
+    )
 
     args = parser.parse_args()
 
+    gui_inputs = collect_spef_paths([p for p in [args.spef1, args.spef2] if p])
+
     if args.gui or (args.spef1 is None and args.spef2 is None):
-        launch_gui()
+        launch_gui(gui_inputs, auto_run=args.gui_auto_run)
         return
 
     if args.spef1 is None or args.spef2 is None:
         parser.error("spef1 and spef2 are required in CLI mode (or use --gui).")
 
-    s1 = SpefFile(args.spef1)
-    s2 = SpefFile(args.spef2)
+    s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
 
-    print(f"Parsing {args.spef1} ...")
-    s1.parse()
-    print(f"Parsing {args.spef2} ...")
-    s2.parse()
-
-    caps, ress = compare_spef(s1, s2, args.r_agg)
+    caps, ress, _top_10_cap, _top_10_res = compare_spef(s1, s2, args.r_agg)
     summarize_and_print(caps, ress, s1, s2, args.r_agg)
 
     if args.csv_prefix:
