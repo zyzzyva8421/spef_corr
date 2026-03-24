@@ -45,6 +45,9 @@ from heapq import nlargest
 import multiprocessing
 from functools import partial
 
+import numpy as np
+from scipy.spatial import cKDTree
+
 @dataclass
 class NetRC:
     name: str
@@ -698,6 +701,12 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
             self.points_cap: List[Dict[str, float]] = []  # per-net data after filtering
             self.points_res: List[Dict[str, float]] = []  # per-pin-pair data after filtering
+            self.kdtree_c: Optional[cKDTree] = None
+            self.kdtree_r: Optional[cKDTree] = None
+            self._xspan_c: float = 1.0
+            self._yspan_c: float = 1.0
+            self._xspan_r: float = 1.0
+            self._yspan_r: float = 1.0
             self._auto_run_requested = auto_run
 
             self._build_ui()
@@ -1121,11 +1130,28 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                 vmin_c = min_c - pad_c
                 vmax_c = max_c + pad_c
 
-                colors_c = ["tab:red" if y > x else "tab:blue" for x, y in zip(xs_c, ys_c)]
+                xs_c_arr = np.array(xs_c)
+                ys_c_arr = np.array(ys_c)
+                mask_red_c = ys_c_arr > xs_c_arr
                 self.ax_c.plot([vmin_c, vmax_c], [vmin_c, vmax_c], "k--", linewidth=1.0)
-                self.ax_c.scatter(xs_c, ys_c, c=colors_c, s=20, alpha=0.8)
+                if mask_red_c.any():
+                    self.ax_c.plot(xs_c_arr[mask_red_c], ys_c_arr[mask_red_c],
+                                   linestyle='', marker='.', color='tab:red',
+                                   markersize=4, alpha=0.8, rasterized=True)
+                if (~mask_red_c).any():
+                    self.ax_c.plot(xs_c_arr[~mask_red_c], ys_c_arr[~mask_red_c],
+                                   linestyle='', marker='.', color='tab:blue',
+                                   markersize=4, alpha=0.8, rasterized=True)
                 self.ax_c.set_xlim(vmin_c, vmax_c)
                 self.ax_c.set_ylim(vmin_c, vmax_c)
+
+                self._xspan_c = float(xs_c_arr.max() - xs_c_arr.min()) or 1.0
+                self._yspan_c = float(ys_c_arr.max() - ys_c_arr.min()) or 1.0
+                pts_c = np.column_stack([xs_c_arr / self._xspan_c,
+                                         ys_c_arr / self._yspan_c])
+                self.kdtree_c = cKDTree(pts_c)
+            else:
+                self.kdtree_c = None
 
             title_c = f"Total C: {ref_name} (X) vs {fit_name} (Y)"
             if corr_c is not None:
@@ -1145,11 +1171,28 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                 vmin_r = min_r - pad_r
                 vmax_r = max_r + pad_r
 
-                colors_r = ["tab:red" if y > x else "tab:blue" for x, y in zip(xs_r, ys_r)]
+                xs_r_arr = np.array(xs_r)
+                ys_r_arr = np.array(ys_r)
+                mask_red_r = ys_r_arr > xs_r_arr
                 self.ax_r.plot([vmin_r, vmax_r], [vmin_r, vmax_r], "k--", linewidth=1.0)
-                self.ax_r.scatter(xs_r, ys_r, c=colors_r, s=20, alpha=0.8)
+                if mask_red_r.any():
+                    self.ax_r.plot(xs_r_arr[mask_red_r], ys_r_arr[mask_red_r],
+                                   linestyle='', marker='.', color='tab:red',
+                                   markersize=4, alpha=0.8, rasterized=True)
+                if (~mask_red_r).any():
+                    self.ax_r.plot(xs_r_arr[~mask_red_r], ys_r_arr[~mask_red_r],
+                                   linestyle='', marker='.', color='tab:blue',
+                                   markersize=4, alpha=0.8, rasterized=True)
                 self.ax_r.set_xlim(vmin_r, vmax_r)
                 self.ax_r.set_ylim(vmin_r, vmax_r)
+
+                self._xspan_r = float(xs_r_arr.max() - xs_r_arr.min()) or 1.0
+                self._yspan_r = float(ys_r_arr.max() - ys_r_arr.min()) or 1.0
+                pts_r = np.column_stack([xs_r_arr / self._xspan_r,
+                                         ys_r_arr / self._yspan_r])
+                self.kdtree_r = cKDTree(pts_r)
+            else:
+                self.kdtree_r = None
 
             title_r = f"Driver->sink R: {ref_name} (X) vs {fit_name} (Y)"
             if corr_r is not None:
@@ -1200,59 +1243,52 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                 return
 
             if ax is self.ax_c:
-                xs = [p["c_ref"] for p in self.points_cap]
-                ys = [p["c_fit"] for p in self.points_cap]
                 annot = self.annot_c
+                kdtree = self.kdtree_c
+                xspan = self._xspan_c
+                yspan = self._yspan_c
             else:
-                xs = [p["r_ref"] for p in self.points_res]
-                ys = [p["r_fit"] for p in self.points_res]
                 annot = self.annot_r
+                kdtree = self.kdtree_r
+                xspan = self._xspan_r
+                yspan = self._yspan_r
 
             x0, y0 = float(event.xdata), float(event.ydata)
-            if not xs or not ys:
+            if kdtree is None:
                 return
 
-            x_min, x_max = min(xs), max(xs)
-            y_min, y_max = min(ys), max(ys)
-            x_span = x_max - x_min or 1.0
-            y_span = y_max - y_min or 1.0
+            q = np.array([x0 / xspan, y0 / yspan])
+            # Threshold of 0.005 in normalized squared-distance space (≈0.0707 linear)
+            dist, best_i = kdtree.query(q, k=1,
+                                        distance_upper_bound=math.sqrt(0.005))
 
-            best_i = None
-            best_d2 = None
-            for i, (x, y) in enumerate(zip(xs, ys)):
-                dx = (x - x0) / x_span
-                dy = (y - y0) / y_span
-                d2 = dx * dx + dy * dy
-                if best_d2 is None or d2 < best_d2:
-                    best_d2 = d2
-                    best_i = i
-
-            if best_i is None:
-                return
-
-            # Threshold in normalized space; tweak if needed
-            if best_d2 is not None and best_d2 < 0.005:
-                if ax is self.ax_c:
-                    p = self.points_cap[best_i]
-                    text = (
-                        f"net: {p['net']}\n"
-                        f"C_ref={p['c_ref']:.3g}, C_fit={p['c_fit']:.3g}"
-                    )
-                else:
-                    p = self.points_res[best_i]
-                    text = (
-                        f"net: {p['net']}\n"
-                        f"R_ref={p['r_ref']:.3g}, R_fit={p['r_fit']:.3g}"
-                    )
-                annot.xy = (xs[best_i], ys[best_i])
-                annot.set_text(text)
-                annot.get_bbox_patch().set_facecolor("#ffffcc")
-                annot.set_visible(True)
-                self.canvas.draw_idle()
-            else:
+            if dist == np.inf:
                 if annot.get_visible():
                     annot.set_visible(False)
                     self.canvas.draw_idle()
+                return
+
+            if ax is self.ax_c:
+                xs = [p["c_ref"] for p in self.points_cap]
+                ys = [p["c_fit"] for p in self.points_cap]
+                p = self.points_cap[best_i]
+                text = (
+                    f"net: {p['net']}\n"
+                    f"C_ref={p['c_ref']:.3g}, C_fit={p['c_fit']:.3g}"
+                )
+            else:
+                xs = [p["r_ref"] for p in self.points_res]
+                ys = [p["r_fit"] for p in self.points_res]
+                p = self.points_res[best_i]
+                text = (
+                    f"net: {p['net']}\n"
+                    f"R_ref={p['r_ref']:.3g}, R_fit={p['r_fit']:.3g}"
+                )
+            annot.xy = (xs[best_i], ys[best_i])
+            annot.set_text(text)
+            annot.get_bbox_patch().set_facecolor("#ffffcc")
+            annot.set_visible(True)
+            self.canvas.draw_idle()
 
     root = tk.Tk()
     RcCorrApp(root, preload_paths=preload_paths, auto_run=auto_run)
