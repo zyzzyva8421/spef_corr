@@ -603,3 +603,91 @@ class TestGuiCliWiring:
         spef_mod.main()
 
         assert calls == [([], False)]
+
+
+# ---------------------------------------------------------------------------
+# Real-SPEF integration tests  (skipped unless --spef-path is supplied)
+# ---------------------------------------------------------------------------
+
+def _compare_spef_in_tmpdir(sf1, sf2, r_agg="max"):
+    """Run compare_spef in a temporary directory and return its results.
+
+    compare_spef writes net_cap.data / net_res.data to the current directory;
+    this helper changes into a temp directory for the call and restores cwd.
+    """
+    orig_cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as td:
+        os.chdir(td)
+        try:
+            return compare_spef(sf1, sf2, r_agg)
+        finally:
+            os.chdir(orig_cwd)
+
+
+@pytest.fixture
+def parsed_real_spef(real_spef_path):
+    """Return a parsed SpefFile for the SPEF supplied via --spef-path."""
+    sf = SpefFile(real_spef_path)
+    sf.parse()
+    return sf
+
+
+class TestRealSpef:
+    """Integration tests that exercise a real SPEF file supplied via --spef-path.
+
+    Run with:
+        pytest --spef-path /path/to/20-blabla.spef
+    """
+
+    def test_parse_succeeds(self, parsed_real_spef):
+        """The file can be opened and parsed without raising an exception."""
+        assert len(parsed_real_spef.nets) > 0, "Expected at least one net in the SPEF file"
+
+    def test_nets_have_names(self, parsed_real_spef):
+        """Every net key is a non-empty string."""
+        for name in parsed_real_spef.nets:
+            assert isinstance(name, str) and name, f"Invalid net name: {name!r}"
+
+    def test_nets_have_non_negative_cap(self, parsed_real_spef):
+        """Total capacitance for each net should be non-negative."""
+        for name, net in parsed_real_spef.nets.items():
+            assert net.total_cap >= 0.0, f"Negative cap for net {name}: {net.total_cap}"
+
+    def test_self_comparison_cap_correlation_is_one(self, parsed_real_spef):
+        """Comparing the file against itself should yield cap correlation == 1.0."""
+        caps, ress, top_c, top_r = _compare_spef_in_tmpdir(
+            parsed_real_spef, parsed_real_spef
+        )
+
+        assert len(caps) > 0
+        c1_vals = [row.c1 for row in caps]
+        c2_vals = [row.c2 for row in caps]
+        corr = pearson_corr(c1_vals, c2_vals)
+        assert corr is None or corr == pytest.approx(1.0), (
+            f"Expected cap correlation 1.0 for self-comparison, got {corr}"
+        )
+
+    def test_self_comparison_top10_length(self, parsed_real_spef):
+        """top_10_cap and top_10_res should each contain at most 10 items."""
+        caps, ress, top_c, top_r = _compare_spef_in_tmpdir(
+            parsed_real_spef, parsed_real_spef
+        )
+
+        assert len(top_c) <= 10
+        assert len(top_r) <= 10
+
+    def test_write_caps_csv_from_real_spef(self, parsed_real_spef, tmp_path):
+        """CSV written from real SPEF data has the expected header and one row per net."""
+        caps, ress, _top_c, _top_r = _compare_spef_in_tmpdir(
+            parsed_real_spef, parsed_real_spef
+        )
+
+        csv_path = str(tmp_path / "caps.csv")
+        write_caps_csv(csv_path, caps)
+
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+
+        assert rows[0] == ["net", "C_tool1", "C_tool2",
+                            "ratio_tool2_over_tool1", "delta_tool2_minus_tool1"]
+        assert len(rows) == len(caps) + 1  # header + one row per net
