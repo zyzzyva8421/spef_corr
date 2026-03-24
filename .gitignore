@@ -33,3 +33,5 @@ net_res.data
 # CSV outputs (from test runs)
 *_caps.csv
 *_res_*.csv
+
+*.spef

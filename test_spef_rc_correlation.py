@@ -73,9 +73,9 @@ MINIMAL_SPEF = textwrap.dedent("""\
     *I *3 I *C 0.0 0.0
     *I *4 I *C 0.0 0.0
     *CAP
-    *1 *2 0.5
-    *2 *3 0.5
-    *3 *4 0.5
+    1 *2 0.5
+    2 *3 0.5
+    3 *4 0.5
     *RES
     *1 *2 *3 10.0
     *2 *3 *4 5.0
@@ -247,7 +247,66 @@ class TestSpefFileParse:
         neighbors = dict(g["drv_u1:Z"])
         assert neighbors["sink_u2:A"] == pytest.approx(10.0)
 
+    def test_segment_caps_parsed(self):
+        """Test that segment capacitances are parsed correctly."""
+        sf = _make_spef_object()
+        net = sf.nets["net_A"]
+        # Should have 3 segment cap entries (indices 1, 2, 3)
+        assert len(net.segment_caps) == 3
+        # Entry 1: node *2 (drv_u1:Z) to ground, 0.5 pF
+        assert net.segment_caps[0] == ("drv_u1:Z", None, 0.5)
+        # Entry 2: node *3 (sink_u2:A) to ground, 0.5 pF
+        assert net.segment_caps[1] == ("sink_u2:A", None, 0.5)
+        # Entry 3: node *4 (sink_u3:B) to ground, 0.5 pF
+        assert net.segment_caps[2] == ("sink_u3:B", None, 0.5)
+
+    def test_segment_caps_mutual(self):
+        """Test parsing of mutual capacitances between nodes."""
+        spef = textwrap.dedent("""\
+            *SPEF "IEEE 1481-1999"
+            *DESIGN "test"
+            *DATE "2026:01:01:00:00:00"
+            *VENDOR "test"
+            *PROGRAM "test"
+            *VERSION "1.0"
+            *DIVIDER /
+            *DELIMITER :
+            *BUS_DELIMITER [ ]
+            *T_UNIT 1 NS
+            *C_UNIT 1 PF
+            *R_UNIT 1 OHM
+            *L_UNIT 1 HENRY
+
+            *NAME_MAP
+            *1 net_A
+            *2 drv_u1:Z
+            *3 sink_u2:A
+
+            *D_NET *1 2.0
+            *CONN
+            *I *2 O *C 0.0 0.0
+            *I *3 I *C 0.0 0.0
+            *CAP
+            1 *2 0.8
+            2 *3 0.8
+            3 *2 *3 0.4
+            *RES
+            *1 *2 *3 10.0
+            *END
+        """)
+        sf = _make_spef_object(spef)
+        net = sf.nets["net_A"]
+        # Should have 3 entries: 2 grounded, 1 mutual
+        assert len(net.segment_caps) == 3
+        # Entry 1: node to ground
+        assert net.segment_caps[0] == ("drv_u1:Z", None, 0.8)
+        # Entry 2: node to ground  
+        assert net.segment_caps[1] == ("sink_u2:A", None, 0.8)
+        # Entry 3: mutual capacitance between two nodes
+        assert net.segment_caps[2] == ("drv_u1:Z", "sink_u2:A", 0.4)
+
     def test_units_ohm(self):
+
         assert _make_spef_object().r_unit == "OHM"
 
     def test_kohm_scaling(self):

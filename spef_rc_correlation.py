@@ -56,6 +56,9 @@ class NetRC:
 
     node_levels: Dict[str, int] = field(default_factory=dict)
     node_layers: Dict[str, str] = field(default_factory=dict)
+    # segment capacitances: list of (node1, node2, cap_value)
+    # node2 is None for grounded caps, otherwise both nodes present for mutual caps
+    segment_caps: List[Tuple[str, Optional[str], float]] = field(default_factory=list)
     # cache for driver->sink resistance
     _driver_sink_res_cache: Optional[Dict[str, float]] = field(default=None, init=False, repr=False)
     _node_prefix_map: Optional[Dict[str, str]] = field(default=None, init=False, repr=False)
@@ -306,6 +309,43 @@ class SpefFile:
                             elif c1 == 'R' and raw[2:4] == 'ES': 
                                 #print(f"Warning: unexpected line in RES section of net {current_net.name} (missing END header): '{raw}'")
                                 section = SEC_RES
+                        continue
+
+                    if section == SEC_CAP:
+                        # Parse CAP entries: 
+                        # - Format 1: idx node1 cap_value (node to ground)
+                        # - Format 2: idx node1 node2 cap_value (mutual cap)
+                        parts = raw.split(None, 4)
+                        if len(parts) >= 3:
+                            # Check if this is a numeric index (CAP entry) or section header
+                            try:
+                                idx = int(parts[0])
+                                # This is a CAP entry
+                                if len(parts) == 3:
+                                    # Node to ground: idx node1 cap_value
+                                    node1 = _resolve(parts[1])
+                                    cap_val = _pf(parts[2])
+                                    current_net.segment_caps.append((node1, None, cap_val))
+                                elif len(parts) >= 4:
+                                    # Mutual cap: idx node1 node2 cap_value
+                                    node1 = _resolve(parts[1])
+                                    node2 = _resolve(parts[2])
+                                    cap_val = _pf(parts[3])
+                                    current_net.segment_caps.append((node1, node2, cap_val))
+                            except ValueError:
+                                # Not a numeric index, must be a section header
+                                if   c1 == 'C' and raw[2:4] == 'AP': section = SEC_CAP
+                                elif c1 == 'C' and raw[2:5] == 'ONN': section = SEC_CONN
+                                elif c1 == 'R' and raw[2:4] == 'ES': 
+                                    #print(f"Warning: unexpected line in CAP section of net {current_net.name} (missing END header?): '{raw}'")
+                                    section = SEC_RES
+                                elif c1 == 'E' and raw[2:4] == 'ND': current_net = None; section = SEC_NONE
+                        else:
+                            # Single or double token line (section header)
+                            if   c1 == 'E' and raw[2:4] == 'ND':                     current_net = None; section = SEC_NONE
+                            elif c1 == 'C' and raw[2:4] == 'AP': section = SEC_CAP
+                            elif c1 == 'C' and raw[2:5] == 'ONN':                     section = SEC_CONN
+                            elif c1 == 'R' and raw[2:4] == 'ES': section = SEC_RES
                         continue
 
                     if section == SEC_CONN:
