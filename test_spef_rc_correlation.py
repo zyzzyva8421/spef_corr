@@ -31,6 +31,8 @@ from spef_rc_correlation import (
     SpefFile,
     collect_spef_paths,
     compare_spef,
+    parse_net_cap_data,
+    parse_net_res_data,
     parse_spefs_parallel,
     pearson_corr,
     write_caps_csv,
@@ -510,6 +512,154 @@ class TestParseSpefParallel:
             assert net_par.total_cap == pytest.approx(net_seq.total_cap)
             assert net_par.driver == net_seq.driver
             assert sorted(net_par.sinks) == sorted(net_seq.sinks)
+
+
+# ---------------------------------------------------------------------------
+# parse_net_cap_data / parse_net_res_data
+# ---------------------------------------------------------------------------
+
+class TestParseNetCapData:
+    def _write_cap_data(self, content: str) -> str:
+        f = tempfile.NamedTemporaryFile(
+            suffix=".data", mode="w", delete=False, encoding="utf-8"
+        )
+        f.write(content)
+        f.close()
+        return f.name
+
+    def test_basic_parse(self):
+        content = "net_A 1.5 2.0\nnet_B 0.5 0.7\n"
+        path = self._write_cap_data(content)
+        try:
+            caps = parse_net_cap_data(path)
+        finally:
+            os.unlink(path)
+        assert len(caps) == 2
+        assert caps[0].net == "net_A"
+        assert caps[0].c1 == pytest.approx(1.5)
+        assert caps[0].c2 == pytest.approx(2.0)
+        assert caps[1].net == "net_B"
+
+    def test_comments_and_blank_lines_skipped(self):
+        content = "# this is a comment\n\nnet_A 1.0 2.0\n\n"
+        path = self._write_cap_data(content)
+        try:
+            caps = parse_net_cap_data(path)
+        finally:
+            os.unlink(path)
+        assert len(caps) == 1
+        assert caps[0].net == "net_A"
+
+    def test_insufficient_fields_skipped(self):
+        content = "net_A 1.0\nnet_B 0.5 0.7\n"
+        path = self._write_cap_data(content)
+        try:
+            caps = parse_net_cap_data(path)
+        finally:
+            os.unlink(path)
+        assert len(caps) == 1
+        assert caps[0].net == "net_B"
+
+    def test_non_numeric_skipped(self):
+        content = "net_A abc 2.0\nnet_B 0.5 0.7\n"
+        path = self._write_cap_data(content)
+        try:
+            caps = parse_net_cap_data(path)
+        finally:
+            os.unlink(path)
+        assert len(caps) == 1
+        assert caps[0].net == "net_B"
+
+    def test_empty_file(self):
+        path = self._write_cap_data("")
+        try:
+            caps = parse_net_cap_data(path)
+        finally:
+            os.unlink(path)
+        assert caps == []
+
+    def test_correlation_from_cap_data(self):
+        """Data parsed from file should yield perfect correlation when c1==c2."""
+        content = "net_A 1.0 1.0\nnet_B 2.0 2.0\nnet_C 3.0 3.0\n"
+        path = self._write_cap_data(content)
+        try:
+            caps = parse_net_cap_data(path)
+        finally:
+            os.unlink(path)
+        corr = pearson_corr([c.c1 for c in caps], [c.c2 for c in caps])
+        assert corr == pytest.approx(1.0)
+
+
+class TestParseNetResData:
+    def _write_res_data(self, content: str) -> str:
+        f = tempfile.NamedTemporaryFile(
+            suffix=".data", mode="w", delete=False, encoding="utf-8"
+        )
+        f.write(content)
+        f.close()
+        return f.name
+
+    def test_basic_parse(self):
+        content = "net_A drv:Z sink:A 10.0 15.0\nnet_A drv:Z sink:B 5.0 8.0\n"
+        path = self._write_res_data(content)
+        try:
+            ress = parse_net_res_data(path)
+        finally:
+            os.unlink(path)
+        assert len(ress) == 2
+        assert ress[0].net == "net_A"
+        assert ress[0].driver == "drv:Z"
+        assert ress[0].load == "sink:A"
+        assert ress[0].r1 == pytest.approx(10.0)
+        assert ress[0].r2 == pytest.approx(15.0)
+
+    def test_comments_and_blank_lines_skipped(self):
+        content = "# comment\n\nnet_A drv:Z sink:A 10.0 15.0\n"
+        path = self._write_res_data(content)
+        try:
+            ress = parse_net_res_data(path)
+        finally:
+            os.unlink(path)
+        assert len(ress) == 1
+
+    def test_insufficient_fields_skipped(self):
+        content = "net_A drv:Z sink:A 10.0\nnet_B drv:Q sink:D 5.0 8.0\n"
+        path = self._write_res_data(content)
+        try:
+            ress = parse_net_res_data(path)
+        finally:
+            os.unlink(path)
+        assert len(ress) == 1
+        assert ress[0].net == "net_B"
+
+    def test_non_numeric_skipped(self):
+        content = "net_A drv:Z sink:A abc 15.0\nnet_B drv:Q sink:D 5.0 8.0\n"
+        path = self._write_res_data(content)
+        try:
+            ress = parse_net_res_data(path)
+        finally:
+            os.unlink(path)
+        assert len(ress) == 1
+        assert ress[0].net == "net_B"
+
+    def test_empty_file(self):
+        path = self._write_res_data("")
+        try:
+            ress = parse_net_res_data(path)
+        finally:
+            os.unlink(path)
+        assert ress == []
+
+    def test_correlation_from_res_data(self):
+        """Data parsed from file should yield perfect correlation when r1==r2."""
+        content = "net_A drv:Z sink:A 10.0 10.0\nnet_B drv:Q sink:D 5.0 5.0\nnet_C drv:X sink:Y 20.0 20.0\n"
+        path = self._write_res_data(content)
+        try:
+            ress = parse_net_res_data(path)
+        finally:
+            os.unlink(path)
+        corr = pearson_corr([r.r1 for r in ress], [r.r2 for r in ress])
+        assert corr == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------

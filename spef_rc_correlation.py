@@ -575,6 +575,66 @@ def compare_spef(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapCompar
 
     return cap_rows, res_rows, top_10_cap, top_10_res
 
+def parse_net_cap_data(path: str) -> List[CapComparison]:
+    """Parse a net_cap.data file into a list of CapComparison objects.
+
+    File format (whitespace-separated, one entry per line):
+        net_name  total_c_spef1  total_c_spef2
+
+    Lines starting with '#' and blank lines are ignored.
+    """
+    caps: List[CapComparison] = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                print(f"[warn] {path}:{lineno}: expected 3 fields, got {len(parts)}, skipping")
+                continue
+            net_name = parts[0]
+            try:
+                c1 = float(parts[1])
+                c2 = float(parts[2])
+            except ValueError:
+                print(f"[warn] {path}:{lineno}: non-numeric capacitance value, skipping")
+                continue
+            caps.append(CapComparison(net=net_name, c1=c1, c2=c2))
+    return caps
+
+
+def parse_net_res_data(path: str) -> List[ResComparison]:
+    """Parse a net_res.data file into a list of ResComparison objects.
+
+    File format (whitespace-separated, one entry per line):
+        net_name  driver_pin  sink_pin  r_spef1  r_spef2
+
+    Lines starting with '#' and blank lines are ignored.
+    """
+    ress: List[ResComparison] = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                print(f"[warn] {path}:{lineno}: expected 5 fields, got {len(parts)}, skipping")
+                continue
+            net_name = parts[0]
+            driver = parts[1]
+            sink = parts[2]
+            try:
+                r1 = float(parts[3])
+                r2 = float(parts[4])
+            except ValueError:
+                print(f"[warn] {path}:{lineno}: non-numeric resistance value, skipping")
+                continue
+            ress.append(ResComparison(net=net_name, driver=driver, load=sink, r1=r1, r2=r2))
+    return ress
+
+
 def write_caps_csv(path: str, caps: List[CapComparison]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -1321,9 +1381,104 @@ def main() -> None:
         action="store_true",
         help="In GUI mode, auto-select the first two loaded SPEFs and run analysis once",
     )
+    parser.add_argument(
+        "--net-cap-data",
+        metavar="FILE",
+        help=(
+            "Path to a pre-computed net_cap.data file. "
+            "Each line: net_name  c_tool1  c_tool2. "
+            "When supplied, capacitance correlation is computed from this file "
+            "instead of parsing two SPEF files."
+        ),
+    )
+    parser.add_argument(
+        "--net-res-data",
+        metavar="FILE",
+        help=(
+            "Path to a pre-computed net_res.data file. "
+            "Each line: net_name  driver_pin  sink_pin  r_tool1  r_tool2. "
+            "When supplied, resistance correlation is computed from this file "
+            "instead of parsing two SPEF files."
+        ),
+    )
 
     args = parser.parse_args()
 
+    # ------------------------------------------------------------------
+    # Data-file mode: at least one of --net-cap-data / --net-res-data
+    # ------------------------------------------------------------------
+    if args.net_cap_data or args.net_res_data:
+        caps: List[CapComparison] = []
+        ress: List[ResComparison] = []
+
+        if args.net_cap_data:
+            print(f"Parsing cap data from {args.net_cap_data} ...")
+            caps = parse_net_cap_data(args.net_cap_data)
+            print(f"  {len(caps)} cap entries loaded")
+
+        if args.net_res_data:
+            print(f"Parsing res data from {args.net_res_data} ...")
+            ress = parse_net_res_data(args.net_res_data)
+            print(f"  {len(ress)} res entries loaded")
+
+        print("=== SPEF RC Correlation Summary (from data files) ===")
+        if args.net_cap_data:
+            print(f"Cap data file: {args.net_cap_data}")
+        if args.net_res_data:
+            print(f"Res data file: {args.net_res_data}")
+
+        xs_c = [c.c1 for c in caps]
+        ys_c = [c.c2 for c in caps]
+        corr_c = pearson_corr(xs_c, ys_c)
+        if caps:
+            if corr_c is not None:
+                print(f"Total C correlation (Pearson, per-net): {corr_c:.6f} over {len(caps)} nets")
+            else:
+                print("Total C correlation: N/A (not enough data or zero variance)")
+
+        xs_r = [r.r1 for r in ress]
+        ys_r = [r.r2 for r in ress]
+        corr_r = pearson_corr(xs_r, ys_r)
+        if ress:
+            if corr_r is not None:
+                print(
+                    f"Driver->sink R correlation (Pearson): "
+                    f"{corr_r:.6f} over {len(ress)} (net, sink) pairs"
+                )
+            else:
+                print("Driver->sink R correlation: N/A (not enough data or zero variance)")
+
+        cap_devs = [(abs(row.c1 - row.c2), row) for row in caps]
+        res_devs = [(abs(row.r1 - row.r2), row) for row in ress]
+        top_10_cap = [row for _, row in nlargest(10, cap_devs, key=lambda x: x[0])]
+        top_10_res = [row for _, row in nlargest(10, res_devs, key=lambda x: x[0])]
+
+        if top_10_cap:
+            print("Cap deviation top 10 (tool1 : tool2):")
+            for cap_com in top_10_cap:
+                print(f"  net:{cap_com.net} ({cap_com.c1} : {cap_com.c2})")
+        if top_10_res:
+            print("Res deviation top 10 (tool1 : tool2):")
+            for res_com in top_10_res:
+                print(
+                    f"  net:{res_com.net} driver:{res_com.driver} "
+                    f"load:{res_com.load} ({res_com.r1} : {res_com.r2})"
+                )
+
+        if args.csv_prefix:
+            if caps:
+                caps_path = f"{args.csv_prefix}_caps.csv"
+                write_caps_csv(caps_path, caps)
+                print(f"\nCSV written: {caps_path}")
+            if ress:
+                res_path = f"{args.csv_prefix}_res_{args.r_agg}.csv"
+                write_res_csv(res_path, ress, args.r_agg)
+                print(f"CSV written: {res_path}")
+        return
+
+    # ------------------------------------------------------------------
+    # Normal SPEF mode
+    # ------------------------------------------------------------------
     gui_inputs = collect_spef_paths([p for p in [args.spef1, args.spef2] if p])
 
     if args.gui or (args.spef1 is None and args.spef2 is None):
