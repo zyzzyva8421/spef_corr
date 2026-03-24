@@ -700,6 +700,258 @@ def write_res_csv(path: str, ress: List[ResComparison], r_agg: str) -> None:
             w.writerow([row.net, row.r1, row.r2, ratio, delta])
 
 
+# -------------------- backmark: apply new RC values to SPEF --------------------
+
+def _parse_backmark_cap_data(path: str) -> Dict[str, float]:
+    """Parse net_cap.data → {net_identifier: new_total_cap}.
+
+    First column: net_id (*NNN) or net_name.
+    Third column: new total cap value.
+    """
+    cap_map: Dict[str, float] = {}
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            net_key = parts[0]          # *id or net_name
+            try:
+                new_cap = float(parts[2])
+            except ValueError:
+                continue
+            cap_map[net_key] = new_cap
+    return cap_map
+
+
+def _parse_backmark_res_data(path: str) -> Dict[str, Dict[str, float]]:
+    """Parse net_res.data → {net_name: {sink_pin: new_driver_to_sink_R}}.
+
+    Format: net_name driver sink r_old r_new
+    Last column (r_new) is the target value.
+    Multiple rows per net (one per sink).
+    """
+    res_map: Dict[str, Dict[str, float]] = {}  # net -> {sink -> new_R}
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            net_key = parts[0]
+            sink = parts[2]
+            try:
+                new_r = float(parts[4])  # last column
+            except ValueError:
+                continue
+            res_map.setdefault(net_key, {})[sink] = new_r
+    return res_map
+
+
+def _fmt_float(val: float) -> str:
+    """Format a float for SPEF output, keeping reasonable precision."""
+    if val == 0.0:
+        return "0"
+    abs_val = abs(val)
+    if abs_val < 1e-4:
+        return f"{val:.6e}"
+    return f"{val:.6g}"
+
+
+def backmark_spef(
+    spef_path: str,
+    cap_data_path: Optional[str],
+    res_data_path: Optional[str],
+    output_path: str,
+) -> None:
+    """Rewrite a SPEF file with updated cap/res values from data files.
+
+    For capacitance:
+      - The new total cap replaces *D_NET total_cap.
+      - Each *CAP segment value is scaled by (new_total / old_total).
+
+    For resistance:
+      - The data file gives new driver-to-sink R per sink.
+      - All *RES segment values in the net are scaled uniformly by the
+        average ratio (new_R / old_R) across all sinks that appear in
+        both the data file and the parsed net.
+
+    The SPEF is first parsed to gather per-net information, then rewritten
+    line-by-line to preserve formatting.
+    """
+    # ---- Step 1: parse the SPEF to get per-net structure ----
+    sf = SpefFile(spef_path)
+    sf.parse()
+
+    # Build reverse name_map: net_name -> net_id (e.g. "clk" -> "*3")
+    reverse_name_map: Dict[str, str] = {}
+    for net_id, net_name in sf.name_map.items():
+        reverse_name_map[net_name] = net_id
+
+    # ---- Step 2: load data files and build scaling ratios ----
+    cap_ratio: Dict[str, float] = {}           # net_name -> ratio
+    new_total_caps: Dict[str, float] = {}      # net_name -> new_total_cap
+
+    if cap_data_path:
+        raw_cap = _parse_backmark_cap_data(cap_data_path)
+        for key, new_cap in raw_cap.items():
+            # Resolve key to net_name
+            if key.startswith('*'):
+                net_name = sf.name_map.get(key, key)
+            else:
+                net_name = key
+            net = sf.nets.get(net_name)
+            if net is None:
+                continue
+            old_cap = net.total_cap
+            new_total_caps[net_name] = new_cap
+            cap_ratio[net_name] = (new_cap / old_cap) if old_cap != 0.0 else 1.0
+
+    res_ratio: Dict[str, float] = {}           # net_name -> uniform R scale
+
+    if res_data_path:
+        raw_res = _parse_backmark_res_data(res_data_path)
+        for key, sink_map in raw_res.items():
+            if key.startswith('*'):
+                net_name = sf.name_map.get(key, key)
+            else:
+                net_name = key
+            net = sf.nets.get(net_name)
+            if net is None:
+                continue
+            old_dr = net.driver_sink_resistances()
+            if not old_dr:
+                continue
+            # Compute per-sink ratios for sinks present in both
+            ratios: List[float] = []
+            for sink, new_r in sink_map.items():
+                old_r = old_dr.get(sink)
+                if old_r is not None and old_r > 0.0:
+                    ratios.append(new_r / old_r)
+            if ratios:
+                res_ratio[net_name] = sum(ratios) / len(ratios)
+
+    print(f"[backmark] Nets with cap update : {len(cap_ratio)}")
+    print(f"[backmark] Nets with res update : {len(res_ratio)}")
+
+    # ---- Step 3: rewrite SPEF line-by-line ----
+    # We also need the net_id -> net_name map to figure out which net_name
+    # we're in when we see "*D_NET *1428 ...".
+
+    SEC_NONE = 0
+    SEC_CONN = 1
+    SEC_CAP  = 2
+    SEC_RES  = 3
+
+    current_net_name: Optional[str] = None
+    current_net_id: Optional[str]   = None
+    section = SEC_NONE
+    c_scale = 1.0
+    r_scale = 1.0
+    lines_written = 0
+
+    with open(spef_path, 'r', encoding='utf-8', errors='ignore') as fin, \
+         open(output_path, 'w', encoding='utf-8') as fout:
+        for line in fin:
+            raw = line.strip()
+
+            # --- *D_NET header ---
+            if raw.startswith('*D_NET '):
+                parts = raw.split(None, 3)
+                if len(parts) >= 3:
+                    net_id_tok = parts[1]
+                    net_name_resolved = sf.name_map.get(net_id_tok, net_id_tok)
+                    current_net_name = net_name_resolved
+                    current_net_id = net_id_tok
+                    section = SEC_NONE
+                    c_scale = cap_ratio.get(net_name_resolved, 1.0)
+                    r_scale = res_ratio.get(net_name_resolved, 1.0)
+
+                    if net_name_resolved in new_total_caps:
+                        new_tc = new_total_caps[net_name_resolved]
+                        # Rewrite the D_NET line with new total cap
+                        fout.write(f"*D_NET {net_id_tok} {_fmt_float(new_tc)}\n")
+                        lines_written += 1
+                        continue
+                # If no cap update, write original line
+                fout.write(line)
+                lines_written += 1
+                continue
+
+            # --- Inside a net: detect section headers ---
+            if current_net_name is not None:
+                if raw == '*CONN':
+                    section = SEC_CONN
+                    fout.write(line)
+                    lines_written += 1
+                    continue
+                elif raw == '*CAP':
+                    section = SEC_CAP
+                    fout.write(line)
+                    lines_written += 1
+                    continue
+                elif raw == '*RES':
+                    section = SEC_RES
+                    fout.write(line)
+                    lines_written += 1
+                    continue
+                elif raw == '*END':
+                    current_net_name = None
+                    current_net_id = None
+                    section = SEC_NONE
+                    c_scale = 1.0
+                    r_scale = 1.0
+                    fout.write(line)
+                    lines_written += 1
+                    continue
+
+                # --- *CAP segment: scale cap values ---
+                if section == SEC_CAP and c_scale != 1.0:
+                    parts = raw.split()
+                    if len(parts) >= 3:
+                        try:
+                            int(parts[0])  # index
+                            # Last token is cap value, second-to-last might be a node
+                            # Format: idx node1 cap_val  OR  idx node1 node2 cap_val
+                            old_val = float(parts[-1])
+                            new_val = old_val * c_scale
+                            # Reconstruct line preserving leading whitespace
+                            lead = line[:len(line) - len(line.lstrip())]
+                            parts[-1] = _fmt_float(new_val)
+                            fout.write(lead + ' '.join(parts) + '\n')
+                            lines_written += 1
+                            continue
+                        except ValueError:
+                            pass  # Not a cap data line, write as-is
+
+                # --- *RES segment: scale res values ---
+                if section == SEC_RES and r_scale != 1.0:
+                    parts = raw.split()
+                    if len(parts) >= 4:
+                        try:
+                            int(parts[0])  # index
+                            # Format: idx node1 node2 res_val [trailing space]
+                            old_val = float(parts[3])
+                            new_val = old_val * r_scale
+                            lead = line[:len(line) - len(line.lstrip())]
+                            parts[3] = _fmt_float(new_val)
+                            fout.write(lead + ' '.join(parts) + ' \n')
+                            lines_written += 1
+                            continue
+                        except ValueError:
+                            pass
+
+            # Default: write line unchanged
+            fout.write(line)
+            lines_written += 1
+
+    print(f"[backmark] Written {lines_written} lines to {output_path}")
+
+
 def summarize_and_print(caps: List[CapComparison], ress: List[ResComparison], 
                         spef1: SpefFile, spef2: SpefFile, r_agg: str) -> None:
     print("=== SPEF RC Correlation Summary ===")
@@ -1574,7 +1826,38 @@ def main() -> None:
         ),
     )
 
+    parser.add_argument(
+        "--backmark",
+        action="store_true",
+        help=(
+            "Backmark mode: apply new cap/res values from --net-cap-data "
+            "and --net-res-data to the SPEF file given as spef1, "
+            "and write the updated SPEF. Use --output to specify output path."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        metavar="FILE",
+        help="Output path for backmarked SPEF (default: <spef1>_backmarked.spef)",
+    )
+
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Backmark mode
+    # ------------------------------------------------------------------
+    if args.backmark:
+        if not args.spef1:
+            parser.error("--backmark requires spef1 (the SPEF file to update).")
+        if not args.net_cap_data and not args.net_res_data:
+            parser.error("--backmark requires at least one of --net-cap-data or --net-res-data.")
+        out = args.output
+        if not out:
+            base, ext = os.path.splitext(args.spef1)
+            out = f"{base}_backmarked{ext}"
+        backmark_spef(args.spef1, args.net_cap_data, args.net_res_data, out)
+        return
 
     # ------------------------------------------------------------------
     # Data-file mode: at least one of --net-cap-data / --net-res-data

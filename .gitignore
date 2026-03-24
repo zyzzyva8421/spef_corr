@@ -22,8 +22,7 @@ build/
 
 # Test/temporary
 .pytest_cache/
-net_cap.data
-net_res.data
+*.data
 .coverage
 
 # OS
