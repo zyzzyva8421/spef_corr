@@ -199,6 +199,24 @@ class TestNetRC:
         result = net.driver_sink_resistances()
         assert result == {"sink": pytest.approx(7.0)}
 
+    def test_multi_colon_prefix_match(self):
+        """
+        When *DELIMITER is ':' (e.g. StarRC/Calibre SPEF), pin names already
+        contain colons (e.g. 'inst:pin').  Internal *RES nodes are written as
+        '*ref:<nodenum>', resolving to 'inst:pin:<nodenum>'.  The first-colon
+        split would only give 'inst' as the prefix key, failing to match
+        'inst:pin'.  The multi-level prefix map must store 'inst:pin' too.
+        """
+        net = NetRC(name="n_multi", total_cap=1.0,
+                    driver="inst:pin", sinks=["sink:in"])
+        net.res_graph = {
+            "inst:pin:1": [("net_A:1", 5.0)],
+            "net_A:1":    [("inst:pin:1", 5.0), ("sink:in:1", 3.0)],
+            "sink:in:1":  [("net_A:1", 3.0)],
+        }
+        result = net.driver_sink_resistances()
+        assert result == {"sink:in": pytest.approx(8.0)}
+
     def test_no_driver_returns_empty(self):
         net = NetRC(name="n3", total_cap=1.0, driver=None, sinks=["sink"])
         assert net.driver_sink_resistances() == {}
@@ -310,6 +328,100 @@ class TestSpefFileParse:
         sinks = set(net.sinks)
         assert "sink_u3:B" not in sinks
         assert net.driver == "drv_u1:Z"   # driver unchanged
+
+    def test_res_with_internal_nodes_via_namemap(self):
+        """
+        Real-world SPEF with *DELIMITER ':': pin names contain colons.
+        *RES uses '*ref:nodenum' syntax which resolves to 'pin:N' form.
+        The driver/sink names from *CONN (resolved via NAME_MAP) must still
+        match the RES-graph nodes via the multi-level prefix map.
+
+        Net topology: drv_u1:Z --5Ω-- net_A:1 --3Ω-- sink_u2:A
+        """
+        spef = textwrap.dedent("""\
+            *SPEF "IEEE 1481-1999"
+            *DESIGN "test"
+            *DATE "2026:01:01:00:00:00"
+            *VENDOR "test"
+            *PROGRAM "test"
+            *VERSION "1.0"
+            *DESIGN_FLOW "NETLIST"
+            *DIVIDER /
+            *DELIMITER :
+            *BUS_DELIMITER [ ]
+            *T_UNIT 1 NS
+            *C_UNIT 1 PF
+            *R_UNIT 1 OHM
+            *L_UNIT 1 HENRY
+
+            *NAME_MAP
+            *1 net_A
+            *2 drv_u1:Z
+            *3 sink_u2:A
+
+            *D_NET *1 1.5
+            *CONN
+            *I *2 O *C 0.0 0.0
+            *I *3 I *C 0.0 0.0
+            *RES
+            *1 *2:1 *1:1 5.0
+            *2 *1:1 *3:1 3.0
+            *END
+        """)
+        sf = _make_spef_object(spef)
+        net = sf.nets["net_A"]
+        assert net.driver == "drv_u1:Z"
+        assert "sink_u2:A" in net.sinks
+        # Verify the resistance graph was built correctly
+        assert "drv_u1:Z:1" in net.res_graph
+        assert "sink_u2:A:1" in net.res_graph
+        # driver_sink_resistances must succeed (was returning {} before the fix)
+        dr = net.driver_sink_resistances()
+        assert "sink_u2:A" in dr, (
+            "driver_sink_resistances() returned empty — "
+            "_find_best_node_name failed to match 'drv_u1:Z' → 'drv_u1:Z:1'"
+        )
+        assert dr["sink_u2:A"] == pytest.approx(8.0)
+
+    def test_res_plain_colon_node_names_preserved(self):
+        """
+        When *RES contains plain colon-node-names (no NAME_MAP '*' prefix),
+        the resolver must keep them as-is and NOT strip the colon-suffix.
+        Previously 'inst:pin' was wrongly resolved to 'inst', causing the
+        node name in the graph to mismatch the driver/sink from *CONN.
+        """
+        spef = textwrap.dedent("""\
+            *SPEF "IEEE 1481-1999"
+            *DESIGN "test"
+            *DATE "2026:01:01:00:00:00"
+            *VENDOR "test"
+            *PROGRAM "test"
+            *VERSION "1.0"
+            *DESIGN_FLOW "NETLIST"
+            *DIVIDER /
+            *DELIMITER :
+            *BUS_DELIMITER [ ]
+            *T_UNIT 1 NS
+            *C_UNIT 1 PF
+            *R_UNIT 1 OHM
+            *L_UNIT 1 HENRY
+
+            *D_NET net_A 1.5
+            *CONN
+            *I drv_u1:Z O *C 0.0 0.0
+            *I sink_u2:A I *C 0.0 0.0
+            *RES
+            *1 drv_u1:Z sink_u2:A 10.0
+            *END
+        """)
+        sf = _make_spef_object(spef)
+        net = sf.nets["net_A"]
+        # Plain colon-names must be kept verbatim in the graph
+        assert "drv_u1:Z" in net.res_graph, (
+            "Node 'drv_u1:Z' was incorrectly stripped to 'drv_u1' by _resolve"
+        )
+        dr = net.driver_sink_resistances()
+        assert dr == {"sink_u2:A": pytest.approx(10.0)}
 
 
 # ---------------------------------------------------------------------------

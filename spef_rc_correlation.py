@@ -65,6 +65,12 @@ class NetRC:
 
         Many SPEF writers use pin, pin:1, pin:2, etc. This function first
         checks exact match, then tries prefix matches.
+
+        When *DELIMITER is ':' (common in sign-off tools), pin names already
+        contain colons (e.g. 'inst:pin').  Internal RC nodes in *RES are
+        written as '*ref:<nodenum>', which resolves to 'inst:pin:<nodenum>'.
+        The prefix map therefore needs to store every colon-separated prefix
+        of each node name, not only the part before the first colon.
         """
         if pin in self.res_graph:
             return pin
@@ -72,9 +78,13 @@ class NetRC:
         if self._node_prefix_map is None:
             mp: Dict[str, str] = {}
             for node in self.res_graph.keys():
-                base = node.split(":", 1)[0]
-                if base not in mp:
-                    mp[base] = node
+                parts = node.split(":")
+                # Store every proper prefix (all lengths up to len-1) so that
+                # a pin like 'inst:pin' matches a node like 'inst:pin:1'.
+                for i in range(1, len(parts)):
+                    prefix = ":".join(parts[:i])
+                    if prefix not in mp:
+                        mp[prefix] = node
             self._node_prefix_map = mp
         return self._node_prefix_map.get(pin)
 
@@ -182,13 +192,17 @@ class SpefFile:
         """Resolve a token via *NAME_MAP if it starts with '*'."""
         if tok.startswith("\"") and tok.endswith("\"") and len(tok) >= 2:
             return tok[1:-1]
-        pin = ''
         if ":" in tok:
-            parts = tok.split(':')
-            pin = parts[1]
-            tok = parts[0]
+            parts = tok.split(':', 1)
+            base = parts[0]
+            pin  = parts[1]
+            if base.startswith("*") and base in self.name_map:
+                r = self.name_map[base]
+                return f"{r}:{pin}" if pin else r
+            # Not a name-map reference: return as-is (preserve full token).
+            return tok
         if tok.startswith("*") and tok in self.name_map:
-            return self.name_map[tok] + f':{pin}' if pin else self.name_map[tok]
+            return self.name_map[tok]
         return tok
 
     def parse(self) -> None:
@@ -227,7 +241,10 @@ class SpefFile:
                 if base and base[0] == '*' and base in name_map:
                     r = name_map[base]
                     return f"{r}:{pin}" if pin else r
-                return base   # no name-map match: return base, dropping pin suffix
+                # Not a name-map reference: return the token as-is.
+                # Previously this returned only `base`, incorrectly dropping
+                # the colon-suffix from plain node names (e.g. 'inst:pin' → 'inst').
+                return tok
             if c == '*':
                 return name_map.get(tok, tok)
             return tok
@@ -609,7 +626,29 @@ def summarize_and_print(caps: List[CapComparison], ress: List[ResComparison],
     print(f"Tool2 SPEF: {spef2.path}")
     print(f"Nets in tool1: {len(spef1.nets)}")
     print(f"Nets in tool2: {len(spef2.nets)}")
-    print(f"Common nets:  {len({c.net for c in caps})}")
+    common_net_count = len({c.net for c in caps})
+    print(f"Common nets:  {common_net_count}")
+
+    # Resistance parse diagnostics — report how many common nets actually
+    # produced driver→sink resistance data, and surface a sample of nets
+    # where resistance is missing so parsing issues are easy to diagnose.
+    if common_net_count > 0:
+        nets_with_res_graph   = sum(1 for c in caps if spef1.nets[c.net].res_graph)
+        nets_with_driver      = sum(1 for c in caps if spef1.nets[c.net].driver)
+        nets_with_sinks       = sum(1 for c in caps if spef1.nets[c.net].sinks)
+        nets_with_r_data      = len({r.net for r in ress})
+        print(f"  Nets with *RES data parsed:     {nets_with_res_graph} / {common_net_count}")
+        print(f"  Nets with driver identified:    {nets_with_driver} / {common_net_count}")
+        print(f"  Nets with sinks identified:     {nets_with_sinks} / {common_net_count}")
+        print(f"  Nets with driver->sink R found: {nets_with_r_data} / {common_net_count}")
+        if nets_with_r_data == 0 and nets_with_res_graph > 0:
+            # Show a few nets to help diagnose node-name matching failures
+            sample = [c.net for c in caps if spef1.nets[c.net].res_graph][:3]
+            for net_name in sample:
+                n = spef1.nets[net_name]
+                graph_nodes = list(n.res_graph.keys())[:6]
+                print(f"  [sample] net={net_name!r}  driver={n.driver!r}"
+                      f"  sinks={n.sinks[:3]}  res_graph_nodes(first 6)={graph_nodes}")
 
     xs_c = [c.c1 for c in caps]
     ys_c = [c.c2 for c in caps]
