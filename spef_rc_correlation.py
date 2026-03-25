@@ -48,6 +48,36 @@ from heapq import nlargest
 import multiprocessing
 from functools import partial
 
+# Try to import C++ extension for better performance
+try:
+    import spef_core
+    HAS_CPP = True
+except ImportError:
+    HAS_CPP = False
+
+# Cache for C++ parsed SPEF to avoid re-parsing
+_cpp_spef_cache: Dict[str, spef_core.ParsedSpef] = {}
+
+def _get_cpp_spef(path: str) -> Optional[spef_core.ParsedSpef]:
+    """Get or parse SPEF using C++ (with caching)."""
+    if not HAS_CPP:
+        return None
+    if path not in _cpp_spef_cache:
+        _cpp_spef_cache[path] = spef_core.parse_spef(path)
+    return _cpp_spef_cache[path]
+
+def compute_resistances_cpp(net: NetRC) -> Dict[str, float]:
+    """Compute driver-sink resistances using C++ (requires C++ parsed net)."""
+    if not HAS_CPP:
+        return {}
+    
+    # Find the cached C++ net
+    for cache_path, cpp_spef in _cpp_spef_cache.items():
+        if net.name in cpp_spef.nets:
+            cpp_net = cpp_spef.nets[net.name]
+            return cpp_net.compute_driver_sink_resistances()
+    return {}
+
 @dataclass
 class NetRC:
     name: str
@@ -120,6 +150,8 @@ class NetRC:
 
         Only includes sinks where a path from driver exists in the graph.
         Result is cached per net.
+        
+        Uses C++ extension if available for better performance.
         """
         if self._driver_sink_res_cache is not None:
             return self._driver_sink_res_cache
@@ -129,6 +161,14 @@ class NetRC:
             self._driver_sink_res_cache = result
             return result
 
+        # Try C++ first for performance
+        if HAS_CPP:
+            cpp_result = compute_resistances_cpp(self)
+            if cpp_result:
+                self._driver_sink_res_cache = cpp_result
+                return cpp_result
+
+        # Fall back to Python implementation
         driver_node = self._find_best_node_name(self.driver) or self.driver
         for sink in self.sinks:
             sink_node = self._find_best_node_name(sink) or sink
@@ -203,6 +243,53 @@ class SpefFile:
         return result
 
     def parse(self) -> None:
+        # Use C++ parser if available for better performance
+        if HAS_CPP:
+            self._parse_cpp()
+            return
+        self._parse_python()
+
+    def _parse_cpp(self) -> None:
+        """Parse using C++ extension."""
+        cpp_spef = spef_core.parse_spef(self.path)
+        self.name_map = dict(cpp_spef.name_map)
+        nmap = self.name_map
+        self.nets = {}
+
+        def _resolve_node(tok: str) -> str:
+            """Resolve *ID or *ID:pin to name or name:pin via name_map."""
+            if not tok or tok[0] != '*':
+                return tok
+            if ':' in tok:
+                idx = tok.index(':')
+                base = tok[:idx]
+                pin = tok[idx + 1:]
+                resolved = nmap.get(base, base)
+                return f"{resolved}:{pin}" if pin else resolved
+            return nmap.get(tok, tok)
+
+        for net_name, cpp_net in cpp_spef.nets.items():
+            net = NetRC(
+                name=cpp_net.name,
+                total_cap=cpp_net.total_cap,
+                driver=cpp_net.driver,
+                sinks=list(cpp_net.sinks)
+            )
+            # Convert C++ graph to Python format, resolving *ID node names
+            for node, edges in cpp_net.res_graph.items():
+                resolved_node = _resolve_node(node)
+                net.res_graph[resolved_node] = [
+                    (_resolve_node(e.to), e.weight) for e in edges
+                ]
+            self.nets[net_name] = net
+        
+        self.t_unit = cpp_spef.t_unit
+        self.c_unit = cpp_spef.c_unit
+        self.r_unit = cpp_spef.r_unit
+        self.l_unit = cpp_spef.l_unit
+        print(f"[{self.path}] parsed {len(self.nets)} nets... (C++)")
+
+    def _parse_python(self) -> None:
         # ---- bind frequently accessed attributes to locals ----
         # Python attribute lookup (self.x) is slower than reading a local variable.
         name_map     = self.name_map
@@ -1127,35 +1214,22 @@ def shuffle_net_mapping(
     output_path: str,
     seed: Optional[int] = None,
 ) -> None:
-    """Generate a new SPEF with a randomly shuffled net_id ↔ net_name mapping.
-
-    The algorithm applies a *global token substitution* on every ``*N`` token
-    in the file where N is a net-type NAME_MAP entry.  Concretely:
-
-    1. Parse the ``*NAME_MAP`` section to find all ``*N → name`` entries.
-    2. Identify which ``*N`` IDs appear as the first argument of ``*D_NET``
-       lines (these are the "net IDs").
-    3. Randomly permute the net_names among those net IDs to produce a
-       bijective substitution ``old_net_id → new_net_id``.
-    4. Replace every ``*N`` token (where N is a net ID) throughout the file
-       with the new ID from step 3.
-
-    The effect is:
-
-    * The ``*NAME_MAP`` entries for nets are re-labelled (mapping shuffled).
-    * Every ``*D_NET`` header is updated to carry the new ID of that net.
-    * All internal node references (``*N:pin``) inside each ``*D_NET`` block
-      are updated consistently, so the resolved pin names are unchanged.
-
-    Because each net_name continues to own exactly its original RC data, a
-    comparison of the shuffled SPEF against the original produces identical
-    ``net_cap.data`` and ``net_res.data`` files.
-
-    Args:
-        spef_path:   Path to the input SPEF file.
-        output_path: Path to write the shuffled SPEF.
-        seed:        Optional random seed for reproducibility.
+    """Generate a new SPEF with a randomly shuffled net_id <-> net_name mapping.
+    
+    Uses C++ implementation if available for better performance.
     """
+    # Use C++ implementation if available
+    if HAS_CPP:
+        actual_seed = seed if seed is not None else -1
+        # Need to parse first to get net count
+        cpp_spef = spef_core.parse_spef(spef_path)
+        n_nets = len(cpp_spef.nets)
+        spef_core.shuffle_spef(spef_path, output_path, actual_seed)
+        print(f"[shuffle] Written shuffled SPEF to {output_path}")
+        print(f"[shuffle] {n_nets} nets total; {n_nets-1 if n_nets > 1 else 0} net_ids reassigned")
+        return
+    
+    # Fall back to Python implementation
     rng = random.Random(seed)
 
     _re_nid = re.compile(r'^\*\d+$')

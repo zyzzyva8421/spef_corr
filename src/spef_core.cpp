@@ -262,7 +262,8 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 std::istringstream iss(code_part);
                 std::string key, value;
                 iss >> key >> value;
-                if (!key.empty() && !value.empty()) {
+                // Only process keys that look like *NUMBER (e.g., *1, *2)
+                if (!key.empty() && key.size() >= 2 && key[1] >= '0' && key[1] <= '9' && !value.empty()) {
                     value = strip_quotes(value);
                     // Unescape \[ and \]
                     size_t pos;
@@ -340,7 +341,14 @@ ParsedSpef parse_spef(const std::string& filepath) {
         }
         else if (section == SEC_CONN && tokens.size() >= 3) {
             std::string pin = tokens[1];
-            std::string dir = tokens[2];
+            // Direction is the first token that starts with O, B, or I
+            std::string dir;
+            for (size_t i = 2; i < tokens.size(); i++) {
+                if (!tokens[i].empty() && (tokens[i][0] == 'O' || tokens[i][0] == 'B' || tokens[i][0] == 'I')) {
+                    dir = tokens[i];
+                    break;
+                }
+            }
             
             // Handle pin:idx format
             std::string pin_base = pin;
@@ -374,12 +382,61 @@ ParsedSpef parse_spef(const std::string& filepath) {
         }
         else if (section == SEC_NONE) {
             // Look for section header
+            std::cerr << "DEBUG SEC_NONE block, tokens[0]=" << (tokens.empty() ? "empty" : tokens[0]) << std::endl;
             if (!tokens.empty() && tokens[0][0] == '*') {
                 std::string header = tokens[0];
-                if (header == "*CONN") section = SEC_CONN;
-                else if (header == "*CAP") section = SEC_CAP;
-                else if (header == "*RES") section = SEC_RES;
-                else if (header == "*END") { current_net = nullptr; }
+                if (header == "*CONN") {
+                    section = SEC_CONN;
+                    continue;
+                }
+                else if (header == "*CAP") {
+                    section = SEC_CAP;
+                    continue;
+                }
+                else if (header == "*RES") {
+                    section = SEC_RES;
+                    continue;
+                }
+                else if (header == "*END") {
+                    current_net = nullptr;
+                    continue;
+                }
+                // Also handle *I (input) and *P (port) as CONN entries when no explicit *CONN header
+                else if ((header == "*I" || header == "*P") && tokens.size() >= 3) {
+                    section = SEC_CONN;
+                    std::cerr << "DEBUG: Processing *I/*P line, pin=" << tokens[1] << " dir=" << tokens[2] << std::endl;
+                    // Process this line as CONN
+                    std::string pin = tokens[1];
+                    std::string dir;
+                    for (size_t i = 2; i < tokens.size(); i++) {
+                        if (!tokens[i].empty() && (tokens[i][0] == 'O' || tokens[i][0] == 'B' || tokens[i][0] == 'I')) {
+                            dir = tokens[i];
+                            break;
+                        }
+                    }
+                    // Handle pin:idx format
+                    std::string pin_base = pin;
+                    std::string pin_idx;
+                    size_t colon_pos = pin.find(':');
+                    if (colon_pos != std::string::npos) {
+                        pin_base = pin.substr(0, colon_pos);
+                        pin_idx = pin.substr(colon_pos);
+                    }
+                    if (pin_base.size() > 1 && pin_base[0] == '*') {
+                        auto it = spef.name_map.find(pin_base);
+                        if (it != spef.name_map.end()) {
+                            pin = it->second + pin_idx;
+                        }
+                    }
+                    if (!dir.empty() && (dir[0] == 'O' || dir[0] == 'B')) {
+                        if (current_net && current_net->driver.empty()) {
+                            current_net->driver = pin;
+                        }
+                    } else if (!dir.empty() && dir[0] == 'I') {
+                        if (current_net) current_net->sinks.push_back(pin);
+                    }
+                    continue;
+                }
             }
         }
     }
