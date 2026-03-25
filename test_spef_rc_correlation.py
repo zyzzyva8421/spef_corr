@@ -13,6 +13,8 @@ Coverage:
   - parse_spefs_parallel: returns two SpefFile objects with the same nets
   - shuffle_net_mapping: RC data preserved per net_name, mapping actually shuffled,
                          seed reproducibility, single-net file copied unchanged
+  - backmark_spef: basic cap/res updates, inline comments on *CAP lines,
+                   complete shuffle→compare→backmark round-trip, edge cases
 """
 
 import csv
@@ -31,6 +33,7 @@ from spef_rc_correlation import (
     NetRC,
     ResComparison,
     SpefFile,
+    backmark_spef,
     collect_spef_paths,
     compare_spef,
     parse_net_cap_data,
@@ -1369,3 +1372,422 @@ class TestShuffleNetMapping:
             os.unlink(src)
             if os.path.exists(dst):
                 os.unlink(dst)
+
+
+# ---------------------------------------------------------------------------
+# backmark_spef
+# ---------------------------------------------------------------------------
+
+# A two-net SPEF with inline comments on both *CAP and *RES lines.
+_BACKMARK_SPEF = textwrap.dedent("""\
+    *SPEF "IEEE 1481-1999"
+    *DESIGN "bm"
+    *DATE "2026:01:01:00:00:00"
+    *VENDOR "test"
+    *PROGRAM "test"
+    *VERSION "1.0"
+    *DESIGN_FLOW "NETLIST"
+    *DIVIDER /
+    *DELIMITER :
+    *BUS_DELIMITER [ ]
+    *T_UNIT 1 NS
+    *C_UNIT 1 PF
+    *R_UNIT 1 OHM
+    *L_UNIT 1 HENRY
+
+    *NAME_MAP
+    *1 net_A
+    *2 net_B
+    *3 drv_u1:Z
+    *4 sink_u2:A
+    *5 drv_u3:Y
+    *6 sink_u4:B
+
+    *D_NET *1 1.5
+    *CONN
+    *I *3 O *C 0.0 0.0
+    *I *4 I *C 0.0 0.0
+    *CAP
+    1 *3 0.8
+    2 *4 0.7
+    *RES
+    1 *3 *4 10.0
+    *END
+
+    *D_NET *2 0.8
+    *CONN
+    *I *5 O *C 0.0 0.0
+    *I *6 I *C 0.0 0.0
+    *CAP
+    1 *5 0.4
+    2 *6 0.4
+    *RES
+    1 *5 *6 5.0
+    *END
+""")
+
+# Same design with doubled RC values (simulates a reference tool).
+_REF_SPEF = textwrap.dedent("""\
+    *SPEF "IEEE 1481-1999"
+    *DESIGN "bm"
+    *DATE "2026:01:01:00:00:00"
+    *VENDOR "ref"
+    *PROGRAM "ref"
+    *VERSION "1.0"
+    *DESIGN_FLOW "NETLIST"
+    *DIVIDER /
+    *DELIMITER :
+    *BUS_DELIMITER [ ]
+    *T_UNIT 1 NS
+    *C_UNIT 1 PF
+    *R_UNIT 1 OHM
+    *L_UNIT 1 HENRY
+
+    *NAME_MAP
+    *1 net_A
+    *2 net_B
+    *3 drv_u1:Z
+    *4 sink_u2:A
+    *5 drv_u3:Y
+    *6 sink_u4:B
+
+    *D_NET *1 3.0
+    *CONN
+    *I *3 O *C 0.0 0.0
+    *I *4 I *C 0.0 0.0
+    *CAP
+    1 *3 1.5
+    2 *4 1.5
+    *RES
+    1 *3 *4 20.0
+    *END
+
+    *D_NET *2 1.6
+    *CONN
+    *I *5 O *C 0.0 0.0
+    *I *6 I *C 0.0 0.0
+    *CAP
+    1 *5 0.8
+    2 *6 0.8
+    *RES
+    1 *5 *6 10.0
+    *END
+""")
+
+
+class TestBackmarkSpef:
+    """Tests for backmark_spef and its helper parsers."""
+
+    # ------------------------------------------------------------------ helpers
+
+    def _write(self, td: str, name: str, content: str) -> str:
+        path = os.path.join(td, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def _parse(self, path: str) -> SpefFile:
+        sf = SpefFile(path)
+        sf.parse()
+        return sf
+
+    # ------------------------------------------------------------------ basic cap update
+
+    def test_basic_cap_update(self):
+        """*D_NET total cap and *CAP segment values are scaled correctly."""
+        with tempfile.TemporaryDirectory() as td:
+            spef = self._write(td, "orig.spef", _BACKMARK_SPEF)
+            cap_data = self._write(td, "cap.data", "net_A 1.5 3.0\n")
+            out = os.path.join(td, "out.spef")
+
+            backmark_spef(spef, cap_data, None, out)
+
+            sf = self._parse(out)
+            net = sf.nets["net_A"]
+            assert net.total_cap == pytest.approx(3.0)
+            # Individual cap segments scaled by factor 2 (3.0/1.5)
+            caps = {node: c for node, _, c in net.segment_caps}
+            assert caps["drv_u1:Z"] == pytest.approx(0.8 * 2)
+            assert caps["sink_u2:A"] == pytest.approx(0.7 * 2)
+            # net_B unchanged
+            assert sf.nets["net_B"].total_cap == pytest.approx(0.8)
+
+    # ------------------------------------------------------------------ basic res update
+
+    def test_basic_res_update(self):
+        """*RES segment values are scaled uniformly by the average sink ratio."""
+        with tempfile.TemporaryDirectory() as td:
+            spef = self._write(td, "orig.spef", _BACKMARK_SPEF)
+            res_data = self._write(
+                td, "res.data", "net_A drv_u1:Z sink_u2:A 10.0 20.0\n"
+            )
+            out = os.path.join(td, "out.spef")
+
+            backmark_spef(spef, None, res_data, out)
+
+            sf = self._parse(out)
+            net = sf.nets["net_A"]
+            r = net.driver_sink_resistances()
+            assert r["sink_u2:A"] == pytest.approx(20.0)
+            # net_B unchanged
+            assert sf.nets["net_B"].driver_sink_resistances()["sink_u4:B"] == pytest.approx(5.0)
+
+    # ------------------------------------------------------------------ inline comment bug fix
+
+    def test_cap_inline_comment_preserved_and_scaled(self):
+        """*CAP lines with inline comments must still have their values scaled.
+
+        This is a regression test for a bug where backmark_spef used parts[-1]
+        to find the cap value, causing the comment text to be parsed instead of
+        the numeric value, and silently leaving segment caps unscaled.
+        """
+        spef_content = textwrap.dedent("""\
+            *SPEF "IEEE 1481-1999"
+            *DESIGN "t"
+            *DATE "2026:01:01:00:00:00"
+            *VENDOR "t"
+            *PROGRAM "t"
+            *VERSION "1.0"
+            *DIVIDER /
+            *DELIMITER :
+            *BUS_DELIMITER [ ]
+            *T_UNIT 1 NS
+            *C_UNIT 1 PF
+            *R_UNIT 1 OHM
+            *L_UNIT 1 HENRY
+
+            *NAME_MAP
+            *1 net_X
+            *2 drv:Z
+            *3 snk:A
+
+            *D_NET *1 1.0
+            *CONN
+            *I *2 O *C 0.0 0.0
+            *I *3 I *C 0.0 0.0
+            *CAP
+            1 *2 0.6 // ground cap at driver
+            2 *3 0.4 // ground cap at sink
+            *RES
+            1 *2 *3 5.0 // M3
+            *END
+        """)
+        with tempfile.TemporaryDirectory() as td:
+            spef = self._write(td, "spef.spef", spef_content)
+            # Double all values
+            cap_data = self._write(td, "cap.data", "net_X 1.0 2.0\n")
+            res_data = self._write(td, "res.data", "net_X drv:Z snk:A 5.0 10.0\n")
+            out = os.path.join(td, "out.spef")
+
+            backmark_spef(spef, cap_data, res_data, out)
+
+            sf = self._parse(out)
+            net = sf.nets["net_X"]
+
+            # Total cap updated
+            assert net.total_cap == pytest.approx(2.0)
+            # Segment caps scaled by 2 (bug fix: comments must not interfere)
+            caps = {node: c for node, _, c in net.segment_caps}
+            assert caps["drv:Z"] == pytest.approx(1.2), (
+                "Segment cap at driver not scaled — inline comment bug not fixed"
+            )
+            assert caps["snk:A"] == pytest.approx(0.8), (
+                "Segment cap at sink not scaled — inline comment bug not fixed"
+            )
+            # Resistance scaled by 2
+            r = net.driver_sink_resistances()
+            assert r["snk:A"] == pytest.approx(10.0)
+
+            # Inline comment text must be preserved in the output file
+            with open(out, encoding="utf-8") as f:
+                out_text = f.read()
+            assert "// ground cap at driver" in out_text
+            assert "// ground cap at sink" in out_text
+
+    def test_cap_mutual_inline_comment_scaled(self):
+        """Mutual *CAP entries (idx node1 node2 value // comment) are scaled correctly."""
+        spef_content = textwrap.dedent("""\
+            *SPEF "IEEE 1481-1999"
+            *DESIGN "t"
+            *DATE "2026:01:01:00:00:00"
+            *VENDOR "t"
+            *PROGRAM "t"
+            *VERSION "1.0"
+            *DIVIDER /
+            *DELIMITER :
+            *BUS_DELIMITER [ ]
+            *T_UNIT 1 NS
+            *C_UNIT 1 PF
+            *R_UNIT 1 OHM
+            *L_UNIT 1 HENRY
+
+            *NAME_MAP
+            *1 net_Y
+            *2 drv:Z
+            *3 snk:A
+
+            *D_NET *1 1.0
+            *CONN
+            *I *2 O *C 0.0 0.0
+            *I *3 I *C 0.0 0.0
+            *CAP
+            1 *2 *3 1.0 // mutual coupling
+            *RES
+            1 *2 *3 5.0
+            *END
+        """)
+        with tempfile.TemporaryDirectory() as td:
+            spef = self._write(td, "spef.spef", spef_content)
+            cap_data = self._write(td, "cap.data", "net_Y 1.0 2.0\n")
+            out = os.path.join(td, "out.spef")
+
+            backmark_spef(spef, cap_data, None, out)
+
+            sf = self._parse(out)
+            net = sf.nets["net_Y"]
+            assert net.total_cap == pytest.approx(2.0)
+            # Mutual cap entry scaled by 2
+            assert net.segment_caps[0][2] == pytest.approx(2.0), (
+                "Mutual cap not scaled — inline comment bug not fixed"
+            )
+
+    # ------------------------------------------------------------------ round-trip with shuffled SPEF
+
+    def test_backmark_from_shuffled_spef_data(self):
+        """Data files generated from a shuffled SPEF can be applied to the original.
+
+        Workflow:
+          1. Generate a shuffled copy of the original SPEF.
+          2. Compare the shuffled SPEF against a reference SPEF → net_cap.data,
+             net_res.data (written to a temp dir by compare_spef).
+          3. Apply those data files to the *original* (unshuffled) SPEF.
+          4. The back-annotated SPEF must have the reference RC values for every net.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            orig_path = self._write(td, "orig.spef", _BACKMARK_SPEF)
+            ref_path  = self._write(td, "ref.spef",  _REF_SPEF)
+            shuf_path = os.path.join(td, "shuffled.spef")
+            out_path  = os.path.join(td, "backmarked.spef")
+
+            # Step 1: shuffle
+            shuffle_net_mapping(orig_path, shuf_path, seed=7)
+
+            # Step 2: compare shuffled vs reference
+            shuf_sf = SpefFile(shuf_path); shuf_sf.parse()
+            ref_sf  = SpefFile(ref_path);  ref_sf.parse()
+
+            old_dir = os.getcwd()
+            os.chdir(td)
+            try:
+                compare_spef(shuf_sf, ref_sf, "max")
+            finally:
+                os.chdir(old_dir)
+
+            cap_data = os.path.join(td, "net_cap.data")
+            res_data = os.path.join(td, "net_res.data")
+
+            # Step 3: back-annotate the *original* SPEF
+            backmark_spef(orig_path, cap_data, res_data, out_path)
+
+            # Step 4: verify the output matches the reference values
+            out_sf = self._parse(out_path)
+            for net_name, ref_net in ref_sf.nets.items():
+                out_net = out_sf.nets.get(net_name)
+                assert out_net is not None, f"{net_name} missing from back-annotated SPEF"
+                assert out_net.total_cap == pytest.approx(ref_net.total_cap, rel=1e-5), (
+                    f"{net_name}: total_cap {out_net.total_cap} != ref {ref_net.total_cap}"
+                )
+                ref_r = ref_net.driver_sink_resistances()
+                out_r = out_net.driver_sink_resistances()
+                for sink, r_ref in ref_r.items():
+                    assert sink in out_r, f"{net_name}/{sink} missing from output"
+                    assert out_r[sink] == pytest.approx(r_ref, rel=1e-5), (
+                        f"{net_name}/{sink}: R {out_r[sink]} != ref {r_ref}"
+                    )
+
+    # ------------------------------------------------------------------ edge cases
+
+    def test_net_absent_from_data_file_unchanged(self):
+        """Nets not mentioned in the data files must be written unchanged."""
+        with tempfile.TemporaryDirectory() as td:
+            spef = self._write(td, "orig.spef", _BACKMARK_SPEF)
+            # Only update net_A; net_B should be untouched
+            cap_data = self._write(td, "cap.data", "net_A 1.5 3.0\n")
+            out = os.path.join(td, "out.spef")
+
+            backmark_spef(spef, cap_data, None, out)
+
+            sf = self._parse(out)
+            assert sf.nets["net_B"].total_cap == pytest.approx(0.8)
+            caps_b = {n: c for n, _, c in sf.nets["net_B"].segment_caps}
+            assert caps_b["drv_u3:Y"] == pytest.approx(0.4)
+            assert caps_b["sink_u4:B"] == pytest.approx(0.4)
+
+    def test_cap_only_data(self):
+        """Providing only cap data does not modify resistance values."""
+        with tempfile.TemporaryDirectory() as td:
+            spef = self._write(td, "orig.spef", _BACKMARK_SPEF)
+            cap_data = self._write(td, "cap.data", "net_A 1.5 3.0\n")
+            out = os.path.join(td, "out.spef")
+
+            backmark_spef(spef, cap_data, None, out)
+
+            sf = self._parse(out)
+            # Cap updated
+            assert sf.nets["net_A"].total_cap == pytest.approx(3.0)
+            # Resistance unchanged
+            r = sf.nets["net_A"].driver_sink_resistances()
+            assert r["sink_u2:A"] == pytest.approx(10.0)
+
+    def test_res_only_data(self):
+        """Providing only res data does not modify capacitance values."""
+        with tempfile.TemporaryDirectory() as td:
+            spef = self._write(td, "orig.spef", _BACKMARK_SPEF)
+            res_data = self._write(
+                td, "res.data", "net_A drv_u1:Z sink_u2:A 10.0 20.0\n"
+            )
+            out = os.path.join(td, "out.spef")
+
+            backmark_spef(spef, None, res_data, out)
+
+            sf = self._parse(out)
+            # Total cap unchanged
+            assert sf.nets["net_A"].total_cap == pytest.approx(1.5)
+            # Resistance scaled
+            r = sf.nets["net_A"].driver_sink_resistances()
+            assert r["sink_u2:A"] == pytest.approx(20.0)
+
+    def test_zero_old_cap_no_crash(self):
+        """A net with zero total cap in the SPEF must not crash (ratio defaults to 1)."""
+        spef_content = textwrap.dedent("""\
+            *SPEF "IEEE 1481-1999"
+            *DESIGN "t"
+            *DATE "2026:01:01:00:00:00"
+            *VENDOR "t"
+            *PROGRAM "t"
+            *VERSION "1.0"
+            *DIVIDER /
+            *DELIMITER :
+            *BUS_DELIMITER [ ]
+            *T_UNIT 1 NS
+            *C_UNIT 1 PF
+            *R_UNIT 1 OHM
+            *L_UNIT 1 HENRY
+
+            *D_NET net_Z 0.0
+            *CONN
+            *I drv:Z O
+            *RES
+            1 drv:Z snk:A 5.0
+            *END
+        """)
+        with tempfile.TemporaryDirectory() as td:
+            spef = self._write(td, "spef.spef", spef_content)
+            cap_data = self._write(td, "cap.data", "net_Z 0.0 2.0\n")
+            out = os.path.join(td, "out.spef")
+
+            backmark_spef(spef, cap_data, None, out)  # must not raise
+
+            sf = self._parse(out)
+            # *D_NET line updated to new total cap
+            assert sf.nets["net_Z"].total_cap == pytest.approx(2.0)
