@@ -1121,6 +1121,122 @@ def summarize_and_print(caps: List[CapComparison], ress: List[ResComparison],
 # ----------------------------- GUI (Tkinter) -----------------------------
 
 
+def _draw_diff_histogram_ax(ax, diffs: List[float], title: str, n_bins: int = 100) -> None:
+    """Draw an absolute difference histogram with coloured sigma-band backgrounds.
+
+    Background bands:
+        yellow       – within ±1σ of the mean
+        purple/lavender – ±1σ to ±2σ
+        pink         – beyond ±2σ
+
+    Bar colours (based on which band the bin centre falls in):
+        dark green – within ±1σ
+        blue       – ±1σ to ±2σ
+        red        – ±2σ to ±3σ
+        black      – beyond ±3σ
+
+    A text box in the upper-right corner shows Mean, StdDev, Min, Max.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        ax.set_title(title + "  [numpy required]")
+        return
+
+    ax.set_title(title)
+    if not diffs:
+        return
+
+    mean = float(sum(diffs)) / len(diffs)
+    variance = sum((x - mean) ** 2 for x in diffs) / max(len(diffs) - 1, 1)
+    stddev = math.sqrt(variance)
+    dmin = min(diffs)
+    dmax = max(diffs)
+
+    counts, bin_edges = np.histogram(diffs, bins=n_bins)
+
+    xmin = float(bin_edges[0])
+    xmax = float(bin_edges[-1])
+
+    # ------------------------------------------------------------------
+    # Coloured background bands
+    # ------------------------------------------------------------------
+    s1 = stddev
+    s2 = 2.0 * stddev
+
+    # Pink: beyond ±2σ
+    ax.axvspan(xmin, mean - s2, color="#FFB3DE", zorder=0)
+    ax.axvspan(mean + s2, xmax, color="#FFB3DE", zorder=0)
+    # Purple/lavender: ±1σ to ±2σ
+    ax.axvspan(mean - s2, mean - s1, color="#AAAAEE", zorder=0)
+    ax.axvspan(mean + s1, mean + s2, color="#AAAAEE", zorder=0)
+    # Yellow: within ±1σ
+    ax.axvspan(mean - s1, mean + s1, color="yellow", zorder=0)
+
+    # ------------------------------------------------------------------
+    # Histogram bars
+    # ------------------------------------------------------------------
+    s3 = 3.0 * stddev
+    for count, left, right in zip(counts, bin_edges[:-1], bin_edges[1:]):
+        bin_center = (float(left) + float(right)) / 2.0
+        dist = abs(bin_center - mean)
+        if stddev == 0.0:
+            color = "darkgreen"
+        elif dist <= s1:
+            color = "darkgreen"
+        elif dist <= s2:
+            color = "blue"
+        elif dist <= s3:
+            color = "red"
+        else:
+            color = "black"
+        ax.bar(float(left), int(count), width=float(right - left),
+               align="edge", color=color, zorder=2)
+
+    ax.set_xlim(xmin, xmax)
+
+    # ------------------------------------------------------------------
+    # Stats text box
+    # ------------------------------------------------------------------
+    def _fmt(v: float) -> str:
+        if v == 0.0:
+            return "0"
+        if abs(v) >= 0.001:
+            return f"{v:.4f}"
+        return f"{v:.4e}"
+
+    stats_text = (
+        "Difference Stats:\n\n"
+        f"Mean: {_fmt(mean)}\n\n"
+        f"StdDev: {_fmt(stddev)}\n\n"
+        f"Min: {_fmt(dmin)}\n\n"
+        f"Max: {_fmt(dmax)}"
+    )
+    ax.text(
+        0.98, 0.97,
+        stats_text,
+        transform=ax.transAxes,
+        verticalalignment="top",
+        horizontalalignment="right",
+        fontsize=9,
+        fontfamily="monospace",
+        bbox=dict(boxstyle="square,pad=0.6", facecolor="white", edgecolor="black", linewidth=1.2),
+        zorder=5,
+    )
+    # Underline the header line by annotating separately
+    ax.text(
+        0.98, 0.97,
+        "Difference Stats:",
+        transform=ax.transAxes,
+        verticalalignment="top",
+        horizontalalignment="right",
+        fontsize=9,
+        fontfamily="monospace",
+        fontweight="bold",
+        zorder=6,
+    )
+
+
 def collect_spef_paths(inputs: Iterable[str]) -> List[str]:
     """Expand file and directory inputs into a SPEF path list.
 
@@ -1311,6 +1427,14 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
             ttk.Button(opts_frame, text="Run Analysis", command=self._run_analysis).grid(
                 row=4,
                 column=2,
+                sticky="w",
+                padx=5,
+                pady=2,
+            )
+
+            ttk.Button(opts_frame, text="Diff Histogram", command=self._show_diff_histogram).grid(
+                row=4,
+                column=4,
                 sticky="w",
                 padx=5,
                 pady=2,
@@ -1725,6 +1849,50 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
             self.ax_c.set_title("No data")
             self.ax_r.set_title("")
             self.canvas.draw()
+
+        def _show_diff_histogram(self) -> None:
+            """Open a new window with absolute difference histograms for C and R."""
+            if not self.points_cap and not self.points_res:
+                messagebox.showwarning("No Data", "Please run the analysis first.")
+                return
+
+            ref_name = self.ref_var.get() or "ref"
+            fit_name = self.fit_var.get() or "fit"
+
+            diffs_c = [p["c_fit"] - p["c_ref"] for p in self.points_cap]
+            diffs_r = [p["r_fit"] - p["r_ref"] for p in self.points_res]
+
+            nrows = (1 if diffs_c else 0) + (1 if diffs_r else 0)
+            if nrows == 0:
+                messagebox.showwarning("No Data", "No difference data available.")
+                return
+
+            win = tk.Toplevel(self.root)
+            win.title(f"Absolute Difference Histogram  {ref_name} – {fit_name}")
+
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg as _FCA
+            from matplotlib.figure import Figure as _Figure
+
+            fig = _Figure(figsize=(10, 5 * nrows))
+            idx = 1
+            if diffs_c:
+                ax_c = fig.add_subplot(nrows, 1, idx)
+                _draw_diff_histogram_ax(
+                    ax_c, diffs_c,
+                    f"Absolute Difference Histogram {ref_name} - {fit_name}  (C)"
+                )
+                idx += 1
+            if diffs_r:
+                ax_r = fig.add_subplot(nrows, 1, idx)
+                _draw_diff_histogram_ax(
+                    ax_r, diffs_r,
+                    f"Absolute Difference Histogram {ref_name} - {fit_name}  (R)"
+                )
+
+            fig.tight_layout()
+            canvas = _FCA(fig, master=win)
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+            canvas.draw()
 
         def _update_plot(self, ref_name: str, fit_name: str,
                           corr_c: Optional[float], corr_r: Optional[float]) -> None:
