@@ -191,8 +191,13 @@ class SpefFile:
             pin = parts[1]
             tok = parts[0]
         if tok.startswith("*") and tok in self.name_map:
-            return self.name_map[tok] + f':{pin}' if pin else self.name_map[tok]
-        return tok
+            result = self.name_map[tok] + f':{pin}' if pin else self.name_map[tok]
+        else:
+            result = tok
+        # Unescape \[ → [ and \] → ] that some SPEF writers emit for bus nets
+        if '\\' in result:
+            result = result.replace('\\[', '[').replace('\\]', ']')
+        return result
 
     def parse(self) -> None:
         # ---- bind frequently accessed attributes to locals ----
@@ -229,11 +234,17 @@ class SpefFile:
                 pin  = tok[idx + 1:]
                 if base and base[0] == '*' and base in name_map:
                     r = name_map[base]
-                    return f"{r}:{pin}" if pin else r
-                return base   # no name-map match: return base, dropping pin suffix
-            if c == '*':
-                return name_map.get(tok, tok)
-            return tok
+                    result = f"{r}:{pin}" if pin else r
+                else:
+                    result = base   # no name-map match: return base, dropping pin suffix
+            elif c == '*':
+                result = name_map.get(tok, tok)
+            else:
+                result = tok
+            # Unescape \[ → [ and \] → ] that some SPEF writers emit for bus nets
+            if '\\' in result:
+                result = result.replace('\\[', '[').replace('\\]', ']')
+            return result
 
         # Integer section constants — int comparison is faster than str comparison
         SEC_NONE = 0

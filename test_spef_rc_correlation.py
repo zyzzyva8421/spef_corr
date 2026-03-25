@@ -356,6 +356,50 @@ class TestSpefFileParse:
         sf = _make_spef_object(spef)
         assert "net/A[0]" in sf.nets
 
+    def test_escaped_brackets_in_name_map(self):
+        """Net names with \\[ \\] in NAME_MAP should be unescaped to [ ]."""
+        spef = MINIMAL_SPEF.replace(
+            '*1 net_A',   r'*1 bus\[1\]'
+        ).replace(
+            '*2 drv_u1:Z', r'*2 drv\[0\]:Z'
+        )
+        sf = _make_spef_object(spef)
+        assert "bus[1]" in sf.nets
+        assert sf.nets["bus[1]"].driver == "drv[0]:Z"
+
+    def test_escaped_brackets_in_d_net_direct(self):
+        """Net names with \\[ \\] written directly in *D_NET (no NAME_MAP) are unescaped."""
+        spef = textwrap.dedent(r"""
+            *SPEF "IEEE 1481-1999"
+            *DESIGN "test"
+            *DATE "2026:01:01:00:00:00"
+            *VENDOR "test"
+            *PROGRAM "test"
+            *VERSION "1.0"
+            *DESIGN_FLOW "NETLIST"
+            *DIVIDER /
+            *DELIMITER :
+            *BUS_DELIMITER [ ]
+            *T_UNIT 1 NS
+            *C_UNIT 1 PF
+            *R_UNIT 1 OHM
+            *L_UNIT 1 HENRY
+
+            *D_NET a\[1\] 1.0
+            *CONN
+            *I drv_Z O
+            *I snk_A I
+            *RES
+            1 drv_Z snk_A 5.0
+            *END
+        """)
+        sf = _make_spef_object(spef)
+        assert "a[1]" in sf.nets
+        net = sf.nets["a[1]"]
+        assert net.driver == "drv_Z"
+        assert "snk_A" in net.sinks
+        assert "drv_Z" in net.res_graph
+
     def test_empty_file_no_crash(self):
         sf = _make_spef_object("")
         assert sf.nets == {}
