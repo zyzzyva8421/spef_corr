@@ -11,6 +11,8 @@ Coverage:
   - write_caps_csv / write_res_csv: round-trip CSV content check
   - collect_spef_paths: directory expansion, direct file path, non-spef file filtering
   - parse_spefs_parallel: returns two SpefFile objects with the same nets
+  - shuffle_net_mapping: RC data preserved per net_name, mapping actually shuffled,
+                         seed reproducibility, single-net file copied unchanged
 """
 
 import csv
@@ -35,6 +37,7 @@ from spef_rc_correlation import (
     parse_net_res_data,
     parse_spefs_parallel,
     pearson_corr,
+    shuffle_net_mapping,
     write_caps_csv,
     write_res_csv,
 )
@@ -998,3 +1001,371 @@ class TestGuiCliWiring:
         # CLI output should mention the correlation
         out = capsys.readouterr().out
         assert "correlation" in out.lower() or "cap" in out.lower()
+# ---------------------------------------------------------------------------
+# shuffle_net_mapping
+# ---------------------------------------------------------------------------
+
+# A two-net SPEF used across the shuffle tests.  Uses plain-integer indices
+# in *CAP and *RES sections (standard commercial format).
+TWO_NET_SPEF = textwrap.dedent("""\
+    *SPEF "IEEE 1481-1999"
+    *DESIGN "test2"
+    *DATE "2026:01:01:00:00:00"
+    *VENDOR "test"
+    *PROGRAM "test"
+    *VERSION "1.0"
+    *DESIGN_FLOW "NETLIST"
+    *DIVIDER /
+    *DELIMITER :
+    *BUS_DELIMITER [ ]
+    *T_UNIT 1 NS
+    *C_UNIT 1 PF
+    *R_UNIT 1 OHM
+    *L_UNIT 1 HENRY
+
+    *NAME_MAP
+    *1 net_A
+    *2 net_B
+    *3 drv_u1:Z
+    *4 sink_u2:A
+    *5 drv_u3:Y
+    *6 sink_u4:B
+
+    *D_NET *1 1.5
+    *CONN
+    *I *3 O *C 0.0 0.0
+    *I *4 I *C 0.0 0.0
+    *CAP
+    1 *3 0.8
+    2 *4 0.7
+    *RES
+    1 *3 *4 10.0
+    *END
+
+    *D_NET *2 0.8
+    *CONN
+    *I *5 O *C 0.0 0.0
+    *I *6 I *C 0.0 0.0
+    *CAP
+    1 *5 0.4
+    2 *6 0.4
+    *RES
+    1 *5 *6 5.0
+    *END
+""")
+
+
+def _parse_spef_from_string(content: str) -> SpefFile:
+    """Write *content* to a temp file, parse it, delete it, and return the SpefFile."""
+    path = _write_temp_spef(content)
+    try:
+        sf = SpefFile(path)
+        sf.parse()
+    finally:
+        os.unlink(path)
+    return sf
+
+
+class TestShuffleNetMapping:
+    # ------------------------------------------------------------------ helpers
+
+    def _shuffle_tmp(self, content: str, seed: int = 0) -> str:
+        """Write *content* to a temp SPEF, shuffle it, return path of shuffled file."""
+        src = _write_temp_spef(content)
+        dst = src + ".shuffled.spef"
+        try:
+            shuffle_net_mapping(src, dst, seed=seed)
+        finally:
+            os.unlink(src)
+        return dst  # caller must unlink
+
+    # ------------------------------------------------------------------ core correctness
+
+    def test_rc_data_preserved_per_net_name(self):
+        """After shuffling, each net_name has the same total_cap and resistance."""
+        orig_sf = _parse_spef_from_string(TWO_NET_SPEF)
+
+        shuffled_path = self._shuffle_tmp(TWO_NET_SPEF, seed=0)
+        try:
+            shuffled_sf = SpefFile(shuffled_path)
+            shuffled_sf.parse()
+        finally:
+            os.unlink(shuffled_path)
+
+        for net_name, orig_net in orig_sf.nets.items():
+            shuf_net = shuffled_sf.nets.get(net_name)
+            assert shuf_net is not None, f"{net_name} missing from shuffled SPEF"
+            assert shuf_net.total_cap == pytest.approx(orig_net.total_cap), (
+                f"{net_name}: cap changed"
+            )
+            orig_r = orig_net.driver_sink_resistances()
+            shuf_r = shuf_net.driver_sink_resistances()
+            for sink, r_val in orig_r.items():
+                assert sink in shuf_r, f"{net_name}: sink {sink} missing after shuffle"
+                assert shuf_r[sink] == pytest.approx(r_val), (
+                    f"{net_name}/{sink}: resistance changed"
+                )
+
+    def test_compare_spef_produces_same_data(self):
+        """compare_spef(original, shuffled) → c1==c2 and r1==r2 for every entry."""
+        orig_path = _write_temp_spef(TWO_NET_SPEF)
+        shuffled_path = orig_path + ".shuffled.spef"
+        try:
+            shuffle_net_mapping(orig_path, shuffled_path, seed=1)
+            orig_sf = SpefFile(orig_path)
+            orig_sf.parse()
+            shuf_sf = SpefFile(shuffled_path)
+            shuf_sf.parse()
+
+            with tempfile.TemporaryDirectory() as td:
+                os.chdir(td)
+                try:
+                    caps, ress, _, _ = compare_spef(orig_sf, shuf_sf, "max")
+                finally:
+                    os.chdir(os.path.dirname(orig_path))
+
+            assert len(caps) == len(orig_sf.nets), "All nets must be in common"
+            for c in caps:
+                assert c.c1 == pytest.approx(c.c2), (
+                    f"Cap mismatch for {c.net}: {c.c1} vs {c.c2}"
+                )
+            for r in ress:
+                assert r.r1 == pytest.approx(r.r2), (
+                    f"Res mismatch for {r.net}/{r.load}: {r.r1} vs {r.r2}"
+                )
+        finally:
+            os.unlink(orig_path)
+            if os.path.exists(shuffled_path):
+                os.unlink(shuffled_path)
+
+    def test_name_map_is_actually_shuffled(self):
+        """The net_id → net_name entries in NAME_MAP must differ from the original."""
+        orig_sf = _parse_spef_from_string(TWO_NET_SPEF)
+        orig_mapping = {v: k for k, v in orig_sf.name_map.items()}  # name→id in original
+
+        shuffled_path = self._shuffle_tmp(TWO_NET_SPEF, seed=0)
+        try:
+            shuf_sf = SpefFile(shuffled_path)
+            shuf_sf.parse()
+        finally:
+            os.unlink(shuffled_path)
+
+        new_mapping = {v: k for k, v in shuf_sf.name_map.items()}   # name→id in shuffled
+
+        # At least one net must have a different ID
+        net_names = list(orig_sf.nets.keys())
+        assert any(
+            orig_mapping.get(n) != new_mapping.get(n) for n in net_names
+        ), "Expected at least one net to have a different ID after shuffling"
+
+    def test_same_net_names_present(self):
+        """The shuffled SPEF must contain exactly the same net names as the original."""
+        orig_sf = _parse_spef_from_string(TWO_NET_SPEF)
+
+        shuffled_path = self._shuffle_tmp(TWO_NET_SPEF, seed=2)
+        try:
+            shuf_sf = SpefFile(shuffled_path)
+            shuf_sf.parse()
+        finally:
+            os.unlink(shuffled_path)
+
+        assert set(shuf_sf.nets.keys()) == set(orig_sf.nets.keys())
+
+    # ------------------------------------------------------------------ seed reproducibility
+
+    def test_seed_gives_reproducible_output(self):
+        """Two calls with the same seed must produce byte-for-byte identical output."""
+        src = _write_temp_spef(TWO_NET_SPEF)
+        dst1 = src + ".s1.spef"
+        dst2 = src + ".s2.spef"
+        try:
+            shuffle_net_mapping(src, dst1, seed=99)
+            shuffle_net_mapping(src, dst2, seed=99)
+            with open(dst1, 'r', encoding='utf-8') as f1, \
+                 open(dst2, 'r', encoding='utf-8') as f2:
+                assert f1.read() == f2.read()
+        finally:
+            os.unlink(src)
+            for p in (dst1, dst2):
+                if os.path.exists(p):
+                    os.unlink(p)
+
+    def test_different_seeds_may_differ(self):
+        """Two different seeds should (with overwhelming probability) differ."""
+        # With only 2 nets there are only 2 permutations and both seeds might
+        # land on the same one, so we use a larger synthetic SPEF here.
+        nets = []
+        name_map_lines = []
+        for i in range(1, 11):
+            net_id = f"*{i}"
+            pin_id = f"*{i + 100}"
+            name_map_lines.append(f"{net_id} net_{i:02d}")
+            name_map_lines.append(f"{pin_id} drv_{i:02d}:Z")
+            nets.append(
+                f"*D_NET {net_id} {i * 0.1:.1f}\n"
+                f"*CONN\n"
+                f"*I {pin_id} O *C 0.0 0.0\n"
+                f"*RES\n"
+                f"1 {pin_id} {pin_id} {i * 1.0:.1f}\n"
+                f"*END"
+            )
+        header = textwrap.dedent("""\
+            *SPEF "IEEE 1481-1999"
+            *DESIGN "big"
+            *DATE "2026:01:01:00:00:00"
+            *VENDOR "t"
+            *PROGRAM "t"
+            *VERSION "1.0"
+            *DIVIDER /
+            *DELIMITER :
+            *BUS_DELIMITER [ ]
+            *T_UNIT 1 NS
+            *C_UNIT 1 PF
+            *R_UNIT 1 OHM
+            *L_UNIT 1 HENRY
+        """)
+        content = header + "\n*NAME_MAP\n" + "\n".join(name_map_lines) + "\n\n" + "\n\n".join(nets) + "\n"
+
+        src = _write_temp_spef(content)
+        dst_a = src + ".a.spef"
+        dst_b = src + ".b.spef"
+        try:
+            shuffle_net_mapping(src, dst_a, seed=1)
+            shuffle_net_mapping(src, dst_b, seed=2)
+            with open(dst_a) as fa, open(dst_b) as fb:
+                assert fa.read() != fb.read(), "Different seeds should produce different results"
+        finally:
+            os.unlink(src)
+            for p in (dst_a, dst_b):
+                if os.path.exists(p):
+                    os.unlink(p)
+
+    # ------------------------------------------------------------------ edge cases
+
+    def test_single_net_file_copied_unchanged(self):
+        """A SPEF with only one net (nothing to shuffle) is copied verbatim."""
+        src = _write_temp_spef(MINIMAL_SPEF)
+        dst = src + ".shuffled.spef"
+        try:
+            shuffle_net_mapping(src, dst, seed=0)
+            with open(src, 'r', encoding='utf-8') as f1, \
+                 open(dst, 'r', encoding='utf-8') as f2:
+                assert f1.read() == f2.read()
+        finally:
+            os.unlink(src)
+            if os.path.exists(dst):
+                os.unlink(dst)
+
+    def test_no_name_map_file_copied_unchanged(self):
+        """A SPEF with no *NAME_MAP / literal net names is copied verbatim."""
+        content = textwrap.dedent("""\
+            *SPEF "IEEE 1481-1999"
+            *DESIGN "t"
+            *DATE "2026:01:01:00:00:00"
+            *VENDOR "t"
+            *PROGRAM "t"
+            *VERSION "1.0"
+            *DIVIDER /
+            *DELIMITER :
+            *BUS_DELIMITER [ ]
+            *T_UNIT 1 NS
+            *C_UNIT 1 PF
+            *R_UNIT 1 OHM
+            *L_UNIT 1 HENRY
+
+            *D_NET net_X 1.0
+            *CONN
+            *I drv_Z O
+            *RES
+            1 drv_Z snk_A 5.0
+            *END
+        """)
+        src = _write_temp_spef(content)
+        dst = src + ".shuffled.spef"
+        try:
+            shuffle_net_mapping(src, dst, seed=0)
+            with open(src, 'r', encoding='utf-8') as f1, \
+                 open(dst, 'r', encoding='utf-8') as f2:
+                assert f1.read() == f2.read()
+        finally:
+            os.unlink(src)
+            if os.path.exists(dst):
+                os.unlink(dst)
+
+    def test_pin_ids_are_not_substituted(self):
+        """Instance/pin NAME_MAP entries (*3, *4, *5, *6) must remain unchanged."""
+        shuffled_path = self._shuffle_tmp(TWO_NET_SPEF, seed=0)
+        try:
+            shuf_sf = SpefFile(shuffled_path)
+            shuf_sf.parse()
+        finally:
+            os.unlink(shuffled_path)
+
+        # Pin/instance entries *3, *4, *5, *6 must still map to the same names
+        assert shuf_sf.name_map.get("*3") == "drv_u1:Z"
+        assert shuf_sf.name_map.get("*4") == "sink_u2:A"
+        assert shuf_sf.name_map.get("*5") == "drv_u3:Y"
+        assert shuf_sf.name_map.get("*6") == "sink_u4:B"
+
+    def test_driver_and_sinks_unchanged(self):
+        """Driver and sink pin names per net must be identical after shuffling."""
+        orig_sf = _parse_spef_from_string(TWO_NET_SPEF)
+
+        shuffled_path = self._shuffle_tmp(TWO_NET_SPEF, seed=3)
+        try:
+            shuf_sf = SpefFile(shuffled_path)
+            shuf_sf.parse()
+        finally:
+            os.unlink(shuffled_path)
+
+        for net_name in orig_sf.nets:
+            orig_net = orig_sf.nets[net_name]
+            shuf_net = shuf_sf.nets[net_name]
+            assert shuf_net.driver == orig_net.driver, (
+                f"{net_name}: driver changed from {orig_net.driver} to {shuf_net.driver}"
+            )
+            assert sorted(shuf_net.sinks) == sorted(orig_net.sinks), (
+                f"{net_name}: sinks changed"
+            )
+
+    # ------------------------------------------------------------------ CLI wiring
+
+    def test_cli_shuffle_creates_output_file(self, monkeypatch, capsys):
+        """--shuffle should create a shuffled SPEF and print a summary."""
+        src = _write_temp_spef(TWO_NET_SPEF)
+        dst = src + ".out.spef"
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "spef_rc_correlation.py",
+                src,
+                "--shuffle",
+                "--output", dst,
+                "--seed", "7",
+            ])
+            spef_mod.main()
+            assert os.path.exists(dst), "Output file was not created"
+            out = capsys.readouterr().out
+            assert "shuffle" in out.lower()
+        finally:
+            os.unlink(src)
+            if os.path.exists(dst):
+                os.unlink(dst)
+
+    def test_cli_shuffle_default_output_name(self, monkeypatch):
+        """Without --output, shuffled SPEF is written to <input>_shuffled.spef."""
+        src = _write_temp_spef(TWO_NET_SPEF)
+        base, ext = os.path.splitext(src)
+        dst = f"{base}_shuffled{ext}"
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "spef_rc_correlation.py",
+                src,
+                "--shuffle",
+                "--seed", "0",
+            ])
+            spef_mod.main()
+            assert os.path.exists(dst)
+        finally:
+            os.unlink(src)
+            if os.path.exists(dst):
+                os.unlink(dst)

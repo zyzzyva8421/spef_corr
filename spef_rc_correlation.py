@@ -36,6 +36,8 @@ import argparse
 import csv
 import math
 import os
+import random
+import shutil
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Iterable, Set
 import heapq
@@ -963,6 +965,126 @@ def backmark_spef(
     print(f"[backmark] Written {lines_written} lines to {output_path}")
 
 
+# -------------------- shuffle: randomise net_id ↔ net_name mapping --------------------
+
+def shuffle_net_mapping(
+    spef_path: str,
+    output_path: str,
+    seed: Optional[int] = None,
+) -> None:
+    """Generate a new SPEF with a randomly shuffled net_id ↔ net_name mapping.
+
+    The algorithm applies a *global token substitution* on every ``*N`` token
+    in the file where N is a net-type NAME_MAP entry.  Concretely:
+
+    1. Parse the ``*NAME_MAP`` section to find all ``*N → name`` entries.
+    2. Identify which ``*N`` IDs appear as the first argument of ``*D_NET``
+       lines (these are the "net IDs").
+    3. Randomly permute the net_names among those net IDs to produce a
+       bijective substitution ``old_net_id → new_net_id``.
+    4. Replace every ``*N`` token (where N is a net ID) throughout the file
+       with the new ID from step 3.
+
+    The effect is:
+
+    * The ``*NAME_MAP`` entries for nets are re-labelled (mapping shuffled).
+    * Every ``*D_NET`` header is updated to carry the new ID of that net.
+    * All internal node references (``*N:pin``) inside each ``*D_NET`` block
+      are updated consistently, so the resolved pin names are unchanged.
+
+    Because each net_name continues to own exactly its original RC data, a
+    comparison of the shuffled SPEF against the original produces identical
+    ``net_cap.data`` and ``net_res.data`` files.
+
+    Args:
+        spef_path:   Path to the input SPEF file.
+        output_path: Path to write the shuffled SPEF.
+        seed:        Optional random seed for reproducibility.
+    """
+    rng = random.Random(seed)
+
+    _re_nid = re.compile(r'^\*\d+$')
+
+    # ---- Pass 1: collect NAME_MAP and net_ids ----
+    name_map: Dict[str, str] = {}   # *N -> resolved_name (all entries)
+    net_ids: List[str] = []         # *N tokens from *D_NET lines (first-seen order)
+    net_ids_set: Set[str] = set()   # fast membership test
+
+    in_name_map = False
+    with open(spef_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            if raw.startswith('*NAME_MAP'):
+                in_name_map = True
+                continue
+            if in_name_map:
+                parts = raw.split(None, 1)
+                if len(parts) == 2 and _re_nid.match(parts[0]):
+                    name_map[parts[0]] = parts[1].strip('"')
+                    continue
+                # Non-matching line ends the NAME_MAP section
+                in_name_map = False
+            if raw.startswith('*D_NET '):
+                parts = raw.split(None, 2)
+                if len(parts) >= 2:
+                    nid = parts[1]
+                    if _re_nid.match(nid) and nid not in net_ids_set:
+                        net_ids.append(nid)
+                        net_ids_set.add(nid)
+
+    if len(net_ids) < 2:
+        shutil.copy2(spef_path, output_path)
+        print(f"[shuffle] Only {len(net_ids)} net(s) found; file copied unchanged.")
+        return
+
+    # ---- Build shuffled assignment ----
+    net_names: List[str] = [name_map.get(nid, nid) for nid in net_ids]
+    shuffled_names: List[str] = list(net_names)
+    # Retry up to 20 times to avoid the identity permutation.  The probability
+    # of landing on the identity for N≥2 elements is 1/N!, so 20 tries gives a
+    # failure probability < (1/2)^20 ≈ 1e-6.
+    for _ in range(20):
+        rng.shuffle(shuffled_names)
+        if shuffled_names != net_names:
+            break
+
+    # new_nid_for_name[net_name] = net_id that net_name will occupy in new SPEF
+    new_nid_for_name: Dict[str, str] = {
+        shuffled_names[i]: net_ids[i] for i in range(len(net_ids))
+    }
+
+    # Global substitution map: old_nid -> new_nid
+    # For a given old_nid with net_names[i], the name moves to new_nid_for_name[net_names[i]]
+    subst: Dict[str, str] = {
+        net_ids[i]: new_nid_for_name[net_names[i]] for i in range(len(net_ids))
+    }
+
+    # ---- Pass 2: apply global substitution and write ----
+    net_nums: Set[str] = {nid[1:] for nid in net_ids}   # digit strings only
+
+    _pat = re.compile(r'\*(\d+)')
+
+    def _replace(m: re.Match) -> str:
+        num = m.group(1)
+        if num in net_nums:
+            old_nid = '*' + num
+            return subst.get(old_nid, old_nid)
+        return m.group(0)
+
+    with open(spef_path, 'r', encoding='utf-8', errors='ignore') as fin, \
+         open(output_path, 'w', encoding='utf-8') as fout:
+        for line in fin:
+            if '*' in line:
+                line = _pat.sub(_replace, line)
+            fout.write(line)
+
+    n_changed = sum(1 for nid in net_ids if subst[nid] != nid)
+    print(f"[shuffle] Written shuffled SPEF to {output_path}")
+    print(f"[shuffle] {len(net_ids)} nets total; {n_changed} net_ids reassigned")
+
+
 def summarize_and_print(caps: List[CapComparison], ress: List[ResComparison], 
                         spef1: SpefFile, spef2: SpefFile, r_agg: str) -> None:
     print("=== SPEF RC Correlation Summary ===")
@@ -1847,10 +1969,28 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help=(
+            "Shuffle mode: randomly permute the net_id ↔ net_name mapping "
+            "in the SPEF given as spef1, while preserving RC data per net_name. "
+            "Comparing the output against the original produces identical "
+            "net_cap.data and net_res.data. "
+            "Use --output for the output path and --seed for reproducibility."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Random seed for --shuffle mode (default: random).",
+    )
+    parser.add_argument(
         "--output",
         "-o",
         metavar="FILE",
-        help="Output path for backmarked SPEF (default: <spef1>_backmarked.spef)",
+        help="Output path for backmarked or shuffled SPEF (default: <spef1>_backmarked.spef or <spef1>_shuffled.spef)",
     )
 
     args = parser.parse_args()
@@ -1868,6 +2008,19 @@ def main() -> None:
             base, ext = os.path.splitext(args.spef1)
             out = f"{base}_backmarked{ext}"
         backmark_spef(args.spef1, args.net_cap_data, args.net_res_data, out)
+        return
+
+    # ------------------------------------------------------------------
+    # Shuffle mode
+    # ------------------------------------------------------------------
+    if args.shuffle:
+        if not args.spef1:
+            parser.error("--shuffle requires spef1 (the SPEF file to shuffle).")
+        out = args.output
+        if not out:
+            base, ext = os.path.splitext(args.spef1)
+            out = f"{base}_shuffled{ext}"
+        shuffle_net_mapping(args.spef1, out, seed=args.seed)
         return
 
     # ------------------------------------------------------------------
