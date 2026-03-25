@@ -43,6 +43,7 @@ from typing import Dict, List, Tuple, Optional, Iterable, Set
 import heapq
 
 import re
+from collections import deque
 from heapq import nlargest
 import multiprocessing
 from functools import partial
@@ -765,6 +766,131 @@ def _parse_backmark_res_data(path: str) -> Dict[str, Dict[str, float]]:
     return res_map
 
 
+def _resolve_spef_token(tok: str, name_map: Dict[str, str]) -> str:
+    """Resolve a raw SPEF *RES/*CAP node token to its graph node name.
+
+    Mirrors the inline ``_resolve`` closure used by SpefFile.parse so that
+    backmark_spef can look up the per-segment scale factor by the same key
+    that the resistance graph was built with.
+
+    Args:
+        tok:      A raw SPEF node token such as ``*3``, ``*3:1``, or a bare
+                  node name.  Quoted strings have their surrounding quotes
+                  stripped.
+        name_map: The ``*NAME_MAP`` dict from :class:`SpefFile`
+                  (``{*id: resolved_name}``).
+
+    Returns:
+        The resolved node name as it appears in :attr:`NetRC.res_graph`.
+    """
+    if not tok:
+        return tok
+    if tok.startswith('"') and tok.endswith('"') and len(tok) >= 2:
+        return tok[1:-1]
+    if ':' in tok:
+        idx = tok.index(':')
+        base = tok[:idx]
+        pin = tok[idx + 1:]
+        if base and base[0] == '*' and base in name_map:
+            r = name_map[base]
+            result = f"{r}:{pin}" if pin else r
+        else:
+            result = base
+    elif tok.startswith('*'):
+        result = name_map.get(tok, tok)
+    else:
+        result = tok
+    if '\\' in result:
+        result = result.replace('\\[', '[').replace('\\]', ']')
+    return result
+
+
+def _compute_res_segment_scales(
+    net: 'NetRC',
+    sink_ratios: Dict[str, float],
+    avg_ratio: float,
+) -> Dict[Tuple[str, str], float]:
+    """Compute per-segment RES scale factors for backmarking.
+
+    For a net with multiple sinks the resistance tree is analysed so that:
+
+    * **Shared segments** — edges whose subtree (below the edge, away from the
+      driver) contains paths to two or more sinks — are scaled by *avg_ratio*,
+      the mean of all per-sink (new_R / old_R) ratios.
+    * **Exclusive segments** — edges whose subtree reaches exactly one sink —
+      are scaled by that particular sink's ratio.
+
+    For a single-sink net every segment is exclusive, and its ratio equals
+    *avg_ratio*, so the result is identical to the old uniform-scale logic.
+
+    Segments not reachable from the driver, or not leading to any sink with a
+    known ratio, are scaled by *avg_ratio*.
+
+    Returns a dict ``{(node_a, node_b): scale}`` with **both** orderings of
+    each edge stored so that the caller can look up either (n1, n2) or (n2, n1)
+    without extra sorting.
+    """
+    if not net.driver or not sink_ratios:
+        return {}
+
+    driver_node = net._find_best_node_name(net.driver) or net.driver
+    if driver_node not in net.res_graph:
+        return {}
+
+    # Map sink pin names → graph node names (only those with known ratios)
+    sink_node_to_ratio: Dict[str, float] = {}
+    for sink_pin, ratio in sink_ratios.items():
+        sink_node = net._find_best_node_name(sink_pin) or sink_pin
+        if sink_node in net.res_graph:
+            sink_node_to_ratio[sink_node] = ratio
+
+    if not sink_node_to_ratio:
+        return {}
+
+    # BFS from driver to build the spanning tree (children map + BFS order)
+    children: Dict[str, List[str]] = {}
+    parent: Dict[str, Optional[str]] = {driver_node: None}
+    order: List[str] = [driver_node]
+    queue: deque = deque([driver_node])
+    while queue:
+        node = queue.popleft()
+        children[node] = []
+        for neigh, _ in net.res_graph.get(node, []):
+            if neigh not in parent:
+                parent[neigh] = node
+                children[node].append(neigh)
+                order.append(neigh)
+                queue.append(neigh)
+
+    # Post-order traversal: compute the set of known sinks in each subtree
+    sinks_below: Dict[str, Set[str]] = {}
+    for node in reversed(order):
+        s: Set[str] = set()
+        if node in sink_node_to_ratio:
+            s.add(node)
+        for child in children.get(node, []):
+            s |= sinks_below.get(child, set())
+        sinks_below[node] = s
+
+    # Assign a scale factor to every tree edge based on subtree sink membership
+    edge_scales: Dict[Tuple[str, str], float] = {}
+    for child_node, par_node in parent.items():
+        if par_node is None:
+            continue  # driver root has no incoming edge
+        sinks = sinks_below.get(child_node, set())
+        if len(sinks) == 1:
+            sink_node = next(iter(sinks))
+            scale = sink_node_to_ratio[sink_node]
+        else:
+            # 0 or ≥2 sinks below this edge → use average ratio
+            scale = avg_ratio
+        # Store both orderings so lookup works regardless of SPEF token order
+        edge_scales[(par_node, child_node)] = scale
+        edge_scales[(child_node, par_node)] = scale
+
+    return edge_scales
+
+
 def _fmt_float(val: float) -> str:
     """Format a float for SPEF output, keeping reasonable precision."""
     if val == 0.0:
@@ -789,9 +915,15 @@ def backmark_spef(
 
     For resistance:
       - The data file gives new driver-to-sink R per sink.
-      - All *RES segment values in the net are scaled uniformly by the
-        average ratio (new_R / old_R) across all sinks that appear in
-        both the data file and the parsed net.
+      - The net's resistance tree is analysed to identify *shared* segments
+        (edges whose subtree contains paths to ≥2 sinks) and *exclusive*
+        segments (edges leading to exactly one sink).
+      - Shared segments are scaled by the average ratio across all sinks
+        (avg of new_R / old_R).
+      - Exclusive segments are scaled by the ratio of the single sink they
+        serve (new_R / old_R for that sink).
+      - For single-sink nets all segments are exclusive, so the result is
+        identical to a uniform scale by the one available ratio.
 
     The SPEF is first parsed to gather per-net information, then rewritten
     line-by-line to preserve formatting.
@@ -824,7 +956,8 @@ def backmark_spef(
             new_total_caps[net_name] = new_cap
             cap_ratio[net_name] = (new_cap / old_cap) if old_cap != 0.0 else 1.0
 
-    res_ratio: Dict[str, float] = {}           # net_name -> uniform R scale
+    res_segment_scales: Dict[str, Dict[Tuple[str, str], float]] = {}   # net_name -> edge -> scale
+    res_avg_ratio: Dict[str, float] = {}                                # net_name -> fallback avg scale
 
     if res_data_path:
         raw_res = _parse_backmark_res_data(res_data_path)
@@ -839,17 +972,20 @@ def backmark_spef(
             old_dr = net.driver_sink_resistances()
             if not old_dr:
                 continue
-            # Compute per-sink ratios for sinks present in both
-            ratios: List[float] = []
+            # Compute per-sink ratios for sinks present in both data file and SPEF
+            sink_ratios: Dict[str, float] = {}
             for sink, new_r in sink_map.items():
                 old_r = old_dr.get(sink)
                 if old_r is not None and old_r > 0.0:
-                    ratios.append(new_r / old_r)
-            if ratios:
-                res_ratio[net_name] = sum(ratios) / len(ratios)
+                    sink_ratios[sink] = new_r / old_r
+            if not sink_ratios:
+                continue
+            avg = sum(sink_ratios.values()) / len(sink_ratios)
+            res_avg_ratio[net_name] = avg
+            res_segment_scales[net_name] = _compute_res_segment_scales(net, sink_ratios, avg)
 
     print(f"[backmark] Nets with cap update : {len(cap_ratio)}")
-    print(f"[backmark] Nets with res update : {len(res_ratio)}")
+    print(f"[backmark] Nets with res update : {len(res_avg_ratio)}")
 
     # ---- Step 3: rewrite SPEF line-by-line ----
     # We also need the net_id -> net_name map to figure out which net_name
@@ -864,7 +1000,8 @@ def backmark_spef(
     current_net_id: Optional[str]   = None
     section = SEC_NONE
     c_scale = 1.0
-    r_scale = 1.0
+    r_avg_scale = 1.0
+    r_edge_scales: Dict[Tuple[str, str], float] = {}
     lines_written = 0
 
     with open(spef_path, 'r', encoding='utf-8', errors='ignore') as fin, \
@@ -882,7 +1019,8 @@ def backmark_spef(
                     current_net_id = net_id_tok
                     section = SEC_NONE
                     c_scale = cap_ratio.get(net_name_resolved, 1.0)
-                    r_scale = res_ratio.get(net_name_resolved, 1.0)
+                    r_avg_scale = res_avg_ratio.get(net_name_resolved, 1.0)
+                    r_edge_scales = res_segment_scales.get(net_name_resolved, {})
 
                     if net_name_resolved in new_total_caps:
                         new_tc = new_total_caps[net_name_resolved]
@@ -917,7 +1055,8 @@ def backmark_spef(
                     current_net_id = None
                     section = SEC_NONE
                     c_scale = 1.0
-                    r_scale = 1.0
+                    r_avg_scale = 1.0
+                    r_edge_scales = {}
                     fout.write(line)
                     lines_written += 1
                     continue
@@ -947,19 +1086,30 @@ def backmark_spef(
                             pass  # Not a cap data line, write as-is
 
                 # --- *RES segment: scale res values ---
-                if section == SEC_RES and r_scale != 1.0:
+                if section == SEC_RES and (r_edge_scales or r_avg_scale != 1.0):
                     parts = raw.split()
                     if len(parts) >= 4:
                         try:
                             int(parts[0])  # index
                             # Format: idx node1 node2 res_val [trailing space]
                             old_val = float(parts[3])
-                            new_val = old_val * r_scale
-                            lead = line[:len(line) - len(line.lstrip())]
-                            parts[3] = _fmt_float(new_val)
-                            fout.write(lead + ' '.join(parts) + ' \n')
-                            lines_written += 1
-                            continue
+                            # Resolve node tokens to graph names for edge lookup
+                            n1 = _resolve_spef_token(parts[1], sf.name_map)
+                            n2 = _resolve_spef_token(parts[2], sf.name_map)
+                            seg_scale = r_edge_scales.get((n1, n2))
+                            if seg_scale is None:
+                                seg_scale = r_edge_scales.get((n2, n1))
+                            if seg_scale is None:
+                                seg_scale = r_avg_scale
+                            if seg_scale == 1.0:
+                                pass  # write unchanged below
+                            else:
+                                new_val = old_val * seg_scale
+                                lead = line[:len(line) - len(line.lstrip())]
+                                parts[3] = _fmt_float(new_val)
+                                fout.write(lead + ' '.join(parts) + ' \n')
+                                lines_written += 1
+                                continue
                         except ValueError:
                             pass
 

@@ -1791,3 +1791,108 @@ class TestBackmarkSpef:
             sf = self._parse(out)
             # *D_NET line updated to new total cap
             assert sf.nets["net_Z"].total_cap == pytest.approx(2.0)
+
+    # ------------------------------------------------------------------ multi-sink per-segment scaling
+
+    def test_multi_sink_res_per_segment_scaling(self):
+        """Shared *RES segments scale by avg ratio; exclusive segments by their sink's ratio.
+
+        Net topology (all R in Ohm):
+          drv:Z --[10]-- mid --[6]-- snk_a:A
+                               |
+                              [4]-- snk_b:B
+
+        Old driver-to-sink R:
+          snk_a:A = 10 + 6 = 16
+          snk_b:B = 10 + 4 = 14
+
+        Data file targets:
+          snk_a:A = 32  → ratio_a = 32/16 = 2.0
+          snk_b:B = 14  → ratio_b = 14/14 = 1.0
+          avg_ratio = (2.0 + 1.0) / 2 = 1.5
+
+        Expected segment scales:
+          drv:Z - mid    (shared, leads to both sinks) → 1.5
+          mid - snk_a:A  (exclusive to snk_a)          → 2.0
+          mid - snk_b:B  (exclusive to snk_b)          → 1.0
+
+        Expected new segment R values:
+          drv:Z - mid    = 10 * 1.5 = 15
+          mid - snk_a:A  =  6 * 2.0 = 12
+          mid - snk_b:B  =  4 * 1.0 =  4
+        """
+        spef_content = textwrap.dedent("""\
+            *SPEF "IEEE 1481-1999"
+            *DESIGN "ms"
+            *DATE "2026:01:01:00:00:00"
+            *VENDOR "t"
+            *PROGRAM "t"
+            *VERSION "1.0"
+            *DIVIDER /
+            *DELIMITER :
+            *BUS_DELIMITER [ ]
+            *T_UNIT 1 NS
+            *C_UNIT 1 PF
+            *R_UNIT 1 OHM
+            *L_UNIT 1 HENRY
+
+            *NAME_MAP
+            *1 net_M
+            *2 drv:Z
+            *3 mid
+            *4 snk_a:A
+            *5 snk_b:B
+
+            *D_NET *1 3.0
+            *CONN
+            *I *2 O *C 0.0 0.0
+            *I *4 I *C 0.0 0.0
+            *I *5 I *C 0.0 0.0
+            *CAP
+            1 *2 1.0
+            2 *4 1.0
+            3 *5 1.0
+            *RES
+            1 *2 *3 10.0
+            2 *3 *4 6.0
+            3 *3 *5 4.0
+            *END
+        """)
+        with tempfile.TemporaryDirectory() as td:
+            spef = self._write(td, "spef.spef", spef_content)
+            res_data = self._write(
+                td, "res.data",
+                "net_M drv:Z snk_a:A 16.0 32.0\n"
+                "net_M drv:Z snk_b:B 14.0 14.0\n",
+            )
+            out = os.path.join(td, "out.spef")
+
+            backmark_spef(spef, None, res_data, out)
+
+            sf = self._parse(out)
+            net = sf.nets["net_M"]
+
+            # Check raw segment resistances in the rewritten graph
+            # drv:Z - mid should be scaled by avg_ratio = 1.5 → 15.0
+            # mid - snk_a:A should be scaled by ratio_a = 2.0  → 12.0
+            # mid - snk_b:B should be scaled by ratio_b = 1.0  →  4.0
+            def _edge_r(g: dict, a: str, b: str) -> float:
+                for neigh, r in g.get(a, []):
+                    if neigh == b:
+                        return r
+                return float('nan')
+
+            assert _edge_r(net.res_graph, "drv:Z", "mid") == pytest.approx(15.0), (
+                "Shared segment not scaled by avg_ratio"
+            )
+            assert _edge_r(net.res_graph, "mid", "snk_a:A") == pytest.approx(12.0), (
+                "Exclusive segment for snk_a not scaled by ratio_a"
+            )
+            assert _edge_r(net.res_graph, "mid", "snk_b:B") == pytest.approx(4.0), (
+                "Exclusive segment for snk_b not scaled by ratio_b"
+            )
+
+            # Also verify driver-sink R values
+            dr = net.driver_sink_resistances()
+            assert dr["snk_a:A"] == pytest.approx(15.0 + 12.0)   # 27.0
+            assert dr["snk_b:B"] == pytest.approx(15.0 + 4.0)    # 19.0
