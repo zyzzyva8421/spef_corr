@@ -3,7 +3,7 @@ Regression tests for spef_rc_correlation.py
 
 Coverage:
   - pearson_corr: perfect correlation, anti-correlation, constant series, mismatched lengths
-  - NetRC._shortest_resistance: direct edge, multi-hop, unreachable node
+  - NetRC._dijkstra_all: direct edge, multi-hop, unreachable node
   - NetRC.driver_sink_resistances: result caching, prefix-match fallback
   - SpefFile.parse: NAME_MAP, *D_NET/*CONN/*RES/*END, KOHM unit scaling,
                     quoted names, comment stripping, unknown-direction lines
@@ -163,23 +163,28 @@ class TestNetRC:
     def test_direct_edge(self):
         net = self._simple_net()
         # drv → mid is a single hop of 10 Ω
-        assert net._shortest_resistance("drv", "mid") == pytest.approx(10.0)
+        dist = net._dijkstra_all("drv")
+        assert dist["mid"] == pytest.approx(10.0)
 
     def test_multi_hop(self):
         net = self._simple_net()
-        assert net._shortest_resistance("drv", "sink") == pytest.approx(15.0)
+        dist = net._dijkstra_all("drv")
+        assert dist["sink"] == pytest.approx(15.0)
 
     def test_same_node_is_zero(self):
         net = self._simple_net()
-        assert net._shortest_resistance("drv", "drv") == pytest.approx(0.0)
+        dist = net._dijkstra_all("drv")
+        assert dist["drv"] == pytest.approx(0.0)
 
     def test_unreachable_returns_none(self):
         net = self._simple_net()
-        assert net._shortest_resistance("drv", "ghost") is None
+        dist = net._dijkstra_all("drv")
+        assert "ghost" not in dist
 
     def test_missing_src_returns_none(self):
         net = self._simple_net()
-        assert net._shortest_resistance("ghost", "sink") is None
+        dist = net._dijkstra_all("ghost")
+        assert dist == {}
 
     def test_driver_sink_resistances(self):
         net = self._simple_net()

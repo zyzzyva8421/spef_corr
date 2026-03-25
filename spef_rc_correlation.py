@@ -114,36 +114,33 @@ class NetRC:
             self._node_prefix_map = mp
         return self._node_prefix_map.get(pin)
 
-    def _shortest_resistance(self, src: str, dst: str) -> Optional[float]:
-        """Dijkstra shortest path on resistance graph between src and dst.
+    def _dijkstra_all(self, src: str) -> Dict[str, float]:
+        """Dijkstra from src to ALL reachable nodes. Returns {node: distance}.
 
-        Returns total resistance, or None if unreachable or src/dst missing.
+        Runs a single pass over the graph; callers pick out the sinks they need.
         """
-        if src not in self.res_graph or dst not in self.res_graph:
-            return None
+        if src not in self.res_graph:
+            return {}
 
-        if src == dst:
-            return 0.0
-
-        # print(f"Computing shortest resistance from {src} to {dst} in net {self.name}...")
-        # Standard Dijkstra with a min-heap
+        graph = self.res_graph
+        inf = math.inf
         dist: Dict[str, float] = {src: 0.0}
         visited: Set[str] = set()
         heap: List[Tuple[float, str]] = [(0.0, src)]
+        heappop = heapq.heappop
+        heappush = heapq.heappush
 
         while heap:
-            d, node = heapq.heappop(heap)
+            d, node = heappop(heap)
             if node in visited:
                 continue
             visited.add(node)
-            if node == dst:
-                return d
-            for neigh, r in self.res_graph.get(node, []):
+            for neigh, r in graph.get(node, []):
                 nd = d + r
-                if nd < dist.get(neigh, math.inf):
+                if nd < dist.get(neigh, inf):
                     dist[neigh] = nd
-                    heapq.heappush(heap, (nd, neigh))
-        return None
+                    heappush(heap, (nd, neigh))
+        return dist
 
     def driver_sink_resistances(self) -> Dict[str, float]:
         """Return map: sink_pin -> R(driver->sink).
@@ -168,13 +165,15 @@ class NetRC:
                 self._driver_sink_res_cache = cpp_result
                 return cpp_result
 
-        # Fall back to Python implementation
+        # Single Dijkstra from driver → distances to all reachable nodes
         driver_node = self._find_best_node_name(self.driver) or self.driver
+        all_dist = self._dijkstra_all(driver_node)
+
         for sink in self.sinks:
             sink_node = self._find_best_node_name(sink) or sink
-            r = self._shortest_resistance(driver_node, sink_node)
-            if r is not None:
-                result[sink] = r
+            d = all_dist.get(sink_node)
+            if d is not None:
+                result[sink] = d
         self._driver_sink_res_cache = result
         return result
 
@@ -1536,6 +1535,11 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
             self.points_cap: List[Dict[str, float]] = []  # per-net data after filtering
             self.points_res: List[Dict[str, float]] = []  # per-pin-pair data after filtering
+            # Cached numpy arrays for fast hover (populated by _cache_plot_arrays)
+            self._xs_c = None
+            self._ys_c = None
+            self._xs_r = None
+            self._ys_r = None
             self._auto_run_requested = auto_run
 
             self._build_ui()
@@ -1866,7 +1870,7 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                     continue
                 if xr is not None and r.r1 > xr:
                     continue
-                points_res.append({"net": r.net, "r_ref": r.r1, "r_fit": r.r2})
+                points_res.append({"net": r.net, "driver": r.driver or "", "load": r.load or "", "r_ref": r.r1, "r_fit": r.r2})
 
             self.points_cap = points_cap
             self.points_res = points_res
@@ -2034,6 +2038,8 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                 p = {
                     "net": net,
                     "fanout": float(fanout),
+                    "driver": pin_pair.driver or "",
+                    "load": pin_pair.load or "",
                     "r_ref": pin_pair.r1,
                     "r_fit": pin_pair.r2,
                 }
@@ -2177,19 +2183,57 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
             self.fig.tight_layout()
             self.canvas.draw()
 
+            # Cache numpy arrays for fast hover lookup
+            self._cache_plot_arrays()
+
         # ------------------------------ hover logic -----------------------------
 
         def _init_annot(self, ax):
             annot = ax.annotate(
                 "",
                 xy=(0, 0),
-                xytext=(10, 10),
+                xytext=(15, 15),
                 textcoords="offset points",
-                bbox=dict(boxstyle="round", fc="w"),
-                arrowprops=dict(arrowstyle="->"),
+                bbox=dict(boxstyle="round,pad=0.4", fc="#ffffcc", ec="gray",
+                          alpha=0.95, linewidth=0.8),
+                arrowprops=dict(arrowstyle="->", color="gray"),
+                fontsize=8,
+                fontfamily="monospace",
             )
             annot.set_visible(False)
             return annot
+
+        def _cache_plot_arrays(self) -> None:
+            """Pre-compute numpy arrays for fast hover lookup."""
+            import numpy as np
+            # Capacitance
+            if self.points_cap:
+                self._xs_c = np.array([p["c_ref"] for p in self.points_cap])
+                self._ys_c = np.array([p["c_fit"] for p in self.points_cap])
+            else:
+                self._xs_c = np.array([])
+                self._ys_c = np.array([])
+            # Resistance
+            if self.points_res:
+                self._xs_r = np.array([p["r_ref"] for p in self.points_res])
+                self._ys_r = np.array([p["r_fit"] for p in self.points_res])
+            else:
+                self._xs_r = np.array([])
+                self._ys_r = np.array([])
+
+        @staticmethod
+        def _fmt_hover(v: float) -> str:
+            """Compact float for tooltip."""
+            av = abs(v)
+            if av == 0:
+                return "0"
+            if av < 1e-3:
+                return f"{v:.4e}"
+            if av < 1:
+                return f"{v:.6f}"
+            if av < 1000:
+                return f"{v:.4f}"
+            return f"{v:.4g}"
 
         def _on_motion(self, event) -> None:
             if not self.points_cap and not self.points_res:
@@ -2197,7 +2241,6 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
             ax = event.inaxes
             if ax not in (self.ax_c, self.ax_r):
-                # hide annotations when leaving axes
                 changed = False
                 if self.annot_c.get_visible():
                     self.annot_c.set_visible(False)
@@ -2212,54 +2255,71 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
             if event.xdata is None or event.ydata is None:
                 return
 
+            # Pick arrays based on which axes we're in
             if ax is self.ax_c:
-                xs = [p["c_ref"] for p in self.points_cap]
-                ys = [p["c_fit"] for p in self.points_cap]
+                xs_arr = self._xs_c
+                ys_arr = self._ys_c
+                points = self.points_cap
                 annot = self.annot_c
+                is_cap = True
             else:
-                xs = [p["r_ref"] for p in self.points_res]
-                ys = [p["r_fit"] for p in self.points_res]
+                xs_arr = self._xs_r
+                ys_arr = self._ys_r
+                points = self.points_res
                 annot = self.annot_r
+                is_cap = False
 
-            x0, y0 = float(event.xdata), float(event.ydata)
-            if not xs or not ys:
+            if xs_arr is None or len(xs_arr) == 0:
                 return
 
-            x_min, x_max = min(xs), max(xs)
-            y_min, y_max = min(ys), max(ys)
-            x_span = x_max - x_min or 1.0
-            y_span = y_max - y_min or 1.0
+            # Convert data coords to pixel coords for distance calculation
+            # This gives consistent hover feel regardless of zoom/scale
+            import numpy as np
+            transform = ax.transData.transform
+            mouse_px = transform([[event.xdata, event.ydata]])[0]
 
-            best_i = None
-            best_d2 = None
-            for i, (x, y) in enumerate(zip(xs, ys)):
-                dx = (x - x0) / x_span
-                dy = (y - y0) / y_span
-                d2 = dx * dx + dy * dy
-                if best_d2 is None or d2 < best_d2:
-                    best_d2 = d2
-                    best_i = i
+            # Vectorised pixel distance
+            data_pts = np.column_stack((xs_arr, ys_arr))
+            px_pts = transform(data_pts)
+            dx = px_pts[:, 0] - mouse_px[0]
+            dy = px_pts[:, 1] - mouse_px[1]
+            d2 = dx * dx + dy * dy
+            best_i = int(np.argmin(d2))
 
-            if best_i is None:
-                return
-
-            # Threshold in normalized space; tweak if needed
-            if best_d2 is not None and best_d2 < 0.005:
-                if ax is self.ax_c:
-                    p = self.points_cap[best_i]
+            # 20 pixel radius threshold
+            if d2[best_i] < 400:  # 20^2
+                p = points[best_i]
+                fmt = self._fmt_hover
+                if is_cap:
+                    ref_v = p["c_ref"]
+                    fit_v = p["c_fit"]
+                    delta = fit_v - ref_v
+                    ratio = fit_v / ref_v if ref_v != 0 else float('inf')
                     text = (
                         f"net: {p['net']}\n"
-                        f"C_ref={p['c_ref']:.3g}, C_fit={p['c_fit']:.3g}"
+                        f"C_ref : {fmt(ref_v)}\n"
+                        f"C_fit : {fmt(fit_v)}\n"
+                        f"delta : {fmt(delta)}\n"
+                        f"ratio : {ratio:.4f}"
                     )
+                    if "fanout" in p:
+                        text += f"\nfanout: {int(p['fanout'])}"
                 else:
-                    p = self.points_res[best_i]
+                    ref_v = p["r_ref"]
+                    fit_v = p["r_fit"]
+                    delta = fit_v - ref_v
+                    ratio = fit_v / ref_v if ref_v != 0 else float('inf')
                     text = (
-                        f"net: {p['net']}\n"
-                        f"R_ref={p['r_ref']:.3g}, R_fit={p['r_fit']:.3g}"
+                        f"net   : {p['net']}\n"
+                        f"driver: {p.get('driver', '')}\n"
+                        f"load  : {p.get('load', '')}\n"
+                        f"R_ref : {fmt(ref_v)}\n"
+                        f"R_fit : {fmt(fit_v)}\n"
+                        f"delta : {fmt(delta)}\n"
+                        f"ratio : {ratio:.4f}"
                     )
-                annot.xy = (xs[best_i], ys[best_i])
+                annot.xy = (xs_arr[best_i], ys_arr[best_i])
                 annot.set_text(text)
-                annot.get_bbox_patch().set_facecolor("#ffffcc")
                 annot.set_visible(True)
                 self.canvas.draw_idle()
             else:
