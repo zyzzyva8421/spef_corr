@@ -924,7 +924,12 @@ def backmark_spef(
 
                 # --- *CAP segment: scale cap values ---
                 if section == SEC_CAP and c_scale != 1.0:
-                    parts = raw.split()
+                    # Strip inline comment before parsing so that parts[-1] is
+                    # the numeric cap value, not a word from the comment.
+                    ci = raw.find('//')
+                    code = raw[:ci].rstrip() if ci >= 0 else raw
+                    comment_suffix = (' ' + raw[ci:]) if ci >= 0 else ''
+                    parts = code.split()
                     if len(parts) >= 3:
                         try:
                             int(parts[0])  # index
@@ -935,7 +940,7 @@ def backmark_spef(
                             # Reconstruct line preserving leading whitespace
                             lead = line[:len(line) - len(line.lstrip())]
                             parts[-1] = _fmt_float(new_val)
-                            fout.write(lead + ' '.join(parts) + '\n')
+                            fout.write(lead + ' '.join(parts) + comment_suffix + '\n')
                             lines_written += 1
                             continue
                         except ValueError:
