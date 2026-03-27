@@ -643,7 +643,7 @@ def process_net_batch(net_names_batch):
     
     return results
 
-def compare_spef1(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison]]:
+def compare_spef(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison]]:
     common_nets = sorted(set(s1.nets.keys()) & set(s2.nets.keys()))
     print("common_nets are sorted")
     cap_rows: List[CapComparison] = []
@@ -675,7 +675,7 @@ def compare_spef1(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapCompa
 
     return cap_rows, res_rows, top_10_cap, top_10_res
 
-def compare_spef(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison]]:
+def compare_spef1(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison]]:
     common_nets = sorted(set(s1.nets.keys()) & set(s2.nets.keys()))
     print("common_nets are sorted")
     cap_rows: List[CapComparison] = []
