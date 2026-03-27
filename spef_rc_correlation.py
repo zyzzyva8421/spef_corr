@@ -189,6 +189,7 @@ class SpefFile:
         self.c_unit = 'PF'
         self.r_unit = 'OHM'
         self.l_unit = 'HENRY'
+        self._cpp_spef = None
 
     # -------------------------- parsing helpers --------------------------
     @staticmethod
@@ -251,6 +252,7 @@ class SpefFile:
     def _parse_cpp(self) -> None:
         """Parse using C++ extension."""
         cpp_spef = spef_core.parse_spef(self.path)
+        self._cpp_spef = cpp_spef
         self.name_map = dict(cpp_spef.name_map)
         nmap = self.name_map
         self.nets = {}
@@ -289,6 +291,7 @@ class SpefFile:
         print(f"[{self.path}] parsed {len(self.nets)} nets... (C++)")
 
     def _parse_python(self) -> None:
+        self._cpp_spef = None
         # ---- bind frequently accessed attributes to locals ----
         # Python attribute lookup (self.x) is slower than reading a local variable.
         name_map     = self.name_map
@@ -643,7 +646,113 @@ def process_net_batch(net_names_batch):
     
     return results
 
-def compare_spef(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison]]:
+def _compare_spef_cpp_batch(
+    s1: SpefFile,
+    s2: SpefFile,
+    r_agg: str,
+) -> Tuple[List[CapComparison], List[ResComparison], List[CapComparison], List[ResComparison]]:
+    """Use C++ batch comparison to avoid per-row Python callback overhead."""
+    # Use Python-side net dict for metadata access (much cheaper than pybind map access).
+    common_nets = sorted(set(s1.nets.keys()) & set(s2.nets.keys()))
+    cap_rows: List[CapComparison] = []
+    res_rows: List[ResComparison] = []
+
+    for net_name in common_nets:
+        n1 = s1.nets[net_name]
+        n2 = s2.nets[net_name]
+        cap_rows.append(CapComparison(net=net_name, c1=n1.total_cap, c2=n2.total_cap))
+
+    n_threads = max(1, multiprocessing.cpu_count())
+    res1 = spef_core.compute_batch_driver_sink_resistances(common_nets, s1._cpp_spef, n_threads)
+    res2 = spef_core.compute_batch_driver_sink_resistances(common_nets, s2._cpp_spef, n_threads)
+
+    net_sink_r1: Dict[str, Dict[str, float]] = {}
+    net_sink_r2: Dict[str, Dict[str, float]] = {}
+    for row in res1:
+        net_sink_r1.setdefault(row.net_name, {})[row.sink_pin] = row.resistance
+    for row in res2:
+        net_sink_r2.setdefault(row.net_name, {})[row.sink_pin] = row.resistance
+
+    for net_name in common_nets:
+        m1 = net_sink_r1.get(net_name)
+        m2 = net_sink_r2.get(net_name)
+        if not m1 or not m2:
+            continue
+        n1 = s1.nets[net_name]
+        common_sinks = sorted(set(m1.keys()) & set(m2.keys()))
+        for sink in common_sinks:
+            res_rows.append(
+                ResComparison(
+                    net=net_name,
+                    driver=n1.driver,
+                    load=sink,
+                    r1=m1[sink],
+                    r2=m2[sink],
+                )
+            )
+
+    cap_rows_with_deviation = [(abs(row.c1 - row.c2), row) for row in cap_rows]
+    res_rows_with_deviation = [(abs(row.r1 - row.r2), row) for row in res_rows]
+
+    top_10_cap = [row for _, row in nlargest(10, cap_rows_with_deviation, key=lambda x: x[0])]
+    top_10_res = [row for _, row in nlargest(10, res_rows_with_deviation, key=lambda x: x[0])]
+    return cap_rows, res_rows, top_10_cap, top_10_res
+
+
+def _compare_spef_cpp_streaming(
+    s1: SpefFile,
+    s2: SpefFile,
+    r_agg: str,
+) -> Tuple[List[CapComparison], List[ResComparison], List[CapComparison], List[ResComparison]]:
+    """Use C++ streaming comparison when C++ backend is available."""
+    cap_rows: List[CapComparison] = []
+    res_rows: List[ResComparison] = []
+
+    def _on_cap(cap_data) -> None:
+        cap_rows.append(CapComparison(net=cap_data.net_name, c1=cap_data.c1, c2=cap_data.c2))
+
+    def _on_res(res_data) -> None:
+        res_rows.append(
+            ResComparison(
+                net=res_data.net_name,
+                driver=res_data.driver,
+                load=res_data.sink,
+                r1=res_data.r1,
+                r2=res_data.r2,
+            )
+        )
+
+    n_threads = max(1, multiprocessing.cpu_count())
+    spef_core.compare_spef_streaming(s1._cpp_spef, s2._cpp_spef, _on_cap, _on_res, n_threads)
+
+    cap_rows_with_deviation = [(abs(row.c1 - row.c2), row) for row in cap_rows]
+    res_rows_with_deviation = [(abs(row.r1 - row.r2), row) for row in res_rows]
+
+    top_10_cap = [row for _, row in nlargest(10, cap_rows_with_deviation, key=lambda x: x[0])]
+    top_10_res = [row for _, row in nlargest(10, res_rows_with_deviation, key=lambda x: x[0])]
+    return cap_rows, res_rows, top_10_cap, top_10_res
+
+
+def compare_spef(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison], List[CapComparison], List[ResComparison]]:
+    # Keep batch mode as optional experiment because it can be slower on some datasets.
+    if (
+        HAS_CPP
+        and os.environ.get("SPEF_USE_CPP_BATCH") == "1"
+        and hasattr(spef_core, "compute_batch_driver_sink_resistances")
+        and s1._cpp_spef is not None
+        and s2._cpp_spef is not None
+    ):
+        print("[compare] HAS_CPP=True, using C++ batch comparison (opt-in)")
+        return _compare_spef_cpp_batch(s1, s2, r_agg)
+
+    if (
+        HAS_CPP
+        and hasattr(spef_core, "compare_spef_streaming")
+        and s1._cpp_spef is not None
+        and s2._cpp_spef is not None
+    ):
+        print("[compare] HAS_CPP=True, using C++ streaming comparison")
+        return _compare_spef_cpp_streaming(s1, s2, r_agg)
     common_nets = sorted(set(s1.nets.keys()) & set(s2.nets.keys()))
     print("common_nets are sorted")
     cap_rows: List[CapComparison] = []

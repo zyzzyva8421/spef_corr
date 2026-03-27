@@ -106,6 +106,256 @@ std::unordered_map<std::string, double> compute_driver_sink_resistances(
     return net.driver_sink_res_cache;
 }
 
+// ============== RECOMMENDATION 3: Pre-computed Pin Prefix Maps ==============
+void build_pin_to_node_map(NetData& net) {
+    if (net.pin_map_built) return;
+    
+    net.pin_to_node_cache.clear();
+    
+    // Helper: find best matching node for a pin
+    auto find_best_match = [&](const std::string& pin) -> std::string {
+        if (pin.empty()) return pin;
+        
+        // Try exact match first
+        if (net.res_graph.find(pin) != net.res_graph.end()) {
+            return pin;
+        }
+        
+        // Try prefix match: split by ':' and match the base
+        size_t colon_pos = pin.find(':');
+        std::string base = (colon_pos != std::string::npos) ? 
+            pin.substr(0, colon_pos) : pin;
+        
+        for (const auto& [node, _] : net.res_graph) {
+            size_t node_colon = node.find(':');
+            std::string node_base = (node_colon != std::string::npos) ?
+                node.substr(0, node_colon) : node;
+            if (node_base == base) {
+                return node;
+            }
+        }
+        return pin;  // Return original if no match
+    };
+    
+    // Pre-compute for driver
+    net.pin_to_node_cache[net.driver] = find_best_match(net.driver);
+    
+    // Pre-compute for all sinks
+    for (const auto& sink : net.sinks) {
+        net.pin_to_node_cache[sink] = find_best_match(sink);
+    }
+    
+    net.pin_map_built = true;
+}
+
+// ============== RECOMMENDATION 1: Batch Resistance Computation ==============
+std::vector<ResistanceResult> compute_batch_driver_sink_resistances(
+    const std::vector<std::string>& net_names,
+    ParsedSpef& spef,
+    int num_threads
+) {
+    if (num_threads <= 0) {
+        num_threads = std::thread::hardware_concurrency();
+        if (num_threads <= 0) num_threads = 4;
+    }
+    
+    std::vector<ResistanceResult> results;
+    std::mutex results_mutex;
+    size_t net_count = net_names.size();
+    
+    // Worker function for each thread
+    auto worker = [&](int thread_id) {
+        std::vector<ResistanceResult> local_results;
+        local_results.reserve(100);  // Pre-allocate
+        
+        // Simple work distribution: each thread processes nets % num_threads == thread_id
+        for (size_t i = thread_id; i < net_count; i += num_threads) {
+            const auto& net_name = net_names[i];
+            auto it = spef.nets.find(net_name);
+            if (it == spef.nets.end()) continue;
+            
+            auto& net = it->second;
+            
+            // Build pin map if not already done
+            if (!net.pin_map_built) {
+                build_pin_to_node_map(net);
+            }
+            
+            // Compute driver-sink resistances for this net
+            auto dists = dijkstra_shortest_paths(net.res_graph, 
+                net.pin_to_node_cache[net.driver]);
+            
+            for (const auto& sink : net.sinks) {
+                std::string sink_node = net.pin_to_node_cache[sink];
+                auto sink_it = dists.find(sink_node);
+                if (sink_it != dists.end()) {
+                    local_results.push_back(ResistanceResult{
+                        net_name,
+                        sink,
+                        sink_it->second
+                    });
+                }
+            }
+        }
+        
+        // Merge local results into global results (thread-safe)
+        {
+            std::lock_guard<std::mutex> lock(results_mutex);
+            results.insert(results.end(), local_results.begin(), local_results.end());
+        }
+    };
+    
+    // Create and join threads
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(worker, i);
+    }
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    return results;
+}
+
+// ============== RECOMMENDATION 2: Vectorized Correlation Computation ==============
+CorrelationResult compute_pearson_correlation(
+    const std::vector<double>& xs,
+    const std::vector<double>& ys
+) {
+    CorrelationResult result{0.0, 0.0, 0.0, 0.0, 0.0, false};
+    
+    size_t n = xs.size();
+    if (n != ys.size() || n < 2) {
+        return result;
+    }
+    
+    // Single pass: compute mean, sum of squares, and covariance
+    double sum_x = 0.0, sum_y = 0.0;
+    double sum_xy = 0.0, sum_x2 = 0.0, sum_y2 = 0.0;
+    
+    // Use pointers for faster access
+    const double* x_ptr = xs.data();
+    const double* y_ptr = ys.data();
+    
+    for (size_t i = 0; i < n; ++i) {
+        double x = x_ptr[i];
+        double y = y_ptr[i];
+        sum_x += x;
+        sum_y += y;
+        sum_xy += x * y;
+        sum_x2 += x * x;
+        sum_y2 += y * y;
+    }
+    
+    double mean_x = sum_x / n;
+    double mean_y = sum_y / n;
+    
+    double cov_xy = (sum_xy - n * mean_x * mean_y);
+    double var_x = (sum_x2 - n * mean_x * mean_x);
+    double var_y = (sum_y2 - n * mean_y * mean_y);
+    
+    result.mean_x = mean_x;
+    result.mean_y = mean_y;
+    result.std_dev_x = std::sqrt(std::max(0.0, var_x / n));
+    result.std_dev_y = std::sqrt(std::max(0.0, var_y / n));
+    
+    // Check for sufficient variance
+    if (result.std_dev_x < 1e-15 || result.std_dev_y < 1e-15) {
+        return result;  // Not enough variance
+    }
+    
+    result.pearson = cov_xy / (std::sqrt(std::max(0.0, var_x)) * std::sqrt(std::max(0.0, var_y)));
+    result.valid = true;
+    
+    return result;
+}
+
+// ============== RECOMMENDATION 4: Streaming Comparison Mode ==============
+void compare_spef_streaming(
+    ParsedSpef& spef1,
+    ParsedSpef& spef2,
+    CapCallback on_cap,
+    ResCallback on_res,
+    int num_threads
+) {
+    if (num_threads <= 0) {
+        num_threads = std::thread::hardware_concurrency();
+        if (num_threads <= 0) num_threads = 4;
+    }
+    
+    // Find common nets
+    std::vector<std::string> common_nets;
+    for (const auto& [name, _] : spef1.nets) {
+        if (spef2.nets.find(name) != spef2.nets.end()) {
+            common_nets.push_back(name);
+        }
+    }
+    
+    std::sort(common_nets.begin(), common_nets.end());
+    
+    // Process in parallel
+    std::mutex callback_mutex;
+    
+    auto worker = [&](int thread_id) {
+        for (size_t i = thread_id; i < common_nets.size(); i += num_threads) {
+            const auto& net_name = common_nets[i];
+            auto& net1 = spef1.nets[net_name];
+            auto& net2 = spef2.nets[net_name];
+            
+            // Capacitance comparison
+            {
+                std::lock_guard<std::mutex> lock(callback_mutex);
+                on_cap(CapComparisonData{net_name, net1.total_cap, net2.total_cap});
+            }
+            
+            // Resistance comparison
+            auto res1 = compute_driver_sink_resistances(net1);
+            auto res2 = compute_driver_sink_resistances(net2);
+            
+            // Find common sinks by extracting keys
+            std::vector<std::string> sinks1_vec, sinks2_vec;
+            for (const auto& [sink, _] : res1) {
+                sinks1_vec.push_back(sink);
+            }
+            for (const auto& [sink, _] : res2) {
+                sinks2_vec.push_back(sink);
+            }
+            
+            std::sort(sinks1_vec.begin(), sinks1_vec.end());
+            std::sort(sinks2_vec.begin(), sinks2_vec.end());
+            
+            std::vector<std::string> common_sinks;
+            std::set_intersection(
+                sinks1_vec.begin(), sinks1_vec.end(),
+                sinks2_vec.begin(), sinks2_vec.end(),
+                std::back_inserter(common_sinks)
+            );
+            
+            for (const auto& sink : common_sinks) {
+                {
+                    std::lock_guard<std::mutex> lock(callback_mutex);
+                    on_res(ResComparisonData{
+                        net_name, net1.driver, sink, res1[sink], res2[sink]
+                    });
+                }
+            }
+        }
+    };
+    
+    // Create and join threads
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(worker, i);
+    }
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+}
+
 // ============== SPEF Parser ==============
 static inline std::string trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
@@ -160,6 +410,34 @@ ParsedSpef parse_spef(const std::string& filepath) {
     
     std::string line;
     size_t line_num = 0;
+
+    // Resolve tokens like *123 or *123:A using NAME_MAP.
+    auto resolve_name_token = [&](const std::string& token) -> std::string {
+        if (token.empty()) return token;
+
+        std::string out = token;
+        if (out[0] == '*') {
+            size_t colon = out.find(':');
+            if (colon != std::string::npos) {
+                std::string base = out.substr(0, colon);
+                std::string suffix = out.substr(colon);  // keep ':' + suffix
+                auto it = spef.name_map.find(base);
+                if (it != spef.name_map.end()) {
+                    out = it->second + suffix;
+                }
+            } else {
+                auto it = spef.name_map.find(out);
+                if (it != spef.name_map.end()) {
+                    out = it->second;
+                }
+            }
+        }
+
+        size_t pos;
+        while ((pos = out.find("\\[")) != std::string::npos) out.replace(pos, 2, "[");
+        while ((pos = out.find("\\]")) != std::string::npos) out.replace(pos, 2, "]");
+        return out;
+    };
     
     while (std::getline(file, line)) {
         line_num++;
@@ -302,27 +580,10 @@ ParsedSpef parse_spef(const std::string& filepath) {
             // RES entry: *idx node1 node2 R_value
             try {
                 int idx = std::stoi(tokens[0]);
-                std::string node1 = tokens[1];
-                std::string node2 = tokens[2];
+                std::string node1 = resolve_name_token(tokens[1]);
+                std::string node2 = resolve_name_token(tokens[2]);
                 double rval = parse_float(tokens[3]);
                 if (r_is_kohm) rval *= 1000.0;
-                
-                // Unescape node names
-                size_t pos;
-                while ((pos = node1.find("\\[")) != std::string::npos) node1.replace(pos, 2, "[");
-                while ((pos = node1.find("\\]")) != std::string::npos) node1.replace(pos, 2, "]");
-                while ((pos = node2.find("\\[")) != std::string::npos) node2.replace(pos, 2, "[");
-                while ((pos = node2.find("\\]")) != std::string::npos) node2.replace(pos, 2, "]");
-                
-                // Resolve via name_map
-                if (node1.size() > 1 && node1[0] == '*') {
-                    auto it = spef.name_map.find(node1);
-                    if (it != spef.name_map.end()) node1 = it->second;
-                }
-                if (node2.size() > 1 && node2[0] == '*') {
-                    auto it = spef.name_map.find(node2);
-                    if (it != spef.name_map.end()) node2 = it->second;
-                }
                 
                 current_net->res_graph[node1].push_back({node2, rval});
                 current_net->res_graph[node2].push_back({node1, rval});
@@ -345,7 +606,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
             }
         }
         else if (section == SEC_CONN && tokens.size() >= 3) {
-            std::string pin = tokens[1];
+            std::string pin = resolve_name_token(tokens[1]);
             // Direction is the first token that starts with O, B, or I
             std::string dir;
             for (size_t i = 2; i < tokens.size(); i++) {
@@ -354,28 +615,6 @@ ParsedSpef parse_spef(const std::string& filepath) {
                     break;
                 }
             }
-            
-            // Handle pin:idx format
-            std::string pin_base = pin;
-            std::string pin_idx;
-            size_t colon_pos = pin.find(':');
-            if (colon_pos != std::string::npos) {
-                pin_base = pin.substr(0, colon_pos);
-                pin_idx = pin.substr(colon_pos);  // e.g., ":Q"
-            }
-            
-            // Resolve pin_base via name_map
-            if (pin_base.size() > 1 && pin_base[0] == '*') {
-                auto it = spef.name_map.find(pin_base);
-                if (it != spef.name_map.end()) {
-                    pin = it->second + pin_idx;
-                }
-            }
-            
-            // Unescape
-            size_t pos;
-            while ((pos = pin.find("\\[")) != std::string::npos) pin.replace(pos, 2, "[");
-            while ((pos = pin.find("\\]")) != std::string::npos) pin.replace(pos, 2, "]");
             
             if (!dir.empty() && (dir[0] == 'O' || dir[0] == 'B')) {
                 if (current_net->driver.empty()) {
@@ -387,7 +626,6 @@ ParsedSpef parse_spef(const std::string& filepath) {
         }
         else if (section == SEC_NONE) {
             // Look for section header
-            std::cerr << "DEBUG SEC_NONE block, tokens[0]=" << (tokens.empty() ? "empty" : tokens[0]) << std::endl;
             if (!tokens.empty() && tokens[0][0] == '*') {
                 std::string header = tokens[0];
                 if (header == "*CONN") {
@@ -409,28 +647,13 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 // Also handle *I (input) and *P (port) as CONN entries when no explicit *CONN header
                 else if ((header == "*I" || header == "*P") && tokens.size() >= 3) {
                     section = SEC_CONN;
-                    std::cerr << "DEBUG: Processing *I/*P line, pin=" << tokens[1] << " dir=" << tokens[2] << std::endl;
                     // Process this line as CONN
-                    std::string pin = tokens[1];
+                    std::string pin = resolve_name_token(tokens[1]);
                     std::string dir;
                     for (size_t i = 2; i < tokens.size(); i++) {
                         if (!tokens[i].empty() && (tokens[i][0] == 'O' || tokens[i][0] == 'B' || tokens[i][0] == 'I')) {
                             dir = tokens[i];
                             break;
-                        }
-                    }
-                    // Handle pin:idx format
-                    std::string pin_base = pin;
-                    std::string pin_idx;
-                    size_t colon_pos = pin.find(':');
-                    if (colon_pos != std::string::npos) {
-                        pin_base = pin.substr(0, colon_pos);
-                        pin_idx = pin.substr(colon_pos);
-                    }
-                    if (pin_base.size() > 1 && pin_base[0] == '*') {
-                        auto it = spef.name_map.find(pin_base);
-                        if (it != spef.name_map.end()) {
-                            pin = it->second + pin_idx;
                         }
                     }
                     if (!dir.empty() && (dir[0] == 'O' || dir[0] == 'B')) {
