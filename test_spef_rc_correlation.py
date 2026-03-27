@@ -36,6 +36,7 @@ from spef_rc_correlation import (
     backmark_spef,
     collect_spef_paths,
     compare_spef,
+    compare_spef1,
     parse_net_cap_data,
     parse_net_res_data,
     parse_spefs_parallel,
@@ -786,7 +787,7 @@ class TestGuiCliWiring:
         path2 = _write_temp_spef(MINIMAL_SPEF.replace("*1 net_A", "*1 net_B"))
         calls = []
 
-        def fake_launch_gui(preload_paths=None, auto_run=False):
+        def fake_launch_gui(preload_paths=None, auto_run=False, **kwargs):
             calls.append((list(preload_paths or []), auto_run))
 
         monkeypatch.setattr(spef_mod, "launch_gui", fake_launch_gui)
@@ -838,7 +839,7 @@ class TestGuiCliWiring:
         path = _write_temp_spef(MINIMAL_SPEF)
         calls = []
 
-        def fake_launch_gui(preload_paths=None, auto_run=False):
+        def fake_launch_gui(preload_paths=None, auto_run=False, **kwargs):
             calls.append((list(preload_paths or []), auto_run))
 
         monkeypatch.setattr(spef_mod, "launch_gui", fake_launch_gui)
@@ -1684,7 +1685,7 @@ class TestBackmarkSpef:
             old_dir = os.getcwd()
             os.chdir(td)
             try:
-                compare_spef(shuf_sf, ref_sf, "max")
+                compare_spef1(shuf_sf, ref_sf, "max")
             finally:
                 os.chdir(old_dir)
 

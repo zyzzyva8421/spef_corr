@@ -156,6 +156,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
     std::string current_net_name;
     NetData* current_net = nullptr;
     bool r_is_kohm = false;
+    size_t net_count = 0;
     
     std::string line;
     size_t line_num = 0;
@@ -206,6 +207,10 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 current_net->name = resolved_name;
                 current_net->total_cap = parse_float(total_cap_str);
                 section = SEC_NONE;
+                net_count++;
+                if (net_count % 5000 == 0) {
+                    std::cout << "[" << filepath << "] parsed " << net_count << " nets... (C++)" << std::endl;
+                }
                 continue;
             }
             if (code_part.find("*END") == 0) {

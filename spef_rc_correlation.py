@@ -675,15 +675,29 @@ def compare_spef(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapCompar
 
     return cap_rows, res_rows, top_10_cap, top_10_res
 
-def compare_spef1(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison]]:
+def compare_spef1(s1: SpefFile, s2: SpefFile, r_agg: str,
+                  cap_data_path: str = "net_cap.data",
+                  res_data_path: str = "net_res.data") -> Tuple[List[CapComparison], List[ResComparison], List[CapComparison], List[ResComparison]]:
+    """Compare two parsed SPEF files and write per-net data to output files.
+
+    Args:
+        s1: First parsed SpefFile.
+        s2: Second parsed SpefFile.
+        r_agg: Resistance aggregation mode ('max', 'avg', or 'total').
+        cap_data_path: Path for the output cap data file (default: 'net_cap.data').
+        res_data_path: Path for the output res data file (default: 'net_res.data').
+
+    Returns:
+        (cap_rows, res_rows, top_10_cap, top_10_res)
+    """
     common_nets = sorted(set(s1.nets.keys()) & set(s2.nets.keys()))
     print("common_nets are sorted")
     cap_rows: List[CapComparison] = []
     res_rows: List[ResComparison] = []
 
     i = 0
-    with open("net_cap.data", 'w', encoding='utf-8') as fc, \
-         open("net_res.data", 'w', encoding='utf-8') as fr:
+    with open(cap_data_path, 'w', encoding='utf-8') as fc, \
+         open(res_data_path, 'w', encoding='utf-8') as fr:
         for net_name in common_nets:
             n1 = s1.nets[net_name]
             n2 = s2.nets[net_name]
@@ -1493,7 +1507,9 @@ def collect_spef_paths(inputs: Iterable[str]) -> List[str]:
 
 def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = False,
                preload_cap_data: Optional[str] = None,
-               preload_res_data: Optional[str] = None) -> None:
+               preload_res_data: Optional[str] = None,
+               preload_caps: Optional[List[CapComparison]] = None,
+               preload_ress: Optional[List[ResComparison]] = None) -> None:
     """Launch an interactive GUI for multi-SPEF correlation analysis."""
 
     try:
@@ -1510,7 +1526,9 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
         def __init__(self, root: "tk.Tk", preload_paths: Optional[Iterable[str]] = None,
                      auto_run: bool = False,
                      preload_cap_data: Optional[str] = None,
-                     preload_res_data: Optional[str] = None) -> None:
+                     preload_res_data: Optional[str] = None,
+                     preload_caps: Optional[List[CapComparison]] = None,
+                     preload_ress: Optional[List[ResComparison]] = None) -> None:
             self.root = root
             self.root.title("SPEF RC Correlation")
 
@@ -1550,6 +1568,18 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
                 self._load_cap_data_file(preload_cap_data)
             if preload_res_data:
                 self._load_res_data_file(preload_res_data)
+            if preload_caps:
+                self._data_caps = list(preload_caps)
+                self.cap_data_label.config(
+                    text=f"(preloaded)  ({len(self._data_caps)} nets)",
+                    foreground="black",
+                )
+            if preload_ress:
+                self._data_ress = list(preload_ress)
+                self.res_data_label.config(
+                    text=f"(preloaded)  ({len(self._data_ress)} pairs)",
+                    foreground="black",
+                )
 
             if self._auto_run_requested:
                 if self._data_caps or self._data_ress:
@@ -2329,7 +2359,8 @@ def launch_gui(preload_paths: Optional[Iterable[str]] = None, auto_run: bool = F
 
     root = tk.Tk()
     RcCorrApp(root, preload_paths=preload_paths, auto_run=auto_run,
-              preload_cap_data=preload_cap_data, preload_res_data=preload_res_data)
+              preload_cap_data=preload_cap_data, preload_res_data=preload_res_data,
+              preload_caps=preload_caps, preload_ress=preload_ress)
     root.mainloop()
 
 
@@ -2481,10 +2512,44 @@ def main() -> None:
         return
 
     # ------------------------------------------------------------------
+    # Normal SPEF mode: both spef1 and spef2 provided
+    # ------------------------------------------------------------------
+    if args.spef1 and args.spef2:
+        if args.gui or args.gui_auto_run:
+            # GUI mode: compare with multiprocessing then launch GUI with results
+            s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
+            caps, ress, _top_10_cap, _top_10_res = compare_spef(s1, s2, args.r_agg)
+            gui_inputs = collect_spef_paths([args.spef1, args.spef2])
+            launch_gui(gui_inputs, auto_run=args.gui_auto_run,
+                       preload_caps=caps, preload_ress=ress)
+        else:
+            # Non-GUI mode: use compare_spef1 to generate data files
+            cap_out = args.net_cap_data or "net_cap.data"
+            res_out = args.net_res_data or "net_res.data"
+            s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
+            caps, ress, _top_10_cap, _top_10_res = compare_spef1(
+                s1, s2, args.r_agg, cap_out, res_out
+            )
+            print(f"Cap data written to: {cap_out}")
+            print(f"Res data written to: {res_out}")
+            summarize_and_print(caps, ress, s1, s2, args.r_agg)
+
+            if args.csv_prefix:
+                caps_path = f"{args.csv_prefix}_caps.csv"
+                res_path = f"{args.csv_prefix}_res_{args.r_agg}.csv"
+                write_caps_csv(caps_path, caps)
+                write_res_csv(res_path, ress, args.r_agg)
+                print("\nCSV written:")
+                print(f"  {caps_path}")
+                print(f"  {res_path}")
+        return
+
+    # ------------------------------------------------------------------
     # Data-file mode: at least one of --net-cap-data / --net-res-data
+    # (only reached when spef1+spef2 are not both provided)
     # ------------------------------------------------------------------
     if args.net_cap_data or args.net_res_data:
-        if args.gui:
+        if args.gui or args.gui_auto_run:
             # GUI mode with data files: pass data paths to the GUI
             gui_inputs = collect_spef_paths([p for p in [args.spef1, args.spef2] if p])
             launch_gui(
@@ -2564,30 +2629,15 @@ def main() -> None:
         return
 
     # ------------------------------------------------------------------
-    # Normal SPEF mode
+    # GUI-only mode (no SPEF files and no data files)
     # ------------------------------------------------------------------
     gui_inputs = collect_spef_paths([p for p in [args.spef1, args.spef2] if p])
 
-    if args.gui or (args.spef1 is None and args.spef2 is None):
+    if args.gui or args.gui_auto_run or (args.spef1 is None and args.spef2 is None):
         launch_gui(gui_inputs, auto_run=args.gui_auto_run)
         return
 
-    if args.spef1 is None or args.spef2 is None:
-        parser.error("spef1 and spef2 are required in CLI mode (or use --gui).")
-
-    s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
-
-    caps, ress, _top_10_cap, _top_10_res = compare_spef(s1, s2, args.r_agg)
-    summarize_and_print(caps, ress, s1, s2, args.r_agg)
-
-    if args.csv_prefix:
-        caps_path = f"{args.csv_prefix}_caps.csv"
-        res_path = f"{args.csv_prefix}_res_{args.r_agg}.csv"
-        write_caps_csv(caps_path, caps)
-        write_res_csv(res_path, ress, args.r_agg)
-        print("\nCSV written:")
-        print(f"  {caps_path}")
-        print(f"  {res_path}")
+    parser.error("spef1 and spef2 are required in CLI mode (or use --gui).")
 
 
 if __name__ == "__main__":
