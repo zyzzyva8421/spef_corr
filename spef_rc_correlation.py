@@ -643,7 +643,9 @@ def process_net_batch(net_names_batch):
     
     return results
 
-def compare_spef1(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapComparison], List[ResComparison]]:
+def compare_spef1(s1: SpefFile, s2: SpefFile, r_agg: str,
+                  net_cap_out: str = "net_cap.data",
+                  net_res_out: str = "net_res.data") -> Tuple[List[CapComparison], List[ResComparison], List[CapComparison], List[ResComparison]]:
     common_nets = sorted(set(s1.nets.keys()) & set(s2.nets.keys()))
     print("common_nets are sorted")
     cap_rows: List[CapComparison] = []
@@ -666,6 +668,17 @@ def compare_spef1(s1: SpefFile, s2: SpefFile, r_agg: str) -> Tuple[List[CapCompa
             res_rows.extend(res_row_list)
     print("start to find top 10")
     print(f"total cap rows: {len(cap_rows)}, total res rows: {len(res_rows)}")
+
+    # Write data files
+    with open(net_cap_out, 'w', encoding='utf-8') as fc:
+        for row in cap_rows:
+            print(f"{row.net} {row.c1} {row.c2}", file=fc)
+    print(f"Cap data written to {net_cap_out}")
+    with open(net_res_out, 'w', encoding='utf-8') as fr:
+        for row in res_rows:
+            print(f"{row.net} {row.driver} {row.load} {row.r1} {row.r2}", file=fr)
+    print(f"Res data written to {net_res_out}")
+
     # 计算偏差并找出最大的10个
     cap_rows_with_deviation = [(abs(row.c1 - row.c2), row) for row in cap_rows]
     res_rows_with_deviation = [(abs(row.r1 - row.r2), row) for row in res_rows]
@@ -2399,20 +2412,20 @@ def main() -> None:
         "--net-cap-data",
         metavar="FILE",
         help=(
-            "Path to a pre-computed net_cap.data file. "
-            "Each line: net_name  c_tool1  c_tool2. "
-            "When supplied, capacitance correlation is computed from this file "
-            "instead of parsing two SPEF files."
+            "When used with spef1 and spef2 in CLI mode, specifies the output path "
+            "for the generated net_cap.data file (default: net_cap.data). "
+            "When used without spef1/spef2, loads a pre-computed net_cap.data file "
+            "where each line is: net_name  c_tool1  c_tool2."
         ),
     )
     parser.add_argument(
         "--net-res-data",
         metavar="FILE",
         help=(
-            "Path to a pre-computed net_res.data file. "
-            "Each line: net_name  driver_pin  sink_pin  r_tool1  r_tool2. "
-            "When supplied, resistance correlation is computed from this file "
-            "instead of parsing two SPEF files."
+            "When used with spef1 and spef2 in CLI mode, specifies the output path "
+            "for the generated net_res.data file (default: net_res.data). "
+            "When used without spef1/spef2, loads a pre-computed net_res.data file "
+            "where each line is: net_name  driver_pin  sink_pin  r_tool1  r_tool2."
         ),
     )
 
@@ -2478,6 +2491,34 @@ def main() -> None:
             base, ext = os.path.splitext(args.spef1)
             out = f"{base}_shuffled{ext}"
         shuffle_net_mapping(args.spef1, out, seed=args.seed)
+        return
+
+    # ------------------------------------------------------------------
+    # SPEF comparison mode: both spef1 and spef2 provided
+    # ------------------------------------------------------------------
+    if args.spef1 and args.spef2:
+        gui_inputs = collect_spef_paths([args.spef1, args.spef2])
+
+        if args.gui or args.gui_auto_run:
+            # GUI mode: launch GUI which internally calls compare_spef
+            launch_gui(gui_inputs, auto_run=args.gui_auto_run)
+            return
+
+        # CLI mode: use compare_spef1 to generate data files
+        s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
+        net_cap_out = args.net_cap_data or "net_cap.data"
+        net_res_out = args.net_res_data or "net_res.data"
+        caps, ress, _top_10_cap, _top_10_res = compare_spef1(s1, s2, args.r_agg, net_cap_out, net_res_out)
+        summarize_and_print(caps, ress, s1, s2, args.r_agg)
+
+        if args.csv_prefix:
+            caps_path = f"{args.csv_prefix}_caps.csv"
+            res_path = f"{args.csv_prefix}_res_{args.r_agg}.csv"
+            write_caps_csv(caps_path, caps)
+            write_res_csv(res_path, ress, args.r_agg)
+            print("\nCSV written:")
+            print(f"  {caps_path}")
+            print(f"  {res_path}")
         return
 
     # ------------------------------------------------------------------
@@ -2564,30 +2605,15 @@ def main() -> None:
         return
 
     # ------------------------------------------------------------------
-    # Normal SPEF mode
+    # GUI-only mode (no SPEF files provided)
     # ------------------------------------------------------------------
     gui_inputs = collect_spef_paths([p for p in [args.spef1, args.spef2] if p])
 
-    if args.gui or (args.spef1 is None and args.spef2 is None):
+    if args.gui or args.gui_auto_run or (args.spef1 is None and args.spef2 is None):
         launch_gui(gui_inputs, auto_run=args.gui_auto_run)
         return
 
-    if args.spef1 is None or args.spef2 is None:
-        parser.error("spef1 and spef2 are required in CLI mode (or use --gui).")
-
-    s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
-
-    caps, ress, _top_10_cap, _top_10_res = compare_spef(s1, s2, args.r_agg)
-    summarize_and_print(caps, ress, s1, s2, args.r_agg)
-
-    if args.csv_prefix:
-        caps_path = f"{args.csv_prefix}_caps.csv"
-        res_path = f"{args.csv_prefix}_res_{args.r_agg}.csv"
-        write_caps_csv(caps_path, caps)
-        write_res_csv(res_path, ress, args.r_agg)
-        print("\nCSV written:")
-        print(f"  {caps_path}")
-        print(f"  {res_path}")
+    parser.error("spef1 and spef2 are required in CLI mode (or use --gui).")
 
 
 if __name__ == "__main__":
