@@ -2633,15 +2633,18 @@ def main() -> None:
     # Normal SPEF mode: both spef1 and spef2 provided
     # ------------------------------------------------------------------
     if args.spef1 and args.spef2:
-        if args.gui or args.gui_auto_run:
-            # GUI mode: compare with multiprocessing then launch GUI with results
+        if args.gui_auto_run:
+            # --gui-auto-run: 先解析并预加载，GUI不再重复解析
             s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
             caps, ress, _top_10_cap, _top_10_res = compare_spef(s1, s2, args.r_agg)
             gui_inputs = collect_spef_paths([args.spef1, args.spef2])
-            launch_gui(gui_inputs, auto_run=args.gui_auto_run,
-                       preload_caps=caps, preload_ress=ress)
+            launch_gui(gui_inputs, auto_run=True, preload_caps=caps, preload_ress=ress)
+        elif args.gui:
+            # --gui: 只启动GUI，不自动解析
+            gui_inputs = collect_spef_paths([args.spef1, args.spef2])
+            launch_gui(gui_inputs, auto_run=False)
         else:
-            # Non-GUI mode: use compare_spef1 to generate data files
+            # 非GUI模式: 生成数据文件
             cap_out = args.net_cap_data or "net_cap.data"
             res_out = args.net_res_data or "net_res.data"
             s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
