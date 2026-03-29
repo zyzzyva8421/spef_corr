@@ -178,6 +178,15 @@ class NetRC:
         return result
 
 class SpefFile:
+    def __getstate__(self):
+        # 只序列化纯 Python 字段，忽略 _cpp_spef
+        state = self.__dict__.copy()
+        state['_cpp_spef'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._cpp_spef = None
     def __init__(self, path: str) -> None:
         self.path = path
         self.name_map: Dict[str, str] = {}

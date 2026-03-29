@@ -21,7 +21,39 @@ PYBIND11_MODULE(spef_core, m) {
         .def_readwrite("driver", &NetData::driver)
         .def_readwrite("sinks", &NetData::sinks)
         .def_readwrite("res_graph", &NetData::res_graph)
-        .def("compute_driver_sink_resistances", &compute_driver_sink_resistances);
+        .def("compute_driver_sink_resistances", &compute_driver_sink_resistances)
+        .def(py::pickle(
+            [](const NetData &self) {
+                return py::make_tuple(
+                    self.name,
+                    self.total_cap,
+                    self.driver,
+                    self.sinks,
+                    self.res_graph,
+                    self.node_prefix_map,
+                    self.pin_to_node_cache,
+                    self.driver_sink_res_cache,
+                    self.cache_valid,
+                    self.pin_map_built
+                );
+            },
+            [](py::tuple t) {
+                if (t.size() != 10)
+                    throw std::runtime_error("Invalid NetData state!");
+                NetData obj;
+                obj.name = t[0].cast<std::string>();
+                obj.total_cap = t[1].cast<double>();
+                obj.driver = t[2].cast<std::string>();
+                obj.sinks = t[3].cast<std::vector<std::string>>();
+                obj.res_graph = t[4].cast<std::unordered_map<std::string, std::vector<Edge>>>();
+                obj.node_prefix_map = t[5].cast<std::unordered_map<std::string, std::string>>();
+                obj.pin_to_node_cache = t[6].cast<std::unordered_map<std::string, std::string>>();
+                obj.driver_sink_res_cache = t[7].cast<std::unordered_map<std::string, double>>();
+                obj.cache_valid = t[8].cast<bool>();
+                obj.pin_map_built = t[9].cast<bool>();
+                return obj;
+            }
+        ));
     
     // ParsedSpef class
     py::class_<ParsedSpef>(m, "ParsedSpef")
@@ -31,7 +63,31 @@ PYBIND11_MODULE(spef_core, m) {
         .def_readwrite("t_unit", &ParsedSpef::t_unit)
         .def_readwrite("c_unit", &ParsedSpef::c_unit)
         .def_readwrite("r_unit", &ParsedSpef::r_unit)
-        .def_readwrite("l_unit", &ParsedSpef::l_unit);
+        .def_readwrite("l_unit", &ParsedSpef::l_unit)
+        .def(py::pickle(
+            [](const ParsedSpef &self) {
+                return py::make_tuple(
+                    self.name_map,
+                    self.nets,
+                    self.t_unit,
+                    self.c_unit,
+                    self.r_unit,
+                    self.l_unit
+                );
+            },
+            [](py::tuple t) {
+                if (t.size() != 6)
+                    throw std::runtime_error("Invalid ParsedSpef state!");
+                ParsedSpef obj;
+                obj.name_map = t[0].cast<std::unordered_map<std::string, std::string>>();
+                obj.nets = t[1].cast<std::unordered_map<std::string, NetData>>();
+                obj.t_unit = t[2].cast<std::string>();
+                obj.c_unit = t[3].cast<std::string>();
+                obj.r_unit = t[4].cast<std::string>();
+                obj.l_unit = t[5].cast<std::string>();
+                return obj;
+            }
+        ));
     
     // ============== NEW BINDINGS FOR RECOMMENDATIONS ==============
     
