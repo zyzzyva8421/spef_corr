@@ -18,25 +18,18 @@ Usage:
     python spef_rc_correlation.py --backmark input.spef --net-cap-data caps.data --output output.spef
 """
 
-from __future__ import annotations
-
-
 import argparse
 import csv
 import math
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Iterable
-
-# Try to import C++ extension for maximum performance
 try:
     import spef_core
     HAS_CPP = True
 except ImportError:
     HAS_CPP = False
     print("[warn] C++ extension not available, using Python fallback (slower)")
-
-# GUI dependencies (always import at top for class-wide use)
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk, simpledialog
@@ -51,79 +44,32 @@ except ImportError:
 # ===================== Python data structures for GUI =====================
 
 @dataclass
+@dataclass
 class CapComparison:
-    """Capacitance comparison result for a single net."""
     net: str
     c1: float
     c2: float
 
-
 @dataclass
 class ResComparison:
-    """Resistance comparison result for a single net/sink pair."""
     net: str
     driver: str
     load: str
     r1: float
     r2: float
 
-
 @dataclass
 class NetRC:
-    """Simple net data holder for GUI compatibility."""
     name: str
     total_cap: float
     driver: Optional[str] = None
     sinks: List[str] = None
     res_graph: Dict[str, List[Tuple[str, float]]] = None
-    
     def __post_init__(self):
         if self.sinks is None:
             self.sinks = []
         if self.res_graph is None:
             self.res_graph = {}
-    
-    def driver_sink_resistances(self) -> Dict[str, float]:
-        """Compute driver-to-sink resistances using Dijkstra."""
-        if not self.driver or not self.sinks:
-            return {}
-        
-        from collections import deque
-        
-        driver_node = self.driver
-        if driver_node not in self.res_graph:
-            for node in self.res_graph:
-                if node.split(':')[0] == driver_node.split(':')[0]:
-                    driver_node = node
-                    break
-        
-        if driver_node not in self.res_graph:
-            return {}
-        
-        dist = {driver_node: 0.0}
-        queue = deque([driver_node])
-        
-        while queue:
-            node = queue.popleft()
-            for neigh, r in self.res_graph.get(node, []):
-                if neigh not in dist:
-                    dist[neigh] = dist[node] + r
-                    queue.append(neigh)
-        
-        result = {}
-        for sink in self.sinks:
-            sink_node = sink
-            if sink_node not in dist:
-                base = sink.split(':')[0]
-                for node in dist:
-                    if node.split(':')[0] == base:
-                        sink_node = node
-                        break
-            if sink_node in dist:
-                result[sink] = dist[sink_node]
-        
-        return result
-
 
 class SpefFile:
     """Simple SPEF wrapper that uses C++ backend."""
