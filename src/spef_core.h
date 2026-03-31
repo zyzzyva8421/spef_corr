@@ -20,6 +20,7 @@
 #include <thread>
 #include <mutex>
 #include <functional>
+#include <set>
 
 namespace py = pybind11;
 
@@ -135,6 +136,63 @@ void shuffle_spef(
     const std::string& input_path,
     const std::string& output_path,
     int seed
+);
+
+// ============== BACKMARK FUNCTIONS ==============
+
+// Backmark: update cap/res values from data files
+void backmark_spef(
+    const std::string& spef_path,
+    const std::string& cap_data_path,
+    const std::string& res_data_path,
+    const std::string& output_path
+);
+
+// Parse backmark cap data
+std::unordered_map<std::string, double> parse_backmark_cap_data(
+    const std::string& path
+);
+
+// Parse backmark res data
+std::unordered_map<std::string, std::unordered_map<std::string, double>> parse_backmark_res_data(
+    const std::string& path
+);
+
+// Compute segment scales for backmarking
+std::unordered_map<std::string, std::unordered_map<std::string, double>> compute_res_segment_scales(
+    NetData& net,
+    const std::unordered_map<std::string, double>& sink_ratios,
+    double avg_ratio
+);
+
+// ============== CORRELATION FUNCTIONS ==============
+
+// Compare two SPEFs and return all comparisons
+struct ComparisonResult {
+    std::vector<CapComparisonData> cap_rows;
+    std::vector<ResComparisonData> res_rows;
+    std::vector<CapComparisonData> top_10_cap;
+    std::vector<ResComparisonData> top_10_res;
+    std::vector<std::string> common_nets;
+    double cap_correlation;
+    double res_correlation;
+    size_t cap_count;
+    size_t res_count;
+};
+
+ComparisonResult compare_spef_full(
+    ParsedSpef& spef1,
+    ParsedSpef& spef2,
+    int num_threads = 0
+);
+
+// Summarize comparison results
+std::string summarize_comparison(const ComparisonResult& result);
+
+// Parse multiple SPEF files in parallel using C++ threads
+std::vector<ParsedSpef> parse_spef_parallel(
+    const std::vector<std::string>& filepaths,
+    int num_threads = 0
 );
 
 #endif // SPEF_CORE_H

@@ -1,4 +1,6 @@
 #include "spef_core.h"
+#include <iomanip>
+#include <sstream>
 
 // ============== Dijkstra Implementation ==============
 std::unordered_map<std::string, double> dijkstra_shortest_paths(
@@ -407,6 +409,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
     NetData* current_net = nullptr;
     bool r_is_kohm = false;
     size_t net_count = 0;
+    auto t_start = std::chrono::steady_clock::now();
     
     std::string line;
     size_t line_num = 0;
@@ -487,7 +490,9 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 section = SEC_NONE;
                 net_count++;
                 if (net_count % 5000 == 0) {
-                    std::cout << "[" << filepath << "] parsed " << net_count << " nets... (C++)" << std::endl;
+                    auto t_now = std::chrono::steady_clock::now();
+                    double elapsed = std::chrono::duration<double>(t_now - t_start).count();
+                    std::cout << "[" << filepath << "] parsed " << net_count << " nets... (C++/single, " << elapsed << "s)" << std::endl;
                 }
                 continue;
             }
@@ -670,6 +675,9 @@ ParsedSpef parse_spef(const std::string& filepath) {
     }
     
     file.close();
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(t_end - t_start).count();
+    std::cout << "[" << filepath << "] finished parsing " << net_count << " nets in " << elapsed << "s (C++/single)" << std::endl;
     return spef;
 }
 
@@ -825,4 +833,746 @@ void shuffle_spef(const std::string& input_path, const std::string& output_path,
     
     input.close();
     output.close();
+}
+
+// ============== BACKMARK IMPLEMENTATIONS ==============
+
+std::unordered_map<std::string, double> parse_backmark_cap_data(const std::string& path) {
+    std::unordered_map<std::string, double> cap_map;
+    
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return cap_map;
+    }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+        // Skip empty lines and comments
+        if (line.empty() || line[0] == '#') continue;
+        
+        std::istringstream iss(line);
+        std::string net_key, dummy1, val_str;
+        if (!(iss >> net_key >> dummy1 >> val_str)) continue;
+        
+        try {
+            double new_cap = std::stod(val_str);
+            cap_map[net_key] = new_cap;
+        } catch (...) {
+            continue;
+        }
+    }
+    
+    return cap_map;
+}
+
+std::unordered_map<std::string, std::unordered_map<std::string, double>> parse_backmark_res_data(const std::string& path) {
+    std::unordered_map<std::string, std::unordered_map<std::string, double>> res_map;
+    
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return res_map;
+    }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
+        std::istringstream iss(line);
+        std::string net_key, driver, sink, r_old, r_new;
+        if (!(iss >> net_key >> driver >> sink >> r_old >> r_new)) continue;
+        
+        try {
+            double new_r = std::stod(r_new);
+            res_map[net_key][sink] = new_r;
+        } catch (...) {
+            continue;
+        }
+    }
+    
+    return res_map;
+}
+
+std::string resolve_spef_token(const std::string& tok, 
+                               const std::unordered_map<std::string, std::string>& name_map) {
+    if (tok.empty()) return tok;
+    
+    std::string out = tok;
+    if (out[0] == '*') {
+        size_t colon = out.find(':');
+        std::string base, suffix;
+        if (colon != std::string::npos) {
+            base = out.substr(0, colon);
+            suffix = out.substr(colon);
+        } else {
+            base = out;
+            suffix = "";
+        }
+        
+        auto it = name_map.find(base);
+        if (it != name_map.end()) {
+            out = it->second + suffix;
+        }
+    }
+    
+    // Unescape \[ and \]
+    size_t pos;
+    while ((pos = out.find("\\[")) != std::string::npos) out.replace(pos, 2, "[");
+    while ((pos = out.find("\\]")) != std::string::npos) out.replace(pos, 2, "]");
+    
+    return out;
+}
+
+std::unordered_map<std::string, std::unordered_map<std::string, double>> compute_res_segment_scales(
+    NetData& net,
+    const std::unordered_map<std::string, double>& sink_ratios,
+    double avg_ratio
+) {
+    std::unordered_map<std::string, std::unordered_map<std::string, double>> result;
+    
+    if (net.driver.empty() || sink_ratios.empty()) {
+        return result;
+    }
+    
+    // Find driver node
+    std::string driver_node = net.driver;
+    if (net.res_graph.find(net.driver) == net.res_graph.end()) {
+        size_t colon_pos = net.driver.find(':');
+        std::string base = (colon_pos != std::string::npos) ? 
+            net.driver.substr(0, colon_pos) : net.driver;
+        
+        for (const auto& node : net.res_graph) {
+            size_t node_colon = node.first.find(':');
+            std::string node_base = (node_colon != std::string::npos) ?
+                node.first.substr(0, node_colon) : node.first;
+            if (node_base == base) {
+                driver_node = node.first;
+                break;
+            }
+        }
+    }
+    
+    if (net.res_graph.find(driver_node) == net.res_graph.end()) {
+        return result;
+    }
+    
+    // Build prefix map for sink resolution
+    auto find_best_sink_node = [&](const std::string& sink_pin) -> std::string {
+        if (net.res_graph.find(sink_pin) != net.res_graph.end()) {
+            return sink_pin;
+        }
+        size_t colon_pos = sink_pin.find(':');
+        std::string base = (colon_pos != std::string::npos) ? 
+            sink_pin.substr(0, colon_pos) : sink_pin;
+        
+        for (const auto& node : net.res_graph) {
+            size_t node_colon = node.first.find(':');
+            std::string node_base = (node_colon != std::string::npos) ?
+                node.first.substr(0, node_colon) : node.first;
+            if (node_base == base) {
+                return node.first;
+            }
+        }
+        return sink_pin;
+    };
+    
+    // Map sink pins to graph nodes
+    std::unordered_map<std::string, double> sink_node_to_ratio;
+    for (const auto& [sink_pin, ratio] : sink_ratios) {
+        std::string sink_node = find_best_sink_node(sink_pin);
+        if (net.res_graph.find(sink_node) != net.res_graph.end()) {
+            sink_node_to_ratio[sink_node] = ratio;
+        }
+    }
+    
+    if (sink_node_to_ratio.empty()) {
+        return result;
+    }
+    
+    // BFS from driver to build spanning tree
+    std::unordered_map<std::string, std::string> parent;
+    std::unordered_map<std::string, std::vector<std::string>> children;
+    std::vector<std::string> order;
+    std::queue<std::string> q;
+    
+    parent[driver_node] = "";
+    q.push(driver_node);
+    order.push_back(driver_node);
+    
+    while (!q.empty()) {
+        std::string node = q.front();
+        q.pop();
+        children[node] = {};
+        
+        auto it = net.res_graph.find(node);
+        if (it != net.res_graph.end()) {
+            for (const auto& edge : it->second) {
+                if (parent.find(edge.to) == parent.end()) {
+                    parent[edge.to] = node;
+                    children[node].push_back(edge.to);
+                    q.push(edge.to);
+                    order.push_back(edge.to);
+                }
+            }
+        }
+    }
+    
+    // Post-order: compute sinks in each subtree
+    std::unordered_map<std::string, std::unordered_set<std::string>> sinks_below;
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+        std::string node = *it;
+        std::unordered_set<std::string> s;
+        
+        if (sink_node_to_ratio.find(node) != sink_node_to_ratio.end()) {
+            s.insert(node);
+        }
+        
+        for (const auto& child : children[node]) {
+            auto child_sinks = sinks_below.find(child);
+            if (child_sinks != sinks_below.end()) {
+                for (const auto& sink : child_sinks->second) {
+                    s.insert(sink);
+                }
+            }
+        }
+        
+        sinks_below[node] = std::move(s);
+    }
+    
+    // Assign scale factors to tree edges
+    for (const auto& [child_node, par_node] : parent) {
+        if (par_node.empty()) continue;
+        
+        double scale;
+        auto sinks_it = sinks_below.find(child_node);
+        if (sinks_it != sinks_below.end() && sinks_it->second.size() == 1) {
+            scale = sink_node_to_ratio[*sinks_it->second.begin()];
+        } else {
+            scale = avg_ratio;
+        }
+        
+        result[par_node][child_node] = scale;
+        result[child_node][par_node] = scale;
+    }
+    
+    return result;
+}
+
+std::string fmt_float(double val) {
+    if (val == 0.0) return "0";
+    if (std::abs(val) < 1e-4) {
+        std::ostringstream oss;
+        oss << std::scientific << std::setprecision(6) << val;
+        return oss.str();
+    }
+    std::ostringstream oss;
+    oss << std::setprecision(6) << std::fixed << val;
+    std::string s = oss.str();
+    // Remove trailing zeros after decimal point
+    size_t dot = s.find('.');
+    if (dot != std::string::npos) {
+        size_t end = s.length() - 1;
+        while (end > dot && s[end] == '0') end--;
+        if (end == dot) s = s.substr(0, dot);
+        else s = s.substr(0, end + 1);
+    }
+    return s;
+}
+
+void backmark_spef(
+    const std::string& spef_path,
+    const std::string& cap_data_path,
+    const std::string& res_data_path,
+    const std::string& output_path
+) {
+    std::cout << "[backmark] Parsing SPEF..." << std::endl;
+    // Parse SPEF
+    ParsedSpef spef = parse_spef(spef_path);
+    
+    // Build reverse name_map: net_name -> net_id
+    std::unordered_map<std::string, std::string> reverse_name_map;
+    for (const auto& [net_id, net_name] : spef.name_map) {
+        reverse_name_map[net_name] = net_id;
+    }
+    
+    // Load cap data
+    std::unordered_map<std::string, double> cap_ratio;
+    std::unordered_map<std::string, double> new_total_caps;
+    
+    if (!cap_data_path.empty()) {
+        auto raw_cap = parse_backmark_cap_data(cap_data_path);
+        for (const auto& [key, new_cap] : raw_cap) {
+            std::string net_name = key;
+            if (key[0] == '*') {
+                auto it = spef.name_map.find(key);
+                if (it != spef.name_map.end()) {
+                    net_name = it->second;
+                }
+            }
+            
+            auto net_it = spef.nets.find(net_name);
+            if (net_it == spef.nets.end()) continue;
+            
+            double old_cap = net_it->second.total_cap;
+            new_total_caps[net_name] = new_cap;
+            cap_ratio[net_name] = (old_cap != 0.0) ? (new_cap / old_cap) : 1.0;
+        }
+    }
+    
+    // Load res data
+    std::unordered_map<std::string, std::unordered_map<std::string, std::unordered_map<std::string, double>>> res_segment_scales;
+    std::unordered_map<std::string, double> res_avg_ratio;
+    
+    if (!res_data_path.empty()) {
+        auto raw_res = parse_backmark_res_data(res_data_path);
+        for (const auto& [key, sink_map] : raw_res) {
+            std::string net_name = key;
+            if (key[0] == '*') {
+                auto it = spef.name_map.find(key);
+                if (it != spef.name_map.end()) {
+                    net_name = it->second;
+                }
+            }
+            
+            auto net_it = spef.nets.find(net_name);
+            if (net_it == spef.nets.end()) continue;
+            
+            NetData& net = net_it->second;
+            auto old_dr = compute_driver_sink_resistances(net);
+            if (old_dr.empty()) continue;
+            
+            std::unordered_map<std::string, double> sink_ratios;
+            for (const auto& [sink, new_r] : sink_map) {
+                auto old_r_it = old_dr.find(sink);
+                if (old_r_it != old_dr.end() && old_r_it->second > 0.0) {
+                    sink_ratios[sink] = new_r / old_r_it->second;
+                }
+            }
+            
+            if (sink_ratios.empty()) continue;
+            
+            double sum = 0.0;
+            for (const auto& [_, r] : sink_ratios) sum += r;
+            double avg = sum / sink_ratios.size();
+            res_avg_ratio[net_name] = avg;
+            res_segment_scales[net_name] = compute_res_segment_scales(net, sink_ratios, avg);
+        }
+    }
+    
+    std::cout << "[backmark] Nets with cap update: " << cap_ratio.size() << std::endl;
+    std::cout << "[backmark] Nets with res update: " << res_avg_ratio.size() << std::endl;
+    
+    // Rewrite SPEF line by line
+    std::ifstream fin(spef_path);
+    std::ofstream fout(output_path);
+    
+    if (!fin.is_open()) {
+        throw std::runtime_error("Cannot open input file: " + spef_path);
+    }
+    if (!fout.is_open()) {
+        throw std::runtime_error("Cannot open output file: " + output_path);
+    }
+    
+    enum Section { SEC_NONE, SEC_CONN, SEC_CAP, SEC_RES };
+    Section section = SEC_NONE;
+    
+    std::string current_net_name;
+    std::string current_net_id;
+    double c_scale = 1.0;
+    double r_avg_scale = 1.0;
+    std::unordered_map<std::string, std::unordered_map<std::string, double>> r_edge_scales;
+    
+    std::string line;
+    size_t lines_written = 0;
+    
+    std::regex re_cap_idx("^\\s*\\d+\\s+");
+    
+    while (std::getline(fin, line)) {
+        std::string raw = trim(line);
+        
+        // *D_NET header
+        if (raw.compare(0, 7, "*D_NET ") == 0) {
+            std::istringstream iss(raw);
+            std::string token, net_id_tok, cap_str;
+            iss >> token >> net_id_tok >> cap_str;
+            
+            std::string net_name_resolved = net_id_tok;
+            auto it_nm = spef.name_map.find(net_id_tok);
+            if (it_nm != spef.name_map.end()) {
+                net_name_resolved = it_nm->second;
+            }
+            
+            current_net_name = net_name_resolved;
+            current_net_id = net_id_tok;
+            section = SEC_NONE;
+            
+            auto it_cap = cap_ratio.find(net_name_resolved);
+            if (it_cap != cap_ratio.end()) c_scale = it_cap->second;
+            else c_scale = 1.0;
+            
+            auto it_avg = res_avg_ratio.find(net_name_resolved);
+            if (it_avg != res_avg_ratio.end()) r_avg_scale = it_avg->second;
+            else r_avg_scale = 1.0;
+            
+            auto it_edge = res_segment_scales.find(net_name_resolved);
+            if (it_edge != res_segment_scales.end()) r_edge_scales = it_edge->second;
+            else r_edge_scales.clear();
+            
+            // Write with updated total cap if needed
+            if (new_total_caps.find(net_name_resolved) != new_total_caps.end()) {
+                fout << "*D_NET " << net_id_tok << " " << fmt_float(new_total_caps[net_name_resolved]) << "\n";
+                lines_written++;
+                continue;
+            }
+            
+            fout << line << "\n";
+            lines_written++;
+            continue;
+        }
+        
+        // Inside a net
+        if (!current_net_name.empty()) {
+            if (raw == "*CONN") {
+                section = SEC_CONN;
+                fout << line << "\n";
+                lines_written++;
+                continue;
+            }
+            if (raw == "*CAP") {
+                section = SEC_CAP;
+                fout << line << "\n";
+                lines_written++;
+                continue;
+            }
+            if (raw == "*RES") {
+                section = SEC_RES;
+                fout << line << "\n";
+                lines_written++;
+                continue;
+            }
+            if (raw == "*END") {
+                current_net_name.clear();
+                current_net_id.clear();
+                section = SEC_NONE;
+                c_scale = 1.0;
+                r_avg_scale = 1.0;
+                r_edge_scales.clear();
+                fout << line << "\n";
+                lines_written++;
+                continue;
+            }
+            
+            // CAP section: scale cap values
+            if (section == SEC_CAP && c_scale != 1.0) {
+                // Check if this is a cap data line (starts with number)
+                if (std::regex_search(raw, re_cap_idx)) {
+                    std::istringstream iss(raw);
+                    std::vector<std::string> tokens;
+                    std::string tok;
+                    while (iss >> tok) tokens.push_back(tok);
+                    
+                    if (tokens.size() >= 3) {
+                        try {
+                            // Try to parse last token as float (cap value)
+                            std::string cap_tok = tokens.back();
+                            double old_val = std::stod(cap_tok);
+                            double new_val = old_val * c_scale;
+                            tokens.back() = fmt_float(new_val);
+                            
+                            // Reconstruct line
+                            std::string lead;
+                            size_t non_space = line.find_first_not_of(" \t");
+                            if (non_space != std::string::npos) {
+                                lead = line.substr(0, non_space);
+                            }
+                            
+                            for (size_t i = 0; i < tokens.size(); i++) {
+                                fout << (i == 0 ? lead : " ") << tokens[i];
+                            }
+                            fout << "\n";
+                            lines_written++;
+                            continue;
+                        } catch (...) {
+                            // Not a cap line, fall through
+                        }
+                    }
+                }
+            }
+            
+            // RES section: scale res values
+            if (section == SEC_RES && (!r_edge_scales.empty() || r_avg_scale != 1.0)) {
+                std::istringstream iss(raw);
+                std::vector<std::string> tokens;
+                std::string tok;
+                while (iss >> tok) tokens.push_back(tok);
+                
+                if (tokens.size() >= 4) {
+                    try {
+                        int idx = std::stoi(tokens[0]);  // index
+                        
+                        std::string n1 = resolve_spef_token(tokens[1], spef.name_map);
+                        std::string n2 = resolve_spef_token(tokens[2], spef.name_map);
+                        double old_val = std::stod(tokens[3]);
+                        
+                        double seg_scale = r_avg_scale;
+                        
+                        auto it_edge1 = r_edge_scales.find(n1);
+                        if (it_edge1 != r_edge_scales.end()) {
+                            auto it_edge2 = it_edge1->second.find(n2);
+                            if (it_edge2 != it_edge1->second.end()) {
+                                seg_scale = it_edge2->second;
+                            }
+                        }
+                        
+                        if (seg_scale != 1.0) {
+                            double new_val = old_val * seg_scale;
+                            
+                            std::string lead;
+                            size_t non_space = line.find_first_not_of(" \t");
+                            if (non_space != std::string::npos) {
+                                lead = line.substr(0, non_space);
+                            }
+                            
+                            for (size_t i = 0; i < 3; i++) {
+                                fout << (i == 0 ? lead : " ") << tokens[i];
+                            }
+                            fout << " " << fmt_float(new_val) << " \n";
+                            lines_written++;
+                            continue;
+                        }
+                    } catch (...) {
+                        // Not a RES line, fall through
+                    }
+                }
+            }
+        }
+        
+        // Default: write line unchanged
+        fout << line << "\n";
+        lines_written++;
+    }
+    
+    fin.close();
+    fout.close();
+    
+    std::cout << "[backmark] Written " << lines_written << " lines to " << output_path << std::endl;
+}
+
+// ============== CORRELATION IMPLEMENTATIONS ==============
+
+ComparisonResult compare_spef_full(
+    ParsedSpef& spef1,
+    ParsedSpef& spef2,
+    int num_threads
+) {
+    std::cout << "[compare] Starting comparison with " << num_threads << " threads..." << std::endl;
+    ComparisonResult result;
+    
+    if (num_threads <= 0) {
+        num_threads = std::thread::hardware_concurrency();
+        if (num_threads <= 0) num_threads = 4;
+    }
+    
+    // Find common nets
+    std::vector<std::string> common_nets;
+    for (const auto& [name, _] : spef1.nets) {
+        if (spef2.nets.find(name) != spef2.nets.end()) {
+            common_nets.push_back(name);
+        }
+    }
+    std::sort(common_nets.begin(), common_nets.end());
+    result.common_nets = common_nets;
+    
+    // Parallel processing
+    std::mutex result_mutex;
+    std::vector<CapComparisonData> cap_rows_local;
+    std::vector<ResComparisonData> res_rows_local;
+    
+    cap_rows_local.reserve(common_nets.size());
+    res_rows_local.reserve(common_nets.size() * 4);  // Estimate
+    
+    auto worker = [&](int thread_id) {
+        std::vector<CapComparisonData> local_caps;
+        std::vector<ResComparisonData> local_ress;
+        
+        for (size_t i = thread_id; i < common_nets.size(); i += num_threads) {
+            const std::string& net_name = common_nets[i];
+            auto& net1 = spef1.nets[net_name];
+            auto& net2 = spef2.nets[net_name];
+            
+            // Capacitance comparison
+            local_caps.push_back({net_name, net1.total_cap, net2.total_cap});
+            
+            // Resistance comparison
+            auto res1 = compute_driver_sink_resistances(net1);
+            auto res2 = compute_driver_sink_resistances(net2);
+            
+            // Find common sinks
+            std::vector<std::string> sinks1_vec, sinks2_vec;
+            for (const auto& [sink, _] : res1) sinks1_vec.push_back(sink);
+            for (const auto& [sink, _] : res2) sinks2_vec.push_back(sink);
+            std::sort(sinks1_vec.begin(), sinks1_vec.end());
+            std::sort(sinks2_vec.begin(), sinks2_vec.end());
+            
+            std::vector<std::string> common_sinks;
+            std::set_intersection(
+                sinks1_vec.begin(), sinks1_vec.end(),
+                sinks2_vec.begin(), sinks2_vec.end(),
+                std::back_inserter(common_sinks)
+            );
+            
+            for (const auto& sink : common_sinks) {
+                local_ress.push_back({
+                    net_name,
+                    net1.driver,
+                    sink,
+                    res1[sink],
+                    res2[sink]
+                });
+            }
+        }
+        
+        std::lock_guard<std::mutex> lock(result_mutex);
+        cap_rows_local.insert(cap_rows_local.end(), local_caps.begin(), local_caps.end());
+        res_rows_local.insert(res_rows_local.end(), local_ress.begin(), local_ress.end());
+    };
+    
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(worker, i);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    result.cap_rows = std::move(cap_rows_local);
+    result.res_rows = std::move(res_rows_local);
+    result.cap_count = result.cap_rows.size();
+    result.res_count = result.res_rows.size();
+    
+    // Compute correlations
+    if (result.cap_count > 0) {
+        std::vector<double> xs, ys;
+        xs.reserve(result.cap_count);
+        ys.reserve(result.cap_count);
+        for (const auto& row : result.cap_rows) {
+            xs.push_back(row.c1);
+            ys.push_back(row.c2);
+        }
+        auto corr = compute_pearson_correlation(xs, ys);
+        result.cap_correlation = corr.valid ? corr.pearson : 0.0;
+    }
+    
+    if (result.res_count > 0) {
+        std::vector<double> xs, ys;
+        xs.reserve(result.res_count);
+        ys.reserve(result.res_count);
+        for (const auto& row : result.res_rows) {
+            xs.push_back(row.r1);
+            ys.push_back(row.r2);
+        }
+        auto corr = compute_pearson_correlation(xs, ys);
+        result.res_correlation = corr.valid ? corr.pearson : 0.0;
+    }
+    
+    // Find top 10 cap deviations
+    std::vector<std::pair<double, size_t>> cap_dev_idx;
+    for (size_t i = 0; i < result.cap_rows.size(); ++i) {
+        double dev = std::abs(result.cap_rows[i].c1 - result.cap_rows[i].c2);
+        cap_dev_idx.push_back({dev, i});
+    }
+    std::nth_element(cap_dev_idx.begin(), cap_dev_idx.begin() + std::min((size_t)10, cap_dev_idx.size()),
+                     cap_dev_idx.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    
+    for (size_t i = 0; i < std::min((size_t)10, cap_dev_idx.size()); ++i) {
+        result.top_10_cap.push_back(result.cap_rows[cap_dev_idx[i].second]);
+    }
+    
+    // Find top 10 res deviations
+    std::vector<std::pair<double, size_t>> res_dev_idx;
+    for (size_t i = 0; i < result.res_rows.size(); ++i) {
+        double dev = std::abs(result.res_rows[i].r1 - result.res_rows[i].r2);
+        res_dev_idx.push_back({dev, i});
+    }
+    std::nth_element(res_dev_idx.begin(), res_dev_idx.begin() + std::min((size_t)10, res_dev_idx.size()),
+                     res_dev_idx.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    
+    for (size_t i = 0; i < std::min((size_t)10, res_dev_idx.size()); ++i) {
+        result.top_10_res.push_back(result.res_rows[res_dev_idx[i].second]);
+    }
+    
+    return result;
+}
+
+std::string summarize_comparison(const ComparisonResult& result) {
+    std::ostringstream oss;
+    oss << "=== SPEF RC Correlation Summary ===\n";
+    oss << "Common nets: " << result.common_nets.size() << "\n";
+    oss << "Cap rows: " << result.cap_count << ", Res rows: " << result.res_count << "\n";
+    oss << "Cap correlation (Pearson): " << result.cap_correlation << "\n";
+    oss << "Res correlation (Pearson): " << result.res_correlation << "\n";
+    oss << "\nTop 10 Cap Deviations:\n";
+    for (size_t i = 0; i < result.top_10_cap.size(); ++i) {
+        const auto& row = result.top_10_cap[i];
+        oss << "  " << row.net_name << ": " << row.c1 << " vs " << row.c2 
+            << " (delta=" << (row.c2 - row.c1) << ")\n";
+    }
+    oss << "\nTop 10 Res Deviations:\n";
+    for (size_t i = 0; i < result.top_10_res.size(); ++i) {
+        const auto& row = result.top_10_res[i];
+        oss << "  " << row.net_name << " / " << row.sink << ": " << row.r1 << " vs " << row.r2
+            << " (delta=" << (row.r2 - row.r1) << ")\n";
+    }
+    return oss.str();
+}
+
+// Parse multiple SPEF files in parallel using C++ threads
+std::vector<ParsedSpef> parse_spef_parallel(
+    const std::vector<std::string>& filepaths,
+    int num_threads
+) {
+    std::cout << "[parse_spef_parallel] Starting parallel parsing of " << filepaths.size() << " files with " << num_threads << " threads..." << std::endl;
+    size_t n = filepaths.size();
+    if (n == 0) return {};
+    
+    // Determine number of threads
+    if (num_threads <= 0) {
+        num_threads = std::thread::hardware_concurrency();
+        if (num_threads == 0) num_threads = 2;
+    }
+    if (num_threads > static_cast<int>(n)) {
+        num_threads = static_cast<int>(n);
+    }
+    
+    std::vector<ParsedSpef> results(n);
+    std::vector<std::thread> threads;
+    std::mutex print_mutex;
+    std::vector<double> elapsed_times(n, 0.0);
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            for (size_t i = t; i < n; i += num_threads) {
+                auto t_start = std::chrono::steady_clock::now();
+                results[i] = parse_spef(filepaths[i]);
+                auto t_end = std::chrono::steady_clock::now();
+                double elapsed = std::chrono::duration<double>(t_end - t_start).count();
+                elapsed_times[i] = elapsed;
+                {
+                    std::lock_guard<std::mutex> lock(print_mutex);
+                    std::cout << "[" << filepaths[i] << "] finished parsing "
+                              << results[i].nets.size() << " nets in " << elapsed << "s (C++/parallel, thread " << t << ")" << std::endl;
+                }
+            }
+        });
+    }
+
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    // Print summary
+    double total = 0.0;
+    for (size_t i = 0; i < n; ++i) total += elapsed_times[i];
+    std::cout << "[parse_spef_parallel] Parsed " << n << " files in total " << total << "s (sum of wall times)" << std::endl;
+    return results;
 }
