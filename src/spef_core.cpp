@@ -1576,3 +1576,256 @@ std::vector<ParsedSpef> parse_spef_parallel(
     std::cout << "[parse_spef_parallel] Parsed " << n << " files in total " << total << "s (sum of wall times)" << std::endl;
     return results;
 }
+
+// ============== NUMPY ARRAY EXPORT FOR FAST PLOTTING ==============
+
+PlotData export_plot_data(
+    ParsedSpef& spef1,
+    ParsedSpef& spef2,
+    int num_threads
+) {
+    PlotData result;
+    
+    if (num_threads <= 0) {
+        num_threads = std::thread::hardware_concurrency();
+        if (num_threads <= 0) num_threads = 4;
+    }
+    
+    // Find common nets
+    std::vector<std::string> common_nets;
+    for (const auto& [name, _] : spef1.nets) {
+        if (spef2.nets.find(name) != spef2.nets.end()) {
+            common_nets.push_back(name);
+        }
+    }
+    std::sort(common_nets.begin(), common_nets.end());
+    
+    size_t n_cap = common_nets.size();
+    result.cap_count = n_cap;
+    
+    // Use std::vector for temporary storage, then convert to numpy
+    std::vector<double> cap_c1_vec;
+    std::vector<double> cap_c2_vec;
+    cap_c1_vec.reserve(n_cap);
+    cap_c2_vec.reserve(n_cap);
+    result.cap_net_names.reserve(n_cap);
+    
+    std::vector<double> res_r1_vec;
+    std::vector<double> res_r2_vec;
+    res_r1_vec.reserve(n_cap * 4);
+    res_r2_vec.reserve(n_cap * 4);
+    std::vector<std::string> res_net_names;
+    std::vector<std::string> res_sink_names;
+    res_net_names.reserve(n_cap * 4);
+    res_sink_names.reserve(n_cap * 4);
+    
+    // Parallel processing
+    std::mutex result_mutex;
+    
+    auto worker = [&](int thread_id) {
+        std::vector<double> local_cap_c1;
+        std::vector<double> local_cap_c2;
+        std::vector<std::string> local_cap_names;
+        
+        std::vector<double> local_res_r1;
+        std::vector<double> local_res_r2;
+        std::vector<std::string> local_res_net_names;
+        std::vector<std::string> local_res_sink_names;
+        
+        local_cap_c1.reserve(n_cap / num_threads + 1);
+        local_cap_c2.reserve(n_cap / num_threads + 1);
+        local_cap_names.reserve(n_cap / num_threads + 1);
+        
+        for (size_t i = thread_id; i < common_nets.size(); i += num_threads) {
+            const std::string& net_name = common_nets[i];
+            auto& net1 = spef1.nets[net_name];
+            auto& net2 = spef2.nets[net_name];
+            
+            // Capacitance
+            local_cap_c1.push_back(net1.total_cap);
+            local_cap_c2.push_back(net2.total_cap);
+            local_cap_names.push_back(net_name);
+            
+            // Resistance
+            auto res1 = compute_driver_sink_resistances(net1);
+            auto res2 = compute_driver_sink_resistances(net2);
+            
+            // Find common sinks
+            std::vector<std::string> sinks1_vec, sinks2_vec;
+            for (const auto& [sink, _] : res1) sinks1_vec.push_back(sink);
+            for (const auto& [sink, _] : res2) sinks2_vec.push_back(sink);
+            std::sort(sinks1_vec.begin(), sinks1_vec.end());
+            std::sort(sinks2_vec.begin(), sinks2_vec.end());
+            
+            std::vector<std::string> common_sinks;
+            std::set_intersection(
+                sinks1_vec.begin(), sinks1_vec.end(),
+                sinks2_vec.begin(), sinks2_vec.end(),
+                std::back_inserter(common_sinks)
+            );
+            
+            for (const auto& sink : common_sinks) {
+                local_res_r1.push_back(res1[sink]);
+                local_res_r2.push_back(res2[sink]);
+                local_res_net_names.push_back(net_name);
+                local_res_sink_names.push_back(sink);
+            }
+        }
+        
+        // Copy to shared vectors
+        {
+            std::lock_guard<std::mutex> lock(result_mutex);
+            cap_c1_vec.insert(cap_c1_vec.end(), local_cap_c1.begin(), local_cap_c1.end());
+            cap_c2_vec.insert(cap_c2_vec.end(), local_cap_c2.begin(), local_cap_c2.end());
+            result.cap_net_names.insert(result.cap_net_names.end(), local_cap_names.begin(), local_cap_names.end());
+            
+            res_r1_vec.insert(res_r1_vec.end(), local_res_r1.begin(), local_res_r1.end());
+            res_r2_vec.insert(res_r2_vec.end(), local_res_r2.begin(), local_res_r2.end());
+            res_net_names.insert(res_net_names.end(), local_res_net_names.begin(), local_res_net_names.end());
+            res_sink_names.insert(res_sink_names.end(), local_res_sink_names.begin(), local_res_sink_names.end());
+        }
+    };
+    
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(worker, i);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    // Convert to numpy arrays with correct size
+    result.cap_c1 = py::array_t<double>(cap_c1_vec.size());
+    result.cap_c2 = py::array_t<double>(cap_c2_vec.size());
+    auto cap_c1_buf = result.cap_c1.request();
+    auto cap_c2_buf = result.cap_c2.request();
+    double* cap_c1_ptr = static_cast<double*>(cap_c1_buf.ptr);
+    double* cap_c2_ptr = static_cast<double*>(cap_c2_buf.ptr);
+    std::memcpy(cap_c1_ptr, cap_c1_vec.data(), cap_c1_vec.size() * sizeof(double));
+    std::memcpy(cap_c2_ptr, cap_c2_vec.data(), cap_c2_vec.size() * sizeof(double));
+    
+    result.res_count = res_r1_vec.size();
+    result.res_r1 = py::array_t<double>(res_r1_vec.size());
+    result.res_r2 = py::array_t<double>(res_r2_vec.size());
+    auto res_r1_buf = result.res_r1.request();
+    auto res_r2_buf = result.res_r2.request();
+    double* res_r1_ptr = static_cast<double*>(res_r1_buf.ptr);
+    double* res_r2_ptr = static_cast<double*>(res_r2_buf.ptr);
+    std::memcpy(res_r1_ptr, res_r1_vec.data(), res_r1_vec.size() * sizeof(double));
+    std::memcpy(res_r2_ptr, res_r2_vec.data(), res_r2_vec.size() * sizeof(double));
+    
+    result.res_net_names = std::move(res_net_names);
+    result.res_sink_names = std::move(res_sink_names);
+    
+    // Compute correlations
+    auto corr_c = compute_pearson_correlation(cap_c1_vec, cap_c2_vec);
+    result.cap_correlation = corr_c.valid ? corr_c.pearson : 0.0;
+    
+    if (result.res_count > 0) {
+        auto corr_r = compute_pearson_correlation(res_r1_vec, res_r2_vec);
+        result.res_correlation = corr_r.valid ? corr_r.pearson : 0.0;
+    }
+    
+    return result;
+}
+
+// Chunked comparison for large datasets
+ComparisonChunk compare_spef_chunk(
+    ParsedSpef& spef1,
+    ParsedSpef& spef2,
+    size_t start_idx,
+    size_t chunk_size,
+    int num_threads
+) {
+    ComparisonChunk chunk;
+    
+    if (num_threads <= 0) {
+        num_threads = std::thread::hardware_concurrency();
+        if (num_threads <= 0) num_threads = 4;
+    }
+    
+    // Find common nets
+    std::vector<std::string> common_nets;
+    for (const auto& [name, _] : spef1.nets) {
+        if (spef2.nets.find(name) != spef2.nets.end()) {
+            common_nets.push_back(name);
+        }
+    }
+    std::sort(common_nets.begin(), common_nets.end());
+    
+    size_t total_nets = common_nets.size();
+    size_t end_idx = std::min(start_idx + chunk_size, total_nets);
+    chunk.is_last = (end_idx >= total_nets);
+    
+    // Process only the chunk
+    std::vector<CapComparisonData> local_caps;
+    std::vector<ResComparisonData> local_ress;
+    local_caps.reserve(chunk_size);
+    local_ress.reserve(chunk_size * 4);
+    
+    for (size_t i = start_idx; i < end_idx; ++i) {
+        const std::string& net_name = common_nets[i];
+        auto& net1 = spef1.nets[net_name];
+        auto& net2 = spef2.nets[net_name];
+        
+        local_caps.push_back({net_name, net1.total_cap, net2.total_cap});
+        
+        auto res1 = compute_driver_sink_resistances(net1);
+        auto res2 = compute_driver_sink_resistances(net2);
+        
+        std::vector<std::string> sinks1_vec, sinks2_vec;
+        for (const auto& [sink, _] : res1) sinks1_vec.push_back(sink);
+        for (const auto& [sink, _] : res2) sinks2_vec.push_back(sink);
+        std::sort(sinks1_vec.begin(), sinks1_vec.end());
+        std::sort(sinks2_vec.begin(), sinks2_vec.end());
+        
+        std::vector<std::string> common_sinks;
+        std::set_intersection(
+            sinks1_vec.begin(), sinks1_vec.end(),
+            sinks2_vec.begin(), sinks2_vec.end(),
+            std::back_inserter(common_sinks)
+        );
+        
+        for (const auto& sink : common_sinks) {
+            local_ress.push_back({net_name, net1.driver, sink, res1[sink], res2[sink]});
+        }
+    }
+    
+    // Convert to numpy arrays
+    size_t n_cap = local_caps.size();
+    size_t n_res = local_ress.size();
+    
+    chunk.cap_c1 = py::array_t<double>(n_cap);
+    chunk.cap_c2 = py::array_t<double>(n_cap);
+    auto c1_buf = chunk.cap_c1.request();
+    auto c2_buf = chunk.cap_c2.request();
+    double* c1_ptr = static_cast<double*>(c1_buf.ptr);
+    double* c2_ptr = static_cast<double*>(c2_buf.ptr);
+    
+    chunk.res_r1 = py::array_t<double>(n_res);
+    chunk.res_r2 = py::array_t<double>(n_res);
+    auto r1_buf = chunk.res_r1.request();
+    auto r2_buf = chunk.res_r2.request();
+    double* r1_ptr = static_cast<double*>(r1_buf.ptr);
+    double* r2_ptr = static_cast<double*>(r2_buf.ptr);
+    
+    chunk.cap_net_names.reserve(n_cap);
+    chunk.res_net_names.reserve(n_res);
+    chunk.res_sink_names.reserve(n_res);
+    
+    for (size_t i = 0; i < n_cap; ++i) {
+        c1_ptr[i] = local_caps[i].c1;
+        c2_ptr[i] = local_caps[i].c2;
+        chunk.cap_net_names.push_back(local_caps[i].net_name);
+    }
+    
+    for (size_t i = 0; i < n_res; ++i) {
+        r1_ptr[i] = local_ress[i].r1;
+        r2_ptr[i] = local_ress[i].r2;
+        chunk.res_net_names.push_back(local_ress[i].net_name);
+        chunk.res_sink_names.push_back(local_ress[i].sink);
+    }
+    
+    return chunk;
+}

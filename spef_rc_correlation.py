@@ -433,20 +433,19 @@ def main() -> None:
     # Normal SPEF mode
     if args.spef1 and args.spef2:
         if args.gui_auto_run:
-            # 先解析 SPEF 并自动比对，结果传递给 GUI
+            # Use numpy export for maximum performance with large datasets
             s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
-            result = spef_core.compare_spef_full(s1._cpp_spef, s2._cpp_spef, args.threads)
-            caps = [CapComparison(c.net_name, c.c1, c.c2) for c in result.cap_rows]
-            ress = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.res_rows]
+            plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads)
             launch_gui(
                 preload_paths=None,
                 auto_run=True,
-                preload_caps=caps,
-                preload_ress=ress,
+                preload_caps=None,
+                preload_ress=None,
                 preload_spef_objs=[
                     (os.path.splitext(os.path.basename(args.spef1))[0], s1),
                     (os.path.splitext(os.path.basename(args.spef2))[0], s2)
-                ]
+                ],
+                preload_cpp_result=plot_data  # Pass PlotData with numpy arrays
             )
             return
         elif args.gui:
@@ -554,7 +553,8 @@ def launch_gui(
     preload_res_data: Optional[str] = None,
     preload_caps: Optional[List[CapComparison]] = None,
     preload_ress: Optional[List[ResComparison]] = None,
-    preload_spef_objs: Optional[list] = None
+    preload_spef_objs: Optional[list] = None,
+    preload_cpp_result: Optional[object] = None
 ) -> None:
     """Launch interactive GUI."""
 
@@ -563,19 +563,21 @@ def launch_gui(
         return
 
     root = tk.Tk()
-    RcCorrApp(root, preload_paths, auto_run, preload_cap_data, preload_res_data, preload_caps, preload_ress, preload_spef_objs)
+    RcCorrApp(root, preload_paths, auto_run, preload_cap_data, preload_res_data, preload_caps, preload_ress, preload_spef_objs, preload_cpp_result)
     root.mainloop()
 
 
 class RcCorrApp:
     def __init__(self, root, preload_paths=None, auto_run=False,
                  preload_cap_data=None, preload_res_data=None,
-                 preload_caps=None, preload_ress=None, preload_spef_objs=None):
+                 preload_caps=None, preload_ress=None, preload_spef_objs=None,
+                 preload_cpp_result=None):
         self.root = root
         self.root.title("SPEF RC Correlation")
         self.spefs: Dict[str, SpefFile] = {}
         self._data_caps: List[CapComparison] = []
         self._data_ress: List[ResComparison] = []
+        self._cpp_result = preload_cpp_result  # Keep C++ result directly
         self.ref_var = tk.StringVar()
         self.fit_var = tk.StringVar()
         self.r_agg_var = tk.StringVar(value="max")
@@ -1067,6 +1069,15 @@ class RcCorrApp:
             return
         self._update_plot()
     def _auto_run(self) -> None:
+        # If preloaded C++ result (PlotData) exists, use it directly
+        if self._cpp_result is not None:
+            self._update_plot()
+            return
+        # If preloaded caps/ress exist, just plot them
+        if self._data_caps or self._data_ress:
+            self._update_plot()
+            return
+        # Otherwise run analysis from SPEF objects
         names = list(self.spefs.keys())
         if len(names) >= 2:
             self.ref_var.set(names[0])
@@ -1076,7 +1087,13 @@ class RcCorrApp:
     def _update_plot(self) -> None:
         self.ax_c.clear()
         self.ax_r.clear()
-        # 过滤数据
+        
+        # If C++ result exists, extract data directly without Python conversion
+        if self._cpp_result is not None:
+            self._update_plot_from_cpp()
+            return
+        
+        # Original logic: use Python CapComparison/ResComparison objects
         flt = self._parse_filters()
         points_cap = []
         for c in self._data_caps:
@@ -1163,6 +1180,218 @@ class RcCorrApp:
             self.ax_r.set_xlabel(f"{ref_name} R")
             self.ax_r.set_ylabel(f"{fit_name} R")
             self.ax_r.grid(True, alpha=0.3)
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def _update_plot_from_cpp(self) -> None:
+        """Extract data directly from C++ result - handles both ComparisonResult and PlotData."""
+        result = self._cpp_result
+        flt = self._parse_filters()
+        
+        # Check if this is PlotData (has numpy arrays) or ComparisonResult
+        if hasattr(result, 'cap_c1') and hasattr(result, 'cap_count'):
+            # PlotData - use numpy arrays directly (fastest)
+            self._update_plot_from_plotdata(result, flt)
+            return
+        
+        # Original ComparisonResult logic
+        points_cap = []
+        for cap_row in result.cap_rows:
+            p = {"net": cap_row.net_name, "c_ref": cap_row.c1, "c_fit": cap_row.c2, "fanout": 0}
+            points_cap.append(p)
+        
+        # Extract resistance data directly from C++ objects
+        points_res = []
+        for res_row in result.res_rows:
+            p = {"net": res_row.net_name, "driver": res_row.driver, "load": res_row.sink,
+                 "r_ref": res_row.r1, "r_fit": res_row.r2, "fanout": 0}
+            points_res.append(p)
+        
+        # Fanout from SPEF objects (if available)
+        if hasattr(self, "spefs") and self.spefs:
+            ref_name = self.ref_var.get()
+            ref = self.spefs.get(ref_name)
+            if ref and hasattr(ref, '_cpp_spef') and ref._cpp_spef is not None:
+                cpp_nets = ref._cpp_spef.nets
+                for p in points_cap:
+                    net = p["net"]
+                    if net in cpp_nets:
+                        p["fanout"] = len(cpp_nets[net].sinks)
+                for p in points_res:
+                    net = p["net"]
+                    if net in cpp_nets:
+                        p["fanout"] = len(cpp_nets[net].sinks)
+        
+        # Apply filters
+        if flt:
+            points_cap = [p for p in points_cap if self._passes_filters(p, flt)]
+            points_res = [p for p in points_res if self._passes_filters(p, flt)]
+        
+        self._cache_plot_arrays(points_cap, points_res)
+        
+        # Capacitance plot
+        xs = [p["c_ref"] for p in points_cap]
+        ys = [p["c_fit"] for p in points_cap]
+        ref_name = self.ref_var.get() if hasattr(self, "ref_var") and self.ref_var.get() else "tool1"
+        fit_name = self.fit_var.get() if hasattr(self, "fit_var") and self.fit_var.get() else "tool2"
+        
+        if xs and ys:
+            min_c = min(xs + ys)
+            max_c = max(xs + ys)
+            span_c = max_c - min_c or 1.0
+            pad_c = 0.05 * span_c
+            vmin_c = min_c - pad_c
+            vmax_c = max_c + pad_c
+            colors_c = ["red" if y > x else "blue" for x, y in zip(xs, ys)]
+            self.ax_c.plot([vmin_c, vmax_c], [vmin_c, vmax_c], "k--", linewidth=1.0)
+            red_idxs = [i for i, c in enumerate(colors_c) if c == "red"]
+            blue_idxs = [i for i, c in enumerate(colors_c) if c == "blue"]
+            if red_idxs:
+                self.ax_c.plot([xs[i] for i in red_idxs], [ys[i] for i in red_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="red", alpha=0.6)
+            if blue_idxs:
+                self.ax_c.plot([xs[i] for i in blue_idxs], [ys[i] for i in blue_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
+            self.ax_c.set_xlim(vmin_c, vmax_c)
+            self.ax_c.set_ylim(vmin_c, vmax_c)
+            corr = pearson_corr(xs, ys)
+            title_c = f"Total C: {ref_name} (X) vs {fit_name} (Y)"
+            if corr is not None:
+                title_c += f"  (corr={corr:.4f})"
+            self.ax_c.set_title(title_c)
+            self.ax_c.set_xlabel(f"{ref_name} C")
+            self.ax_c.set_ylabel(f"{fit_name} C")
+            self.ax_c.grid(True, alpha=0.3)
+        
+        # Resistance plot
+        xs_r = [p["r_ref"] for p in points_res]
+        ys_r = [p["r_fit"] for p in points_res]
+        if xs_r and ys_r:
+            min_r = min(xs_r + ys_r)
+            max_r = max(xs_r + ys_r)
+            span_r = max_r - min_r or 1.0
+            pad_r = 0.05 * span_r
+            vmin_r = min_r - pad_r
+            vmax_r = max_r + pad_r
+            colors_r = ["red" if y > x else "blue" for x, y in zip(xs_r, ys_r)]
+            self.ax_r.plot([vmin_r, vmax_r], [vmin_r, vmax_r], "k--", linewidth=1.0)
+            red_idxs_r = [i for i, c in enumerate(colors_r) if c == "red"]
+            blue_idxs_r = [i for i, c in enumerate(colors_r) if c == "blue"]
+            if red_idxs_r:
+                self.ax_r.plot([xs_r[i] for i in red_idxs_r], [ys_r[i] for i in red_idxs_r], "o", markersize=2, markerfacecolor="none", markeredgecolor="red", alpha=0.6)
+            if blue_idxs_r:
+                self.ax_r.plot([xs_r[i] for i in blue_idxs_r], [ys_r[i] for i in blue_idxs_r], "o", markersize=2, markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
+            self.ax_r.set_xlim(vmin_r, vmax_r)
+            self.ax_r.set_ylim(vmin_r, vmax_r)
+            corr_r = pearson_corr(xs_r, ys_r)
+            title_r = f"Driver->sink R: {ref_name} (X) vs {fit_name} (Y)"
+            if corr_r is not None:
+                title_r += f"  (corr={corr_r:.4f})"
+            self.ax_r.set_title(title_r)
+            self.ax_r.set_xlabel(f"{ref_name} R")
+            self.ax_r.set_ylabel(f"{fit_name} R")
+            self.ax_r.grid(True, alpha=0.3)
+        
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def _update_plot_from_plotdata(self, plot_data, flt) -> None:
+        """Fast plotting using numpy arrays from C++ - optimized for 1M+ nets."""
+        try:
+            import numpy as np
+        except ImportError:
+            # Fallback to original method
+            self._update_plot_from_cpp_fallback()
+            return
+        
+        # Get numpy arrays directly (no Python loop overhead!)
+        cap_c1 = np.asarray(plot_data.cap_c1)
+        cap_c2 = np.asarray(plot_data.cap_c2)
+        res_r1 = np.asarray(plot_data.res_r1)
+        res_r2 = np.asarray(plot_data.res_r2)
+        
+        ref_name = self.ref_var.get() if hasattr(self, "ref_var") and self.ref_var.get() else "tool1"
+        fit_name = self.fit_var.get() if hasattr(self, "fit_var") and self.fit_var.get() else "tool2"
+        
+        # Capacitance plot - vectorized operations
+        if len(cap_c1) > 0:
+            # Compute min/max (vectorized)
+            min_c = float(np.minimum(cap_c1.min(), cap_c2.min()))
+            max_c = float(np.maximum(cap_c1.max(), cap_c2.max()))
+            span_c = max_c - min_c or 1.0
+            pad_c = 0.05 * span_c
+            vmin_c = min_c - pad_c
+            vmax_c = max_c + pad_c
+            
+            # Vectorized color computation
+            red_mask = cap_c2 > cap_c1
+            
+            self.ax_c.plot([vmin_c, vmax_c], [vmin_c, vmax_c], "k--", linewidth=1.0)
+            
+            # Plot red points
+            if np.any(red_mask):
+                self.ax_c.plot(cap_c1[red_mask], cap_c2[red_mask], "o", markersize=2, 
+                             markerfacecolor="none", markeredgecolor="red", alpha=0.6)
+            
+            # Plot blue points
+            if np.any(~red_mask):
+                self.ax_c.plot(cap_c1[~red_mask], cap_c2[~red_mask], "o", markersize=2,
+                             markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
+            
+            self.ax_c.set_xlim(vmin_c, vmax_c)
+            self.ax_c.set_ylim(vmin_c, vmax_c)
+            
+            # Correlation from C++ (already computed)
+            corr = plot_data.cap_correlation
+            title_c = f"Total C: {ref_name} (X) vs {fit_name} (Y)"
+            if corr:
+                title_c += f"  (corr={corr:.4f})"
+            self.ax_c.set_title(title_c)
+            self.ax_c.set_xlabel(f"{ref_name} C")
+            self.ax_c.set_ylabel(f"{fit_name} C")
+            self.ax_c.grid(True, alpha=0.3)
+            
+            # Cache for kd-tree (if available)
+            self._xs_c = cap_c1
+            self._ys_c = cap_c2
+            self._cap_points = list(zip(cap_c1.tolist(), cap_c2.tolist()))
+        
+        # Resistance plot - vectorized operations
+        if len(res_r1) > 0:
+            min_r = float(np.minimum(res_r1.min(), res_r2.min()))
+            max_r = float(np.maximum(res_r1.max(), res_r2.max()))
+            span_r = max_r - min_r or 1.0
+            pad_r = 0.05 * span_r
+            vmin_r = min_r - pad_r
+            vmax_r = max_r + pad_r
+            
+            red_mask_r = res_r2 > res_r1
+            
+            self.ax_r.plot([vmin_r, vmax_r], [vmin_r, vmax_r], "k--", linewidth=1.0)
+            
+            if np.any(red_mask_r):
+                self.ax_r.plot(res_r1[red_mask_r], res_r2[red_mask_r], "o", markersize=2,
+                              markerfacecolor="none", markeredgecolor="red", alpha=0.6)
+            
+            if np.any(~red_mask_r):
+                self.ax_r.plot(res_r1[~red_mask_r], res_r2[~red_mask_r], "o", markersize=2,
+                              markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
+            
+            self.ax_r.set_xlim(vmin_r, vmax_r)
+            self.ax_r.set_ylim(vmin_r, vmax_r)
+            
+            corr_r = plot_data.res_correlation
+            title_r = f"Driver->sink R: {ref_name} (X) vs {fit_name} (Y)"
+            if corr_r:
+                title_r += f"  (corr={corr_r:.4f})"
+            self.ax_r.set_title(title_r)
+            self.ax_r.set_xlabel(f"{ref_name} R")
+            self.ax_r.set_ylabel(f"{fit_name} R")
+            self.ax_r.grid(True, alpha=0.3)
+            
+            # Cache for kd-tree
+            self._xs_r = res_r1
+            self._ys_r = res_r2
+            self._res_points = list(zip(res_r1.tolist(), res_r2.tolist()))
+        
         self.fig.tight_layout()
         self.canvas.draw()
 

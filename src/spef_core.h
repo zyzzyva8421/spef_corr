@@ -195,4 +195,53 @@ std::vector<ParsedSpef> parse_spef_parallel(
     int num_threads = 0
 );
 
+// ============== NUMPY ARRAY EXPORT FOR FAST PLOTTING ==============
+// Export comparison results as numpy arrays - avoids Python loop overhead
+
+struct PlotData {
+    // Capacitance data (num_nets x 1)
+    py::array_t<double> cap_c1;
+    py::array_t<double> cap_c2;
+    std::vector<std::string> cap_net_names;
+    
+    // Resistance data (num_driver_sink_pairs x 1)
+    py::array_t<double> res_r1;
+    py::array_t<double> res_r2;
+    std::vector<std::string> res_net_names;
+    std::vector<std::string> res_sink_names;
+    
+    // Correlation values
+    double cap_correlation;
+    double res_correlation;
+    size_t cap_count;
+    size_t res_count;
+};
+
+PlotData export_plot_data(
+    ParsedSpef& spef1,
+    ParsedSpef& spef2,
+    int num_threads = 0
+);
+
+// Chunked comparison for very large datasets (1M+ nets)
+// Returns results in batches to avoid memory issues
+struct ComparisonChunk {
+    py::array_t<double> cap_c1;
+    py::array_t<double> cap_c2;
+    py::array_t<double> res_r1;
+    py::array_t<double> res_r2;
+    std::vector<std::string> cap_net_names;
+    std::vector<std::string> res_net_names;
+    std::vector<std::string> res_sink_names;
+    bool is_last;
+};
+
+ComparisonChunk compare_spef_chunk(
+    ParsedSpef& spef1,
+    ParsedSpef& spef2,
+    size_t start_idx,
+    size_t chunk_size,
+    int num_threads = 0
+);
+
 #endif // SPEF_CORE_H

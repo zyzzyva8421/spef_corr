@@ -157,4 +157,48 @@ PYBIND11_MODULE(spef_core, m) {
           "Parse multiple SPEF files in parallel using C++ threads",
           py::arg("filepaths"),
           py::arg("num_threads") = 0);
+    
+    // ============== New functions for large dataset optimization ==============
+    
+    // PlotData struct bindings
+    py::class_<PlotData>(m, "PlotData")
+        .def(py::init<>())
+        .def_readwrite("cap_c1", &PlotData::cap_c1)
+        .def_readwrite("cap_c2", &PlotData::cap_c2)
+        .def_readwrite("cap_net_names", &PlotData::cap_net_names)
+        .def_readwrite("res_r1", &PlotData::res_r1)
+        .def_readwrite("res_r2", &PlotData::res_r2)
+        .def_readwrite("res_net_names", &PlotData::res_net_names)
+        .def_readwrite("res_sink_names", &PlotData::res_sink_names)
+        .def_readwrite("cap_correlation", &PlotData::cap_correlation)
+        .def_readwrite("res_correlation", &PlotData::res_correlation)
+        .def_readwrite("cap_count", &PlotData::cap_count)
+        .def_readwrite("res_count", &PlotData::res_count);
+    
+    // ComparisonChunk struct bindings
+    py::class_<ComparisonChunk>(m, "ComparisonChunk")
+        .def(py::init<>())
+        .def_readwrite("cap_c1", &ComparisonChunk::cap_c1)
+        .def_readwrite("cap_c2", &ComparisonChunk::cap_c2)
+        .def_readwrite("res_r1", &ComparisonChunk::res_r1)
+        .def_readwrite("res_r2", &ComparisonChunk::res_r2)
+        .def_readwrite("cap_net_names", &ComparisonChunk::cap_net_names)
+        .def_readwrite("res_net_names", &ComparisonChunk::res_net_names)
+        .def_readwrite("res_sink_names", &ComparisonChunk::res_sink_names)
+        .def_readwrite("is_last", &ComparisonChunk::is_last);
+    
+    // New optimized functions
+    m.def("export_plot_data", &export_plot_data,
+          "Export comparison results as numpy arrays for fast plotting",
+          py::arg("spef1"),
+          py::arg("spef2"),
+          py::arg("num_threads") = 0);
+    
+    m.def("compare_spef_chunk", &compare_spef_chunk,
+          "Compare SPEF files in chunks for large datasets",
+          py::arg("spef1"),
+          py::arg("spef2"),
+          py::arg("start_idx"),
+          py::arg("chunk_size"),
+          py::arg("num_threads") = 0);
 }
