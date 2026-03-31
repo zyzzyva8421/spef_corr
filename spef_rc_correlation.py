@@ -610,39 +610,51 @@ class RcCorrApp:
             self._auto_run_requested = False
 
     def _init_annot(self, ax):
-        annot = ax.annotate(
-            "",
-            xy=(0, 0),
-            xytext=(15, 15),
-            textcoords="offset points",
-            bbox=dict(boxstyle="round,pad=0.4", fc="#ffffcc", ec="gray", alpha=0.95, linewidth=0.8),
-            arrowprops=dict(arrowstyle="->", color="gray"),
-            fontsize=8,
-            fontfamily="monospace",
-        )
-        annot.set_visible(False)
-        return annot
+        # For Tkinter backend, use a separate Toplevel window as tooltip instead of matplotlib annotation
+        self._tooltip_window = None
+        self._tooltip_label = None
+        # Return a dummy annot for compatibility
+        return None
 
     def _cache_plot_arrays(self, points_cap, points_res):
         try:
             import numpy as np
         except ImportError:
             self._xs_c = self._ys_c = self._xs_r = self._ys_r = None
+            self._kd_c = self._kd_r = None
             return
+        # Check if scipy is available for kd-tree optimization
+        try:
+            from scipy.spatial import cKDTree
+            HAS_CKD = True
+        except ImportError:
+            HAS_CKD = False
         if points_cap:
             self._xs_c = np.array([p["c_ref"] for p in points_cap])
             self._ys_c = np.array([p["c_fit"] for p in points_cap])
             self._cap_points = points_cap
+            # Build kd-tree for fast nearest neighbor search with large datasets
+            if HAS_CKD and len(points_cap) > 100000:
+                self._kd_c = cKDTree(np.column_stack((self._xs_c, self._ys_c)))
+            else:
+                self._kd_c = None
         else:
             self._xs_c = self._ys_c = None
             self._cap_points = []
+            self._kd_c = None
         if points_res:
             self._xs_r = np.array([p["r_ref"] for p in points_res])
             self._ys_r = np.array([p["r_fit"] for p in points_res])
             self._res_points = points_res
+            # Build kd-tree for fast nearest neighbor search with large datasets
+            if HAS_CKD and len(points_res) > 100000:
+                self._kd_r = cKDTree(np.column_stack((self._xs_r, self._ys_r)))
+            else:
+                self._kd_r = None
         else:
             self._xs_r = self._ys_r = None
             self._res_points = []
+            self._kd_r = None
 
     def _fmt_hover(self, v):
         av = abs(v)
@@ -660,16 +672,10 @@ class RcCorrApp:
         if not hasattr(self, "_cap_points") or not hasattr(self, "_res_points"):
             return
         ax = event.inaxes
-        changed = False
         if ax not in (self.ax_c, self.ax_r):
-            if hasattr(self, "annot_c") and self.annot_c.get_visible():
-                self.annot_c.set_visible(False)
-                changed = True
-            if hasattr(self, "annot_r") and self.annot_r.get_visible():
-                self.annot_r.set_visible(False)
-                changed = True
-            if changed:
-                self.canvas.draw_idle()
+            # Hide tooltip when mouse leaves axes
+            if hasattr(self, '_tooltip_window') and self._tooltip_window is not None:
+                self._hide_tooltip()
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -678,65 +684,128 @@ class RcCorrApp:
             xs_arr = self._xs_c
             ys_arr = self._ys_c
             points = self._cap_points
-            annot = self.annot_c
+            kd_tree = getattr(self, "_kd_c", None)
         elif ax is self.ax_r and self._xs_r is not None and len(self._xs_r):
             xs_arr = self._xs_r
             ys_arr = self._ys_r
             points = self._res_points
-            annot = self.annot_r
+            kd_tree = getattr(self, "_kd_r", None)
         else:
             return
         transform = ax.transData.transform
         mouse_px = transform([[event.xdata, event.ydata]])[0]
-        data_pts = np.column_stack((xs_arr, ys_arr))
-        px_pts = transform(data_pts)
-        dx = px_pts[:, 0] - mouse_px[0]
-        dy = px_pts[:, 1] - mouse_px[1]
-        d2 = dx * dx + dy * dy
-        best_i = int(np.argmin(d2))
-        if d2[best_i] < 400:
-            p = points[best_i]
-            fmt = self._fmt_hover
-            if ax is self.ax_c:
-                ref_v = p["c_ref"]
-                fit_v = p["c_fit"]
-                delta = fit_v - ref_v
-                ratio = fit_v / ref_v if ref_v != 0 else float('inf')
-                text = (
-                    f"net: {p['net']}\n"
-                    f"C_ref : {fmt(ref_v)}\n"
-                    f"C_fit : {fmt(fit_v)}\n"
-                    f"delta : {fmt(delta)}\n"
-                    f"ratio : {ratio:.4f}"
-                )
-                if "fanout" in p:
-                    text += f"\nfanout: {int(p['fanout'])}"
-            else:
-                ref_v = p["r_ref"]
-                fit_v = p["r_fit"]
-                delta = fit_v - ref_v
-                ratio = fit_v / ref_v if ref_v != 0 else float('inf')
-                text = (
-                    f"net: {p['net']}\n"
-                    f"driver: {p.get('driver','')}\n"
-                    f"load: {p.get('load','')}\n"
-                    f"R_ref : {fmt(ref_v)}\n"
-                    f"R_fit : {fmt(fit_v)}\n"
-                    f"delta : {fmt(delta)}\n"
-                    f"ratio : {ratio:.4f}"
-                )
-                if "fanout" in p:
-                    text += f"\nfanout: {int(p['fanout'])}"
-            annot.xy = (xs_arr[best_i], ys_arr[best_i])
-            annot.set_text(text)
-            annot.set_visible(True)
-            changed = True
+        # Use kd-tree for fast lookup if available (for large datasets)
+        if kd_tree is not None:
+            dist, best_i = kd_tree.query([event.xdata, event.ydata])
+            # dist is Euclidean distance in data units
+            # Use a threshold based on data coordinate scale
+            # Convert ~20 pixel radius to data units
+            inv_transform = transform.inverted()
+            # Get data coordinates at two points 20 pixels apart in x
+            p1 = inv_transform([[event.xdata, event.ydata]])[0]
+            p2 = inv_transform([[event.xdata + 20, event.ydata]])[0]
+            data_threshold = abs(p2[0] - p1[0])
+            if dist < data_threshold:
+                self._show_annotation(event, ax, xs_arr, ys_arr, points, best_i, kd_tree)
+                return
         else:
-            if annot.get_visible():
-                annot.set_visible(False)
-                changed = True
-        if changed:
-            self.canvas.draw_idle()
+            data_pts = np.column_stack((xs_arr, ys_arr))
+            px_pts = transform(data_pts)
+            dx = px_pts[:, 0] - mouse_px[0]
+            dy = px_pts[:, 1] - mouse_px[1]
+            d2 = dx * dx + dy * dy
+            best_i = int(np.argmin(d2))
+            # d2 is in pixel^2, threshold is 20 pixel radius -> 400 pixel^2
+            if d2[best_i] < 400:
+                self._show_annotation(event, ax, xs_arr, ys_arr, points, best_i, None)
+                return
+        # Hide tooltip if no point is close enough
+        if hasattr(self, '_tooltip_window') and self._tooltip_window is not None:
+            self._hide_tooltip()
+
+    def _show_annotation(self, event, ax, xs_arr, ys_arr, points, best_i, kd_tree):
+        """Show tooltip using Tkinter."""
+        p = points[best_i]
+        fmt = self._fmt_hover
+        if ax is self.ax_c:
+            ref_v = p["c_ref"]
+            fit_v = p["c_fit"]
+            delta = fit_v - ref_v
+            ratio = fit_v / ref_v if ref_v != 0 else float('inf')
+            text = (
+                f"net: {p['net']}\n"
+                f"C_ref : {fmt(ref_v)}\n"
+                f"C_fit : {fmt(fit_v)}\n"
+                f"delta : {fmt(delta)}\n"
+                f"ratio : {ratio:.4f}"
+            )
+            if "fanout" in p:
+                text += f"\nfanout: {int(p['fanout'])}"
+        else:
+            ref_v = p["r_ref"]
+            fit_v = p["r_fit"]
+            delta = fit_v - ref_v
+            ratio = fit_v / ref_v if ref_v != 0 else float('inf')
+            text = (
+                f"net: {p['net']}\n"
+                f"driver: {p.get('driver','')}\n"
+                f"load: {p.get('load','')}\n"
+                f"R_ref : {fmt(ref_v)}\n"
+                f"R_fit : {fmt(fit_v)}\n"
+                f"delta : {fmt(delta)}\n"
+                f"ratio : {ratio:.4f}"
+            )
+            if "fanout" in p:
+                text += f"\nfanout: {int(p['fanout'])}"
+        # Show tooltip window
+        self._show_tooltip(event, text)
+
+    def _show_tooltip(self, event, text):
+        """Show a Tkinter tooltip window at mouse position."""
+        # Hide existing tooltip
+        self._hide_tooltip()
+        # Create tooltip window
+        self._tooltip_window = tk.Toplevel(self.root)
+        self._tooltip_window.wm_overrideredirect(True)  # No window border
+        self._tooltip_window.wm_geometry("+99999+99999")  # Start off-screen
+        # Add label
+        self._tooltip_label = tk.Label(
+            self._tooltip_window,
+            text=text,
+            background="#ffffcc",
+            foreground="black",
+            relief=tk.SOLID,
+            borderwidth=1,
+            font=("monospace", 9),
+            justify=tk.LEFT,
+            padx=5,
+            pady=5,
+        )
+        self._tooltip_label.pack()
+        # Get mouse position
+        x = self.root.winfo_pointerx() + 10
+        y = self.root.winfo_pointery() + 10
+        # Ensure it stays on screen
+        w = self._tooltip_label.winfo_reqwidth()
+        h = self._tooltip_label.winfo_reqheight()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        if x + w > screen_w:
+            x = screen_w - w - 10
+        if y + h > screen_h:
+            y = screen_h - h - 10
+        self._tooltip_window.wm_geometry(f"+{x}+{y}")
+        self._tooltip_window.lift()
+
+    def _hide_tooltip(self):
+        """Hide the tooltip window."""
+        if hasattr(self, '_tooltip_window') and self._tooltip_window is not None:
+            try:
+                self._tooltip_window.destroy()
+            except:
+                pass
+            self._tooltip_window = None
+            self._tooltip_label = None
 
     def _build_ui(self) -> None:
         # SPEF files frame
@@ -837,8 +906,6 @@ class RcCorrApp:
         self.canvas = FigureCanvasTkAgg(self.fig, master=pframe)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.fig.tight_layout()
-        self.annot_c = self._init_annot(self.ax_c)
-        self.annot_r = self._init_annot(self.ax_r)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
 
     def _parse_filters(self):
@@ -1048,9 +1115,15 @@ class RcCorrApp:
             pad_c = 0.05 * span_c
             vmin_c = min_c - pad_c
             vmax_c = max_c + pad_c
-            colors_c = ["tab:red" if y > x else "tab:blue" for x, y in zip(xs, ys)]
+            colors_c = ["red" if y > x else "blue" for x, y in zip(xs, ys)]
             self.ax_c.plot([vmin_c, vmax_c], [vmin_c, vmax_c], "k--", linewidth=1.0)
-            self.ax_c.scatter(xs, ys, c=colors_c, s=20, alpha=0.8)
+            # Plot red points first, then blue points
+            red_idxs = [i for i, c in enumerate(colors_c) if c == "red"]
+            blue_idxs = [i for i, c in enumerate(colors_c) if c == "blue"]
+            if red_idxs:
+                self.ax_c.plot([xs[i] for i in red_idxs], [ys[i] for i in red_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="red", alpha=0.6)
+            if blue_idxs:
+                self.ax_c.plot([xs[i] for i in blue_idxs], [ys[i] for i in blue_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
             self.ax_c.set_xlim(vmin_c, vmax_c)
             self.ax_c.set_ylim(vmin_c, vmax_c)
             corr = pearson_corr(xs, ys)
@@ -1071,9 +1144,15 @@ class RcCorrApp:
             pad_r = 0.05 * span_r
             vmin_r = min_r - pad_r
             vmax_r = max_r + pad_r
-            colors_r = ["tab:red" if y > x else "tab:blue" for x, y in zip(xs, ys)]
+            colors_r = ["red" if y > x else "blue" for x, y in zip(xs, ys)]
             self.ax_r.plot([vmin_r, vmax_r], [vmin_r, vmax_r], "k--", linewidth=1.0)
-            self.ax_r.scatter(xs, ys, c=colors_r, s=20, alpha=0.8)
+            # Plot red points first, then blue points
+            red_idxs = [i for i, c in enumerate(colors_r) if c == "red"]
+            blue_idxs = [i for i, c in enumerate(colors_r) if c == "blue"]
+            if red_idxs:
+                self.ax_r.plot([xs[i] for i in red_idxs], [ys[i] for i in red_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="red", alpha=0.6)
+            if blue_idxs:
+                self.ax_r.plot([xs[i] for i in blue_idxs], [ys[i] for i in blue_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
             self.ax_r.set_xlim(vmin_r, vmax_r)
             self.ax_r.set_ylim(vmin_r, vmax_r)
             corr = pearson_corr(xs, ys)
@@ -1102,8 +1181,15 @@ class RcCorrApp:
         dmin = min(diffs)
         dmax = max(diffs)
         counts, bin_edges = np.histogram(diffs, bins=n_bins)
+        # Center the x-axis on zero, not on the data range
         xmin = float(bin_edges[0])
         xmax = float(bin_edges[-1])
+        max_abs = max(abs(xmin), abs(xmax))
+        if max_abs == 0:
+            max_abs = 1.0  # Avoid zero range
+        x_range = max_abs * 1.1  # Add 10% padding
+        xmin = -x_range
+        xmax = x_range
         s1 = stddev
         s2 = 2.0 * stddev
         # Pink: beyond ±2σ
