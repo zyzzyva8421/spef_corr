@@ -168,7 +168,10 @@ std::vector<ResistanceResult> compute_batch_driver_sink_resistances(
     // Worker function for each thread
     auto worker = [&](int thread_id) {
         std::vector<ResistanceResult> local_results;
-        local_results.reserve(100);  // Pre-allocate
+        // Reserve a proportional share to avoid repeated reallocations.
+        // 4 sinks per net is a heuristic; actual fanout may vary.
+        size_t est = (net_count / num_threads + 1) * 4;
+        local_results.reserve(est);
         
         // Simple work distribution: each thread processes nets % num_threads == thread_id
         for (size_t i = thread_id; i < net_count; i += num_threads) {
@@ -297,52 +300,57 @@ void compare_spef_streaming(
     
     std::sort(common_nets.begin(), common_nets.end());
     
-    // Process in parallel
+    // Process in parallel: each thread accumulates results locally, then
+    // holds the callback mutex once to flush them.  This reduces lock
+    // contention from O(nets * sinks) acquires down to O(num_threads).
     std::mutex callback_mutex;
-    
+
     auto worker = [&](int thread_id) {
+        std::vector<CapComparisonData> local_caps;
+        std::vector<ResComparisonData> local_res;
+
         for (size_t i = thread_id; i < common_nets.size(); i += num_threads) {
             const auto& net_name = common_nets[i];
-            auto& net1 = spef1.nets[net_name];
-            auto& net2 = spef2.nets[net_name];
-            
-            // Capacitance comparison
-            {
-                std::lock_guard<std::mutex> lock(callback_mutex);
-                on_cap(CapComparisonData{net_name, net1.total_cap, net2.total_cap});
-            }
-            
+            // Use .at() instead of [] to avoid UB on concurrent non-const
+            // access to the shared unordered_map ([] can insert, which is
+            // not safe across threads even for different keys).
+            auto& net1 = spef1.nets.at(net_name);
+            auto& net2 = spef2.nets.at(net_name);
+
+            local_caps.push_back({net_name, net1.total_cap, net2.total_cap});
+
             // Resistance comparison
             auto res1 = compute_driver_sink_resistances(net1);
             auto res2 = compute_driver_sink_resistances(net2);
-            
+
             // Find common sinks by extracting keys
             std::vector<std::string> sinks1_vec, sinks2_vec;
-            for (const auto& [sink, _] : res1) {
-                sinks1_vec.push_back(sink);
-            }
-            for (const auto& [sink, _] : res2) {
-                sinks2_vec.push_back(sink);
-            }
-            
+            sinks1_vec.reserve(res1.size());
+            sinks2_vec.reserve(res2.size());
+            for (const auto& [sink, _] : res1) sinks1_vec.push_back(sink);
+            for (const auto& [sink, _] : res2) sinks2_vec.push_back(sink);
+
             std::sort(sinks1_vec.begin(), sinks1_vec.end());
             std::sort(sinks2_vec.begin(), sinks2_vec.end());
-            
+
             std::vector<std::string> common_sinks;
             std::set_intersection(
                 sinks1_vec.begin(), sinks1_vec.end(),
                 sinks2_vec.begin(), sinks2_vec.end(),
                 std::back_inserter(common_sinks)
             );
-            
+
             for (const auto& sink : common_sinks) {
-                {
-                    std::lock_guard<std::mutex> lock(callback_mutex);
-                    on_res(ResComparisonData{
-                        net_name, net1.driver, sink, res1[sink], res2[sink]
-                    });
-                }
+                local_res.push_back({net_name, net1.driver, sink,
+                                     res1[sink], res2[sink]});
             }
+        }
+
+        // Flush local results through the callbacks once per thread
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex);
+            for (const auto& cap : local_caps) on_cap(cap);
+            for (const auto& res : local_res) on_res(res);
         }
     };
     
@@ -474,6 +482,17 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 std::string token, net_id, net_name, total_cap_str;
                 iss >> token >> net_id >> total_cap_str;
                 
+                // Reserve map capacity on the first net, using name_map size
+                // as a proxy for total net count to avoid 1M+ rehashes.
+                if (net_count == 0 && !spef.name_map.empty()) {
+                    spef.nets.reserve(spef.name_map.size() * 5 / 4);
+                }
+
+                // *D_NET always ends the *NAME_MAP section.  Without this
+                // reset, *I/*O/*P CONN entries would be silently swallowed
+                // by the name_map handler for any net that follows the map.
+                in_name_map = false;
+
                 // Resolve net name
                 std::string resolved_name = net_id;
                 if (net_id[0] == '*') {
@@ -681,7 +700,287 @@ ParsedSpef parse_spef(const std::string& filepath) {
     return spef;
 }
 
-// ============== Shuffle Implementation ==============
+// ============== Parallel Single-File SPEF Parser ==============
+//
+// Two-phase strategy for 1M+ nets:
+//   Phase 1 (single-threaded, I/O-bound):
+//     - Read entire file into a vector<string> of lines.
+//     - Parse header directives (*_UNIT) and the *NAME_MAP section.
+//     - Record the [start, end) line-index range for every *D_NET..*END block.
+//   Phase 2 (multi-threaded, CPU-bound):
+//     - Divide the net-block list into contiguous chunks, one per thread.
+//     - Each thread independently parses its net blocks; name_map is
+//       accessed read-only so no synchronisation is needed.
+//     - Results are stored in a pre-sized vector (one slot per net block),
+//       so threads write to disjoint memory without any mutex.
+//   Phase 3 (single-threaded):
+//     - Move per-block NetData into the final ParsedSpef::nets map.
+//
+// Expected speedup over parse_spef(): roughly linear in num_threads for
+// files whose per-net parsing is the bottleneck (typically >~100 K nets).
+ParsedSpef parse_spef_mt(const std::string& filepath, int num_threads) {
+    if (num_threads <= 0) {
+        num_threads = static_cast<int>(std::thread::hardware_concurrency());
+        if (num_threads <= 0) num_threads = 4;
+    }
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    // ---- Phase 1: load file, parse header/name_map, find net boundaries ----
+    std::vector<std::string> all_lines;
+    all_lines.reserve(1 << 22);  // ~4.2M lines – enough for most large files
+    {
+        std::ifstream file(filepath);
+        if (!file.is_open())
+            throw std::runtime_error("Cannot open file: " + filepath);
+        std::string line;
+        while (std::getline(file, line))
+            all_lines.push_back(std::move(line));
+    }
+
+    ParsedSpef spef;
+    bool in_name_map = false;
+    bool r_is_kohm   = false;
+
+    struct Boundary { size_t start; size_t end; };
+    std::vector<Boundary> boundaries;
+    boundaries.reserve(1 << 20);  // ~1M nets (1,048,576 slots)
+
+    size_t cur_net_start = SIZE_MAX;
+
+    // Helper: trim a raw line and strip // comments; returns trimmed string_view
+    auto trimmed_code = [](const std::string& raw) -> std::string_view {
+        size_t s = 0;
+        while (s < raw.size() && (raw[s] == ' ' || raw[s] == '\t' || raw[s] == '\r')) ++s;
+        size_t e = raw.find("//", s);
+        if (e == std::string::npos) e = raw.size();
+        while (e > s && (raw[e-1] == ' ' || raw[e-1] == '\t' || raw[e-1] == '\r')) --e;
+        return std::string_view(raw.data() + s, e - s);
+    };
+
+    for (size_t li = 0; li < all_lines.size(); ++li) {
+        std::string_view code = trimmed_code(all_lines[li]);
+        if (code.empty()) continue;
+
+        if (code[0] == '*') {
+            if (code.find("*NAME_MAP") == 0) { in_name_map = true;  continue; }
+            if (code.find("*PORTS")    == 0) { in_name_map = false; continue; }
+            if (code.find("*D_NET")    == 0) { in_name_map = false; cur_net_start = li; continue; }
+            if (code.find("*END")      == 0) {
+                if (cur_net_start != SIZE_MAX) {
+                    boundaries.push_back({cur_net_start, li + 1});
+                    cur_net_start = SIZE_MAX;
+                }
+                continue;
+            }
+            // Unit directives
+            auto parse_unit_line = [&](std::string& dest) {
+                std::string code_str(code);
+                std::istringstream iss(code_str);
+                std::string tok, num, unit;
+                if (iss >> tok >> num >> unit) dest = unit;
+                in_name_map = false;
+            };
+            if (code.find("*R_UNIT") == 0) {
+                parse_unit_line(spef.r_unit);
+                r_is_kohm = (spef.r_unit == "KOHM");
+                continue;
+            }
+            if (code.find("*C_UNIT") == 0) { parse_unit_line(spef.c_unit); continue; }
+            if (code.find("*T_UNIT") == 0) { parse_unit_line(spef.t_unit); continue; }
+            if (code.find("*L_UNIT") == 0) { parse_unit_line(spef.l_unit); continue; }
+        }
+
+        if (in_name_map) {
+            if (!code.empty() && code[0] == '*') {
+                size_t sp = code.find(' ');
+                if (sp != std::string_view::npos) {
+                    std::string key(code.data(), sp);
+                    size_t vs = sp + 1;
+                    while (vs < code.size() && (code[vs] == ' ' || code[vs] == '\t')) ++vs;
+                    std::string value(code.data() + vs, code.size() - vs);
+                    if (key.size() >= 2 && key[1] >= '0' && key[1] <= '9' && !value.empty()) {
+                        value = strip_quotes(value);
+                        size_t pos;
+                        while ((pos = value.find("\\[")) != std::string::npos) value.replace(pos, 2, "[");
+                        while ((pos = value.find("\\]")) != std::string::npos) value.replace(pos, 2, "]");
+                        spef.name_map[key] = std::move(value);
+                    }
+                }
+            } else {
+                in_name_map = false;
+            }
+        }
+    }
+
+    size_t net_count = boundaries.size();
+    spef.nets.reserve(net_count * 5 / 4);
+
+    {
+        auto t1 = std::chrono::steady_clock::now();
+        std::cout << "[" << filepath << "] parse_spef_mt Phase 1: found "
+                  << net_count << " nets, name_map=" << spef.name_map.size()
+                  << " in " << std::chrono::duration<double>(t1 - t_start).count()
+                  << "s" << std::endl;
+    }
+
+    if (net_count == 0) return spef;
+
+    // ---- Phase 2: parallel per-net-block parsing ----
+    std::vector<NetData> net_results(net_count);
+
+    // Token resolver – name_map is read-only here so safe to call from threads
+    auto resolve_token = [&](const std::string& token) -> std::string {
+        if (token.empty()) return token;
+        std::string out = token;
+        if (out[0] == '*') {
+            size_t colon = out.find(':');
+            if (colon != std::string::npos) {
+                std::string base   = out.substr(0, colon);
+                std::string suffix = out.substr(colon);
+                auto it = spef.name_map.find(base);
+                if (it != spef.name_map.end()) out = it->second + suffix;
+            } else {
+                auto it = spef.name_map.find(out);
+                if (it != spef.name_map.end()) out = it->second;
+            }
+        }
+        size_t pos;
+        while ((pos = out.find("\\[")) != std::string::npos) out.replace(pos, 2, "[");
+        while ((pos = out.find("\\]")) != std::string::npos) out.replace(pos, 2, "]");
+        return out;
+    };
+
+    // Parse one net block (lines [start, end)) into net_results[block_idx]
+    auto parse_net_block = [&](size_t block_idx) {
+        const size_t start_li = boundaries[block_idx].start;
+        const size_t end_li   = boundaries[block_idx].end;
+        NetData& net = net_results[block_idx];
+
+        enum Section { SEC_NONE, SEC_CONN, SEC_CAP, SEC_RES };
+        Section section = SEC_NONE;
+
+        for (size_t li = start_li; li < end_li; ++li) {
+            const std::string& raw = all_lines[li];
+            if (raw.empty()) continue;
+
+            size_t s = raw.find_first_not_of(" \t\r\n");
+            if (s == std::string::npos) continue;
+
+            size_t cpos     = raw.find("//", s);
+            size_t code_end = (cpos != std::string::npos) ? cpos : raw.size();
+            while (code_end > s &&
+                   (raw[code_end-1]==' '||raw[code_end-1]=='\t'||raw[code_end-1]=='\r'))
+                --code_end;
+            if (s >= code_end) continue;
+
+            // Fast tokeniser (avoids istringstream overhead)
+            std::vector<std::string> tokens;
+            size_t p = s;
+            while (p < code_end) {
+                while (p < code_end && (raw[p]==' '||raw[p]=='\t')) ++p;
+                if (p >= code_end) break;
+                size_t q = p;
+                while (q < code_end && raw[q]!=' ' && raw[q]!='\t') ++q;
+                tokens.emplace_back(raw.data()+p, raw.data()+q);
+                p = q;
+            }
+            if (tokens.empty()) continue;
+
+            const std::string& t0 = tokens[0];
+
+            if (t0[0] == '*') {
+                if (t0 == "*D_NET" && tokens.size() >= 3) {
+                    net.name      = resolve_token(tokens[1]);
+                    net.total_cap = parse_float(tokens[2]);
+                    continue;
+                }
+                if (t0 == "*CONN") { section = SEC_CONN; continue; }
+                if (t0 == "*CAP")  { section = SEC_CAP;  continue; }
+                if (t0 == "*RES")  { section = SEC_RES;  continue; }
+                if (t0 == "*END")  { break; }
+                // *I / *P may appear before an explicit *CONN header
+                if ((t0 == "*I" || t0 == "*P") && section == SEC_NONE)
+                    section = SEC_CONN;
+                // fall through to CONN handler below
+            }
+
+            if (section == SEC_CONN && tokens.size() >= 3) {
+                std::string pin = resolve_token(tokens[1]);
+                std::string dir;
+                for (size_t i = 2; i < tokens.size(); i++) {
+                    if (!tokens[i].empty() &&
+                        (tokens[i][0]=='O'||tokens[i][0]=='B'||tokens[i][0]=='I')) {
+                        dir = tokens[i];
+                        break;
+                    }
+                }
+                if (!dir.empty() && (dir[0]=='O'||dir[0]=='B')) {
+                    if (net.driver.empty()) net.driver = pin;
+                } else if (!dir.empty() && dir[0]=='I') {
+                    net.sinks.push_back(pin);
+                }
+            } else if (section == SEC_RES && tokens.size() >= 4) {
+                try {
+                    std::stoi(tokens[0]);  // verify index token
+                    std::string node1 = resolve_token(tokens[1]);
+                    std::string node2 = resolve_token(tokens[2]);
+                    double rval = parse_float(tokens[3]);
+                    if (r_is_kohm) rval *= 1000.0;
+                    net.res_graph[node1].push_back({node2, rval});
+                    net.res_graph[node2].push_back({node1, rval});
+                } catch (...) {
+                    if (t0 == "*CAP")  section = SEC_CAP;
+                    else if (t0 == "*CONN") section = SEC_CONN;
+                    else if (t0 == "*END")  break;
+                }
+            }
+        }
+    };
+
+    if (num_threads > static_cast<int>(net_count))
+        num_threads = static_cast<int>(net_count);
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            // Contiguous chunk assignment gives better cache locality than
+            // the interleaved (round-robin) distribution.
+            size_t chunk      = (net_count + num_threads - 1) / num_threads;
+            size_t begin_idx  = static_cast<size_t>(t) * chunk;
+            size_t end_idx    = std::min(begin_idx + chunk, net_count);
+            for (size_t i = begin_idx; i < end_idx; ++i)
+                parse_net_block(i);
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    {
+        auto t2 = std::chrono::steady_clock::now();
+        std::cout << "[" << filepath << "] parse_spef_mt Phase 2: parallel parse done in "
+                  << std::chrono::duration<double>(t2 - t_start).count() << "s" << std::endl;
+    }
+
+    // ---- Phase 3: merge net_results into spef.nets ----
+    for (size_t i = 0; i < net_count; ++i) {
+        if (!net_results[i].name.empty()) {
+            // Move the name out first so it can be used as the map key
+            // without copying; the moved-from .name field is then discarded.
+            std::string key = std::move(net_results[i].name);
+            spef.nets.emplace(std::move(key), std::move(net_results[i]));
+        }
+    }
+
+    auto t_end2 = std::chrono::steady_clock::now();
+    std::cout << "[" << filepath << "] parse_spef_mt finished: "
+              << spef.nets.size() << " nets in "
+              << std::chrono::duration<double>(t_end2 - t_start).count()
+              << "s (C++/mt, " << num_threads << " threads)" << std::endl;
+    return spef;
+}
+
+
 void shuffle_spef(const std::string& input_path, const std::string& output_path, int seed) {
     std::srand(seed);
     
@@ -1396,8 +1695,9 @@ ComparisonResult compare_spef_full(
         
         for (size_t i = thread_id; i < common_nets.size(); i += num_threads) {
             const std::string& net_name = common_nets[i];
-            auto& net1 = spef1.nets[net_name];
-            auto& net2 = spef2.nets[net_name];
+            // .at() is safe for concurrent reads; operator[] is not (can insert)
+            auto& net1 = spef1.nets.at(net_name);
+            auto& net2 = spef2.nets.at(net_name);
             
             // Capacitance comparison
             local_caps.push_back({net_name, net1.total_cap, net2.total_cap});
@@ -1638,8 +1938,9 @@ PlotData export_plot_data(
         
         for (size_t i = thread_id; i < common_nets.size(); i += num_threads) {
             const std::string& net_name = common_nets[i];
-            auto& net1 = spef1.nets[net_name];
-            auto& net2 = spef2.nets[net_name];
+            // .at() is safe for concurrent reads; operator[] is not (can insert)
+            auto& net1 = spef1.nets.at(net_name);
+            auto& net2 = spef2.nets.at(net_name);
             
             // Capacitance
             local_cap_c1.push_back(net1.total_cap);

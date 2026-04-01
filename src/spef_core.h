@@ -21,6 +21,9 @@
 #include <mutex>
 #include <functional>
 #include <set>
+#include <chrono>
+#include <string_view>
+#include <atomic>
 
 namespace py = pybind11;
 
@@ -128,8 +131,16 @@ void compare_spef_streaming(
     int num_threads = 0
 );
 
-// Parse SPEF file - C++ optimized
+// Parse SPEF file - C++ optimized (single-threaded)
 ParsedSpef parse_spef(const std::string& filepath);
+
+// Parse SPEF file using two-phase parallel strategy for 1M+ nets:
+//   Phase 1 (single-threaded): read file into memory, parse header/NAME_MAP,
+//             locate every *D_NET..*END boundary.
+//   Phase 2 (multi-threaded):  parse each net block independently in parallel.
+//   Phase 3 (single-threaded): merge per-thread results into ParsedSpef.
+// num_threads <= 0 means use hardware_concurrency().
+ParsedSpef parse_spef_mt(const std::string& filepath, int num_threads = 0);
 
 // Shuffle net ID mapping
 void shuffle_spef(

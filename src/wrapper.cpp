@@ -81,7 +81,15 @@ PYBIND11_MODULE(spef_core, m) {
         .def_readwrite("res_count", &ComparisonResult::res_count);
     
     // Module functions
-    m.def("parse_spef", &parse_spef, "Parse SPEF file", py::arg("filepath"));
+    m.def("parse_spef", &parse_spef, "Parse SPEF file (single-threaded)", py::arg("filepath"));
+
+    m.def("parse_spef_mt", &parse_spef_mt,
+          "Parse a single SPEF file using a two-phase parallel strategy.\n"
+          "Phase 1 (sequential): read file, parse NAME_MAP, locate net-block boundaries.\n"
+          "Phase 2 (parallel):   parse each *D_NET..*END block concurrently.\n"
+          "Recommended for files with 100 K+ nets; num_threads=0 uses all CPU cores.",
+          py::arg("filepath"),
+          py::arg("num_threads") = 0);
     
     m.def("shuffle_spef", &shuffle_spef, "Shuffle SPEF net IDs",
           py::arg("input_path"),
@@ -107,10 +115,15 @@ PYBIND11_MODULE(spef_core, m) {
     m.def("compare_spef_streaming",
           [](ParsedSpef& spef1, ParsedSpef& spef2, 
              py::object py_on_cap, py::object py_on_res, int num_threads) {
+              // Release the GIL so C++ worker threads can run concurrently.
+              // Each callback re-acquires it before calling back into Python.
+              py::gil_scoped_release release;
               auto on_cap = [&](const CapComparisonData& data) {
+                  py::gil_scoped_acquire acquire;
                   py_on_cap(data);
               };
               auto on_res = [&](const ResComparisonData& data) {
+                  py::gil_scoped_acquire acquire;
                   py_on_res(data);
               };
               compare_spef_streaming(spef1, spef2, on_cap, on_res, num_threads);
