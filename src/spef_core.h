@@ -195,6 +195,11 @@ std::vector<ParsedSpef> parse_spef_parallel(
     int num_threads = 0
 );
 
+// ============== UNIT CONVERSION ==============
+// Convert value to standard unit (OHM for R, PF for C)
+double convert_capacitance(double value, const std::string& from_unit);
+double convert_resistance(double value, const std::string& from_unit);
+
 // ============== NUMPY ARRAY EXPORT FOR FAST PLOTTING ==============
 // Export comparison results as numpy arrays - avoids Python loop overhead
 

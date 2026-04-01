@@ -1357,6 +1357,36 @@ void backmark_spef(
     std::cout << "[backmark] Written " << lines_written << " lines to " << output_path << std::endl;
 }
 
+// ============== UNIT CONVERSION ==============
+
+double convert_capacitance(double value, const std::string& from_unit) {
+    // Convert to PF (picofarad) as standard
+    if (from_unit == "PF" || from_unit == "pf") {
+        return value;
+    } else if (from_unit == "NF" || from_unit == "nf") {
+        return value * 1000.0;  // 1 NF = 1000 PF
+    } else if (from_unit == "UF" || from_unit == "uf" || from_unit == "µF") {
+        return value * 1000000.0;  // 1 µF = 1000000 PF
+    } else if (from_unit == "FF" || from_unit == "ff") {
+        return value * 0.001;  // 1 FF = 0.001 PF
+    }
+    // Default: assume already PF
+    return value;
+}
+
+double convert_resistance(double value, const std::string& from_unit) {
+    // Convert to OHM as standard
+    if (from_unit == "OHM" || from_unit == "ohm") {
+        return value;
+    } else if (from_unit == "KOHM" || from_unit == "kohm" || from_unit == "KOHM") {
+        return value * 1000.0;  // 1 KOHM = 1000 OHM
+    } else if (from_unit == "MOHM" || from_unit == "mohm" || from_unit == "MOHM") {
+        return value * 1000000.0;  // 1 MOHM = 1000000 OHM
+    }
+    // Default: assume already OHM
+    return value;
+}
+
 // ============== CORRELATION IMPLEMENTATIONS ==============
 
 ComparisonResult compare_spef_full(
@@ -1399,10 +1429,14 @@ ComparisonResult compare_spef_full(
             auto& net1 = spef1.nets[net_name];
             auto& net2 = spef2.nets[net_name];
             
-            // Capacitance comparison
-            local_caps.push_back({net_name, net1.total_cap, net2.total_cap});
+            // Capacitance comparison - convert to standard unit (PF)
+            {
+                double c1 = convert_capacitance(net1.total_cap, spef1.c_unit);
+                double c2 = convert_capacitance(net2.total_cap, spef2.c_unit);
+                local_caps.push_back({net_name, c1, c2});
+            }
             
-            // Resistance comparison
+            // Resistance comparison - convert to standard unit (OHM)
             auto res1 = compute_driver_sink_resistances(net1);
             auto res2 = compute_driver_sink_resistances(net2);
             
@@ -1421,12 +1455,15 @@ ComparisonResult compare_spef_full(
             );
             
             for (const auto& sink : common_sinks) {
+                // Convert resistance to standard unit (OHM)
+                double r1 = convert_resistance(res1[sink], spef1.r_unit);
+                double r2 = convert_resistance(res2[sink], spef2.r_unit);
                 local_ress.push_back({
                     net_name,
                     net1.driver,
                     sink,
-                    res1[sink],
-                    res2[sink]
+                    r1,
+                    r2
                 });
             }
         }
@@ -1641,12 +1678,12 @@ PlotData export_plot_data(
             auto& net1 = spef1.nets[net_name];
             auto& net2 = spef2.nets[net_name];
             
-            // Capacitance
-            local_cap_c1.push_back(net1.total_cap);
-            local_cap_c2.push_back(net2.total_cap);
+            // Capacitance - convert to standard unit (PF)
+            local_cap_c1.push_back(convert_capacitance(net1.total_cap, spef1.c_unit));
+            local_cap_c2.push_back(convert_capacitance(net2.total_cap, spef2.c_unit));
             local_cap_names.push_back(net_name);
             
-            // Resistance
+            // Resistance - convert to standard unit (OHM)
             auto res1 = compute_driver_sink_resistances(net1);
             auto res2 = compute_driver_sink_resistances(net2);
             
@@ -1665,8 +1702,9 @@ PlotData export_plot_data(
             );
             
             for (const auto& sink : common_sinks) {
-                local_res_r1.push_back(res1[sink]);
-                local_res_r2.push_back(res2[sink]);
+                // Convert resistance to standard unit (OHM)
+                local_res_r1.push_back(convert_resistance(res1[sink], spef1.r_unit));
+                local_res_r2.push_back(convert_resistance(res2[sink], spef2.r_unit));
                 local_res_net_names.push_back(net_name);
                 local_res_sink_names.push_back(sink);
             }

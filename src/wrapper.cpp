@@ -201,4 +201,15 @@ PYBIND11_MODULE(spef_core, m) {
           py::arg("start_idx"),
           py::arg("chunk_size"),
           py::arg("num_threads") = 0);
+    
+    // Unit conversion functions - exposed for testing
+    m.def("convert_capacitance", &convert_capacitance,
+          "Convert capacitance to standard unit (PF)",
+          py::arg("value"),
+          py::arg("unit"));
+    
+    m.def("convert_resistance", &convert_resistance,
+          "Convert resistance to standard unit (OHM)",
+          py::arg("value"),
+          py::arg("unit"));
 }
