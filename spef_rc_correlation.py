@@ -1352,7 +1352,13 @@ class RcCorrApp:
             # Cache for kd-tree (if available)
             self._xs_c = cap_c1
             self._ys_c = cap_c2
-            self._cap_points = list(zip(cap_c1.tolist(), cap_c2.tolist()))
+            cap_net_names = plot_data.cap_net_names
+            cap_c1_list = cap_c1.tolist()
+            cap_c2_list = cap_c2.tolist()
+            self._cap_points = [
+                {"net": n, "c_ref": c1, "c_fit": c2}
+                for n, c1, c2 in zip(cap_net_names, cap_c1_list, cap_c2_list)
+            ]
         
         # Resistance plot - vectorized operations
         if len(res_r1) > 0:
@@ -1390,7 +1396,14 @@ class RcCorrApp:
             # Cache for kd-tree
             self._xs_r = res_r1
             self._ys_r = res_r2
-            self._res_points = list(zip(res_r1.tolist(), res_r2.tolist()))
+            res_net_names = plot_data.res_net_names
+            res_sink_names = plot_data.res_sink_names
+            res_r1_list = res_r1.tolist()
+            res_r2_list = res_r2.tolist()
+            self._res_points = [
+                {"net": n, "r_ref": r1, "r_fit": r2, "load": s}
+                for n, r1, r2, s in zip(res_net_names, res_r1_list, res_r2_list, res_sink_names)
+            ]
         
         self.fig.tight_layout()
         self.canvas.draw()
