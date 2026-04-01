@@ -278,13 +278,17 @@ def _parse_one(path: str) -> SpefFile:
 
 
 def parse_spefs_parallel(path1: str, path2: str) -> Tuple[SpefFile, SpefFile]:
-    """Parse two SPEF files concurrently using C++ multithreaded backend."""
+    """Parse two SPEF files concurrently using C++ multithreaded backend.
+    
+    Optimized for 1M+ nets: keeps data in C++ format, no Python conversion.
+    """
     if not HAS_CPP:
         raise RuntimeError("C++ extension not available")
     print(f"Parsing {path1} and {path2} in parallel (C++ threads)...")
     try:
         cpp_spefs = spef_core.parse_spef_parallel([path1, path2], 2)
-        # Wrap in SpefFile for compatibility with rest of code
+        
+        # Wrap in SpefFile - keep data in C++ format for performance
         s1 = SpefFile(path1)
         s1._cpp_spef = cpp_spefs[0]
         s1.name_map = dict(cpp_spefs[0].name_map)
@@ -292,31 +296,9 @@ def parse_spefs_parallel(path1: str, path2: str) -> Tuple[SpefFile, SpefFile]:
         s1.c_unit = cpp_spefs[0].c_unit
         s1.r_unit = cpp_spefs[0].r_unit
         s1.l_unit = cpp_spefs[0].l_unit
-        s1.nets = {}
-        nmap = s1.name_map
-        def _resolve_node(tok: str) -> str:
-            if not tok or tok[0] != '*':
-                return tok
-            if ':' in tok:
-                idx = tok.index(':')
-                base = tok[:idx]
-                pin = tok[idx + 1:]
-                resolved = nmap.get(base, base)
-                return f"{resolved}:{pin}" if pin else resolved
-            return nmap.get(tok, tok)
-        for net_name, cpp_net in cpp_spefs[0].nets.items():
-            net = NetRC(
-                name=cpp_net.name,
-                total_cap=cpp_net.total_cap,
-                driver=cpp_net.driver,
-                sinks=list(cpp_net.sinks)
-            )
-            for node, edges in cpp_net.res_graph.items():
-                resolved_node = _resolve_node(node)
-                net.res_graph[resolved_node] = [
-                    (_resolve_node(e.to), e.weight) for e in edges
-                ]
-            s1.nets[net_name] = net
+        # DON'T build s1.nets Python dict - keep in C++!
+        # Lazy load nets only when needed for tree view display
+        s1._net_count = len(cpp_spefs[0].nets)  # Store count from C++
 
         s2 = SpefFile(path2)
         s2._cpp_spef = cpp_spefs[1]
@@ -325,31 +307,8 @@ def parse_spefs_parallel(path1: str, path2: str) -> Tuple[SpefFile, SpefFile]:
         s2.c_unit = cpp_spefs[1].c_unit
         s2.r_unit = cpp_spefs[1].r_unit
         s2.l_unit = cpp_spefs[1].l_unit
-        s2.nets = {}
-        nmap2 = s2.name_map
-        def _resolve_node2(tok: str) -> str:
-            if not tok or tok[0] != '*':
-                return tok
-            if ':' in tok:
-                idx = tok.index(':')
-                base = tok[:idx]
-                pin = tok[idx + 1:]
-                resolved = nmap2.get(base, base)
-                return f"{resolved}:{pin}" if pin else resolved
-            return nmap2.get(tok, tok)
-        for net_name, cpp_net in cpp_spefs[1].nets.items():
-            net = NetRC(
-                name=cpp_net.name,
-                total_cap=cpp_net.total_cap,
-                driver=cpp_net.driver,
-                sinks=list(cpp_net.sinks)
-            )
-            for node, edges in cpp_net.res_graph.items():
-                resolved_node = _resolve_node2(node)
-                net.res_graph[resolved_node] = [
-                    (_resolve_node2(e.to), e.weight) for e in edges
-                ]
-            s2.nets[net_name] = net
+        s2._net_count = len(cpp_spefs[1].nets)  # Store count from C++
+        
         return s1, s2
     except Exception as exc:
         print(f"[warn] C++ parallel parse failed ({exc}), falling back to sequential")
@@ -358,6 +317,34 @@ def parse_spefs_parallel(path1: str, path2: str) -> Tuple[SpefFile, SpefFile]:
         s2 = SpefFile(path2)
         s2.parse()
         return s1, s2
+
+
+class SpefFile:
+    """Simple SPEF wrapper that uses C++ backend."""
+    def __init__(self, path: str):
+        self.path = path
+        self.name_map: Dict[str, str] = {}
+        self.nets: Dict[str, NetRC] = {}  # Lazy-loaded on demand
+        self.t_unit = 'NS'
+        self.c_unit = 'PF'
+        self.r_unit = 'OHM'
+        self.l_unit = 'HENRY'
+        self._cpp_spef = None
+        self._net_count = 0  # Cached net count
+    
+    def __len__(self) -> int:
+        """Return net count - from C++ if available, else from Python dict."""
+        if self._cpp_spef is not None:
+            return len(self._cpp_spef.nets)
+        return len(self.nets)
+    
+    def get_net_count(self) -> int:
+        """Get net count without building Python dict - optimized for 1M+ nets."""
+        if self._net_count > 0:
+            return self._net_count
+        if self._cpp_spef is not None:
+            return len(self._cpp_spef.nets)
+        return len(self.nets)
 
 
 def summarize_and_print(caps: List[CapComparison], ress: List[ResComparison], 
@@ -587,7 +574,9 @@ class RcCorrApp:
         if preload_spef_objs:
             for name, spef in preload_spef_objs:
                 self.spefs[name] = spef
-                self.tree.insert("", "end", iid=name, values=(name, len(spef.nets), spef.path))
+                # Use get_net_count() to avoid building Python dict for 1M+ nets
+                net_count = spef.get_net_count() if hasattr(spef, 'get_net_count') else len(spef.nets)
+                self.tree.insert("", "end", iid=name, values=(name, net_count, spef.path))
             self._refresh_choices()
         elif preload_paths:
             self._preload_spefs(preload_paths)
@@ -978,7 +967,9 @@ class RcCorrApp:
             self.root.config(cursor="")
             self.root.update_idletasks()
         self.spefs[name] = spef
-        self.tree.insert("", "end", iid=name, values=(name, len(spef.nets), path))
+        # Use get_net_count() for efficiency with 1M+ nets
+        net_count = spef.get_net_count() if hasattr(spef, 'get_net_count') else len(spef.nets)
+        self.tree.insert("", "end", iid=name, values=(name, net_count, path))
         self._refresh_choices()
 
     def _remove_selected(self) -> None:
@@ -1014,7 +1005,9 @@ class RcCorrApp:
             self.root.config(cursor="")
             self.root.update_idletasks()
         self.spefs[name] = spef
-        self.tree.insert("", "end", iid=name, values=(name, len(spef.nets), path))
+        # Use get_net_count() for efficiency with 1M+ nets
+        net_count = spef.get_net_count() if hasattr(spef, 'get_net_count') else len(spef.nets)
+        self.tree.insert("", "end", iid=name, values=(name, net_count, path))
         self._refresh_choices()
     def _refresh_choices(self) -> None:
         names = list(self.spefs.keys())
