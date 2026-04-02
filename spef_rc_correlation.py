@@ -550,6 +550,7 @@ def launch_gui(
         return
 
     root = tk.Tk()
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
     RcCorrApp(root, preload_paths, auto_run, preload_cap_data, preload_res_data, preload_caps, preload_ress, preload_spef_objs, preload_cpp_result)
     root.mainloop()
 
