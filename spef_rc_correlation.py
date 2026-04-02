@@ -44,7 +44,6 @@ except ImportError:
 # ===================== Python data structures for GUI =====================
 
 @dataclass
-@dataclass
 class CapComparison:
     net: str
     c1: float
@@ -1291,15 +1290,14 @@ class RcCorrApp:
         try:
             import numpy as np
         except ImportError:
-            # Fallback to original method
-            self._update_plot_from_cpp_fallback()
+            messagebox.showwarning("Warning", "numpy is required for plotting. Please install numpy to use this feature.")
             return
         
         # Get numpy arrays directly (no Python loop overhead!)
-        cap_c1 = np.asarray(plot_data.cap_c1)
-        cap_c2 = np.asarray(plot_data.cap_c2)
-        res_r1 = np.asarray(plot_data.res_r1)
-        res_r2 = np.asarray(plot_data.res_r2)
+        cap_c1 = np.asarray(getattr(plot_data, 'cap_c1', []))
+        cap_c2 = np.asarray(getattr(plot_data, 'cap_c2', []))
+        res_r1 = np.asarray(getattr(plot_data, 'res_r1', []))
+        res_r2 = np.asarray(getattr(plot_data, 'res_r2', []))
         
         ref_name = self.ref_var.get() if hasattr(self, "ref_var") and self.ref_var.get() else "tool1"
         fit_name = self.fit_var.get() if hasattr(self, "fit_var") and self.fit_var.get() else "tool2"
@@ -1333,7 +1331,7 @@ class RcCorrApp:
             self.ax_c.set_ylim(vmin_c, vmax_c)
             
             # Correlation from C++ (already computed)
-            corr = plot_data.cap_correlation
+            corr = getattr(plot_data, 'cap_correlation', None)
             title_c = f"Total C: {ref_name} (X) vs {fit_name} (Y)"
             if corr:
                 title_c += f"  (corr={corr:.4f})"
@@ -1345,7 +1343,7 @@ class RcCorrApp:
             # Cache for kd-tree (if available)
             self._xs_c = cap_c1
             self._ys_c = cap_c2
-            cap_net_names = plot_data.cap_net_names
+            cap_net_names = getattr(plot_data, 'cap_net_names', [])
             cap_c1_list = cap_c1.tolist()
             cap_c2_list = cap_c2.tolist()
             self._cap_points = [
@@ -1377,7 +1375,7 @@ class RcCorrApp:
             self.ax_r.set_xlim(vmin_r, vmax_r)
             self.ax_r.set_ylim(vmin_r, vmax_r)
             
-            corr_r = plot_data.res_correlation
+            corr_r = getattr(plot_data, 'res_correlation', None)
             title_r = f"Driver->sink R: {ref_name} (X) vs {fit_name} (Y)"
             if corr_r:
                 title_r += f"  (corr={corr_r:.4f})"
@@ -1389,8 +1387,8 @@ class RcCorrApp:
             # Cache for kd-tree
             self._xs_r = res_r1
             self._ys_r = res_r2
-            res_net_names = plot_data.res_net_names
-            res_sink_names = plot_data.res_sink_names
+            res_net_names = getattr(plot_data, 'res_net_names', [])
+            res_sink_names = getattr(plot_data, 'res_sink_names', [])
             res_r1_list = res_r1.tolist()
             res_r2_list = res_r2.tolist()
             self._res_points = [
