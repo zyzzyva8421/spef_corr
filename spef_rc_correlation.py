@@ -1408,7 +1408,7 @@ class RcCorrApp:
             ax.set_title(title + "  [numpy required]")
             return
         ax.set_title(title)
-        if not diffs:
+        if len(diffs) == 0:
             return
         mean = float(sum(diffs)) / len(diffs)
         variance = sum((x - mean) ** 2 for x in diffs) / max(len(diffs) - 1, 1)
@@ -1501,10 +1501,16 @@ class RcCorrApp:
             diffs = [abs(c.c1 - c.c2) for c in self._data_caps]
             if diffs:
                 self._draw_diff_histogram_ax(ax1, diffs, f"Cap Diff (n={len(diffs)})")
+        elif getattr(self, '_xs_c', None) is not None and len(self._xs_c):
+            diffs = np.abs(self._xs_c - self._ys_c)
+            self._draw_diff_histogram_ax(ax1, diffs, f"Cap Diff (n={len(diffs)})")
         if self._data_ress:
             diffs = [abs(r.r1 - r.r2) for r in self._data_ress]
             if diffs:
                 self._draw_diff_histogram_ax(ax2, diffs, f"Res Diff (n={len(diffs)})")
+        elif getattr(self, '_xs_r', None) is not None and len(self._xs_r):
+            diffs = np.abs(self._xs_r - self._ys_r)
+            self._draw_diff_histogram_ax(ax2, diffs, f"Res Diff (n={len(diffs)})")
         fig.tight_layout()
         FigureCanvasTkAgg(fig, master=win).get_tk_widget().pack(fill="both", expand=True)
 
