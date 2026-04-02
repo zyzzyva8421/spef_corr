@@ -1177,122 +1177,15 @@ class RcCorrApp:
         self.canvas.draw()
 
     def _update_plot_from_cpp(self) -> None:
-        """Extract data directly from C++ result - handles both ComparisonResult and PlotData."""
-        result = self._cpp_result
-        flt = self._parse_filters()
-        
-        # Check if this is PlotData (has numpy arrays) or ComparisonResult
-        if hasattr(result, 'cap_c1') and hasattr(result, 'cap_count'):
-            # PlotData - use numpy arrays directly (fastest)
-            self._update_plot_from_plotdata(result, flt)
-            return
-        
-        # Original ComparisonResult logic
-        points_cap = []
-        for cap_row in result.cap_rows:
-            p = {"net": cap_row.net_name, "c_ref": cap_row.c1, "c_fit": cap_row.c2, "fanout": 0}
-            points_cap.append(p)
-        
-        # Extract resistance data directly from C++ objects
-        points_res = []
-        for res_row in result.res_rows:
-            p = {"net": res_row.net_name, "driver": res_row.driver, "load": res_row.sink,
-                 "r_ref": res_row.r1, "r_fit": res_row.r2, "fanout": 0}
-            points_res.append(p)
-        
-        # Fanout from SPEF objects (if available)
-        if hasattr(self, "spefs") and self.spefs:
-            ref_name = self.ref_var.get()
-            ref = self.spefs.get(ref_name)
-            if ref and hasattr(ref, '_cpp_spef') and ref._cpp_spef is not None:
-                cpp_nets = ref._cpp_spef.nets
-                for p in points_cap:
-                    net = p["net"]
-                    if net in cpp_nets:
-                        p["fanout"] = len(cpp_nets[net].sinks)
-                for p in points_res:
-                    net = p["net"]
-                    if net in cpp_nets:
-                        p["fanout"] = len(cpp_nets[net].sinks)
-        
-        # Apply filters
-        if flt:
-            points_cap = [p for p in points_cap if self._passes_filters(p, flt)]
-            points_res = [p for p in points_res if self._passes_filters(p, flt)]
-        
-        self._cache_plot_arrays(points_cap, points_res)
-        
-        # Capacitance plot
-        xs = [p["c_ref"] for p in points_cap]
-        ys = [p["c_fit"] for p in points_cap]
-        ref_name = self.ref_var.get() if hasattr(self, "ref_var") and self.ref_var.get() else "tool1"
-        fit_name = self.fit_var.get() if hasattr(self, "fit_var") and self.fit_var.get() else "tool2"
-        
-        if xs and ys:
-            min_c = min(xs + ys)
-            max_c = max(xs + ys)
-            span_c = max_c - min_c or 1.0
-            pad_c = 0.05 * span_c
-            vmin_c = min_c - pad_c
-            vmax_c = max_c + pad_c
-            colors_c = ["red" if y > x else "blue" for x, y in zip(xs, ys)]
-            self.ax_c.plot([vmin_c, vmax_c], [vmin_c, vmax_c], "k--", linewidth=1.0)
-            red_idxs = [i for i, c in enumerate(colors_c) if c == "red"]
-            blue_idxs = [i for i, c in enumerate(colors_c) if c == "blue"]
-            if red_idxs:
-                self.ax_c.plot([xs[i] for i in red_idxs], [ys[i] for i in red_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="red", alpha=0.6)
-            if blue_idxs:
-                self.ax_c.plot([xs[i] for i in blue_idxs], [ys[i] for i in blue_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
-            self.ax_c.set_xlim(vmin_c, vmax_c)
-            self.ax_c.set_ylim(vmin_c, vmax_c)
-            corr = pearson_corr(xs, ys)
-            title_c = f"Total C: {ref_name} (X) vs {fit_name} (Y)"
-            if corr is not None:
-                title_c += f"  (corr={corr:.4f})"
-            self.ax_c.set_title(title_c)
-            self.ax_c.set_xlabel(f"{ref_name} C")
-            self.ax_c.set_ylabel(f"{fit_name} C")
-            self.ax_c.grid(True, alpha=0.3)
-        
-        # Resistance plot
-        xs_r = [p["r_ref"] for p in points_res]
-        ys_r = [p["r_fit"] for p in points_res]
-        if xs_r and ys_r:
-            min_r = min(xs_r + ys_r)
-            max_r = max(xs_r + ys_r)
-            span_r = max_r - min_r or 1.0
-            pad_r = 0.05 * span_r
-            vmin_r = min_r - pad_r
-            vmax_r = max_r + pad_r
-            colors_r = ["red" if y > x else "blue" for x, y in zip(xs_r, ys_r)]
-            self.ax_r.plot([vmin_r, vmax_r], [vmin_r, vmax_r], "k--", linewidth=1.0)
-            red_idxs_r = [i for i, c in enumerate(colors_r) if c == "red"]
-            blue_idxs_r = [i for i, c in enumerate(colors_r) if c == "blue"]
-            if red_idxs_r:
-                self.ax_r.plot([xs_r[i] for i in red_idxs_r], [ys_r[i] for i in red_idxs_r], "o", markersize=2, markerfacecolor="none", markeredgecolor="red", alpha=0.6)
-            if blue_idxs_r:
-                self.ax_r.plot([xs_r[i] for i in blue_idxs_r], [ys_r[i] for i in blue_idxs_r], "o", markersize=2, markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
-            self.ax_r.set_xlim(vmin_r, vmax_r)
-            self.ax_r.set_ylim(vmin_r, vmax_r)
-            corr_r = pearson_corr(xs_r, ys_r)
-            title_r = f"Driver->sink R: {ref_name} (X) vs {fit_name} (Y)"
-            if corr_r is not None:
-                title_r += f"  (corr={corr_r:.4f})"
-            self.ax_r.set_title(title_r)
-            self.ax_r.set_xlabel(f"{ref_name} R")
-            self.ax_r.set_ylabel(f"{fit_name} R")
-            self.ax_r.grid(True, alpha=0.3)
-        
-        self.fig.tight_layout()
-        self.canvas.draw()
+        """Extract data directly from C++ PlotData result."""
+        self._update_plot_from_plotdata(self._cpp_result)
 
-    def _update_plot_from_plotdata(self, plot_data, flt) -> None:
+    def _update_plot_from_plotdata(self, plot_data) -> None:
         """Fast plotting using numpy arrays from C++ - optimized for 1M+ nets."""
         try:
             import numpy as np
         except ImportError:
-            # Fallback to original method
-            self._update_plot_from_cpp_fallback()
+            messagebox.showerror("Error", "numpy is required for PlotData visualization")
             return
         
         # Get numpy arrays directly (no Python loop overhead!)
