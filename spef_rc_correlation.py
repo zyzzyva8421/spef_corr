@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
 SPEF RC Correlation Tool - C++ accelerated Python wrapper.
 
@@ -70,64 +72,6 @@ class NetRC:
             self.sinks = []
         if self.res_graph is None:
             self.res_graph = {}
-
-class SpefFile:
-    """Simple SPEF wrapper that uses C++ backend."""
-    def __init__(self, path: str):
-        self.path = path
-        self.name_map: Dict[str, str] = {}
-        self.nets: Dict[str, NetRC] = {}
-        self.t_unit = 'NS'
-        self.c_unit = 'PF'
-        self.r_unit = 'OHM'
-        self.l_unit = 'HENRY'
-        self._cpp_spef = None
-    
-    def parse(self) -> None:
-        """Parse SPEF file using C++ backend."""
-        if HAS_CPP:
-            self._parse_cpp()
-        else:
-            raise RuntimeError("C++ extension required for parsing")
-    
-    def _parse_cpp(self) -> None:
-        """Parse using C++ extension and convert to Python objects."""
-        print(f"[{self.path}] parsing with C++ extension...")
-        cpp_spef = spef_core.parse_spef(self.path)
-        self._cpp_spef = cpp_spef
-        self.name_map = dict(cpp_spef.name_map)
-        nmap = self.name_map
-        
-        def _resolve_node(tok: str) -> str:
-            if not tok or tok[0] != '*':
-                return tok
-            if ':' in tok:
-                idx = tok.index(':')
-                base = tok[:idx]
-                pin = tok[idx + 1:]
-                resolved = nmap.get(base, base)
-                return f"{resolved}:{pin}" if pin else resolved
-            return nmap.get(tok, tok)
-        
-        for net_name, cpp_net in cpp_spef.nets.items():
-            net = NetRC(
-                name=cpp_net.name,
-                total_cap=cpp_net.total_cap,
-                driver=cpp_net.driver,
-                sinks=list(cpp_net.sinks)
-            )
-            for node, edges in cpp_net.res_graph.items():
-                resolved_node = _resolve_node(node)
-                net.res_graph[resolved_node] = [
-                    (_resolve_node(e.to), e.weight) for e in edges
-                ]
-            self.nets[net_name] = net
-        
-        self.t_unit = cpp_spef.t_unit
-        self.c_unit = cpp_spef.c_unit
-        self.r_unit = cpp_spef.r_unit
-        self.l_unit = cpp_spef.l_unit
-        print(f"[{self.path}] parsed {len(self.nets)} nets... (C++)")
 
 
 def pearson_corr(xs: Iterable[float], ys: Iterable[float]) -> Optional[float]:
@@ -230,7 +174,7 @@ def compare_spef_cpp(spef1_path: str, spef2_path: str, num_threads: int = 0) -> 
     return caps, ress, top_10_cap, top_10_res
 
 
-def compare_spef_cpp_objs(spef1: SpefFile, spef2: SpefFile, num_threads: int = 0):
+def compare_spef_cpp_objs(spef1: "SpefFile", spef2: "SpefFile", num_threads: int = 0):
     """Compare two already-parsed SPEF objects using C++ backend."""
     if not HAS_CPP:
         raise RuntimeError("C++ extension not available")
@@ -240,19 +184,6 @@ def compare_spef_cpp_objs(spef1: SpefFile, spef2: SpefFile, num_threads: int = 0
     top_10_cap = [CapComparison(c.net_name, c.c1, c.c2) for c in result.top_10_cap]
     top_10_res = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.top_10_res]
     return caps, ress, top_10_cap, top_10_res
-
-
-def compare_spef_cpp_to_files(spef1_path: str, spef2_path: str, cap_out: str, res_out: str, num_threads: int = 0) -> Tuple[List[CapComparison], List[ResComparison]]:
-    """Compare and write data files."""
-    caps, ress, _, _ = compare_spef_cpp(spef1_path, spef2_path, num_threads)
-    
-    with open(cap_out, 'w', encoding='utf-8') as fc, open(res_out, 'w', encoding='utf-8') as fr:
-        for cap in caps:
-            print(f"{cap.net} {cap.c1} {cap.c2}", file=fc)
-        for res in ress:
-            print(f"{res.net} {res.driver} {res.load} {res.r1} {res.r2}", file=fr)
-    
-    return caps, ress
 
 
 def backmark_spef_cpp(spef_path: str, cap_data_path: Optional[str], res_data_path: Optional[str], output_path: str) -> None:
@@ -268,13 +199,6 @@ def shuffle_spef_cpp(spef_path: str, output_path: str, seed: Optional[int] = Non
         raise RuntimeError("C++ extension not available")
     actual_seed = seed if seed is not None else -1
     spef_core.shuffle_spef(spef_path, output_path, actual_seed)
-
-
-def _parse_one(path: str) -> SpefFile:
-    """Parse a single SPEF file."""
-    sf = SpefFile(path)
-    sf.parse()
-    return sf
 
 
 def parse_spefs_parallel(path1: str, path2: str) -> Tuple[SpefFile, SpefFile]:
@@ -331,6 +255,20 @@ class SpefFile:
         self.l_unit = 'HENRY'
         self._cpp_spef = None
         self._net_count = 0  # Cached net count
+    
+    def parse(self) -> None:
+        """Parse SPEF file using C++ backend."""
+        if not HAS_CPP:
+            raise RuntimeError("C++ extension required for parsing")
+        print(f"[{self.path}] parsing with C++ extension...")
+        self._cpp_spef = spef_core.parse_spef(self.path)
+        self.name_map = dict(self._cpp_spef.name_map)
+        self.t_unit = self._cpp_spef.t_unit
+        self.c_unit = self._cpp_spef.c_unit
+        self.r_unit = self._cpp_spef.r_unit
+        self.l_unit = self._cpp_spef.l_unit
+        self._net_count = len(self._cpp_spef.nets)
+        print(f"[{self.path}] parsed {self._net_count} nets... (C++)")
     
     def __len__(self) -> int:
         """Return net count - from C++ if available, else from Python dict."""
@@ -855,24 +793,24 @@ class RcCorrApp:
         self.fit_combo.grid(row=0, column=3, sticky="w", padx=5, pady=2)
 
         # Row 1: fanout range
-        self.min_fanout_var = tk.StringVar(value="1")
-        self.max_fanout_var = tk.StringVar(value="99999")
+        self.min_fanout_var = tk.StringVar(value="")
+        self.max_fanout_var = tk.StringVar(value="")
         ttk.Label(srm, text="Fanout range:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
         ttk.Entry(srm, textvariable=self.min_fanout_var, width=8).grid(row=1, column=1, sticky="w", padx=5, pady=2)
         ttk.Label(srm, text="to").grid(row=1, column=2, sticky="w", padx=2, pady=2)
         ttk.Entry(srm, textvariable=self.max_fanout_var, width=8).grid(row=1, column=3, sticky="w", padx=5, pady=2)
 
         # Row 2: cap range (reference)
-        self.min_c_var = tk.StringVar(value="0.001")
-        self.max_c_var = tk.StringVar(value="2")
+        self.min_c_var = tk.StringVar(value="")
+        self.max_c_var = tk.StringVar(value="")
         ttk.Label(srm, text="Cap range (ref C):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
         ttk.Entry(srm, textvariable=self.min_c_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=2)
         ttk.Label(srm, text="to").grid(row=2, column=2, sticky="w", padx=2, pady=2)
         ttk.Entry(srm, textvariable=self.max_c_var, width=10).grid(row=2, column=3, sticky="w", padx=5, pady=2)
 
         # Row 3: R range (reference, aggregated)
-        self.min_r_var = tk.StringVar(value="1")
-        self.max_r_var = tk.StringVar(value="1000000")
+        self.min_r_var = tk.StringVar(value="")
+        self.max_r_var = tk.StringVar(value="")
         ttk.Label(srm, text="R range (ref, agg):").grid(row=3, column=0, sticky="w", padx=5, pady=2)
         ttk.Entry(srm, textvariable=self.min_r_var, width=10).grid(row=3, column=1, sticky="w", padx=5, pady=2)
         ttk.Label(srm, text="to").grid(row=3, column=2, sticky="w", padx=2, pady=2)
@@ -1023,23 +961,54 @@ class RcCorrApp:
         path = filedialog.askopenfilename(title="Cap Data", filetypes=[("Data", "*.data"), ("All", "*.*")])
         if path:
             self._load_cap_data(path)
-    def _load_cap_data(self, path: str) -> None:
-        try:
-            self._data_caps = parse_net_cap_data(path)
-            self.cap_data_label.config(text=f"{os.path.basename(path)} ({len(self._data_caps)} nets)", foreground="black")
-        except Exception as exc:
-            messagebox.showerror("Error", f"Load failed:\n{exc}")
+    
     def _add_res_data(self) -> None:
         path = filedialog.askopenfilename(title="Res Data", filetypes=[("Data", "*.data"), ("All", "*.*")])
         if path:
             self._load_res_data(path)
-    def _load_res_data(self, path: str) -> None:
+    
+    def _load_cap_data(self, path: str) -> None:
+        """Load cap data using C++ backend."""
         try:
-            self._data_ress = parse_net_res_data(path)
-            self.res_data_label.config(text=f"{os.path.basename(path)} ({len(self._data_ress)} pairs)", foreground="black")
+            # If we already have res data in _cpp_result, merge; otherwise create new
+            if self._cpp_result is not None and self._cpp_result.res_count > 0:
+                # Merge with existing res data
+                new_cap = spef_core.create_plot_data_from_files(path, "")
+                # Copy res data from current result
+                self._cpp_result.cap_c1 = new_cap.cap_c1
+                self._cpp_result.cap_c2 = new_cap.cap_c2
+                self._cpp_result.cap_net_names = new_cap.cap_net_names
+                self._cpp_result.cap_count = new_cap.cap_count
+                self._cpp_result.cap_correlation = new_cap.cap_correlation
+            else:
+                # Create new PlotData from cap file
+                self._cpp_result = spef_core.create_plot_data_from_files(path, "")
+            self.cap_data_label.config(text=f"{os.path.basename(path)} ({self._cpp_result.cap_count} nets)", foreground="black")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Load failed:\n{exc}")
+    
+    def _load_res_data(self, path: str) -> None:
+        """Load res data using C++ backend."""
+        try:
+            # If we already have cap data in _cpp_result, merge; otherwise create new
+            if self._cpp_result is not None and self._cpp_result.cap_count > 0:
+                # Merge with existing cap data
+                new_res = spef_core.create_plot_data_from_files("", path)
+                # Copy res data to current result
+                self._cpp_result.res_r1 = new_res.res_r1
+                self._cpp_result.res_r2 = new_res.res_r2
+                self._cpp_result.res_net_names = new_res.res_net_names
+                self._cpp_result.res_sink_names = new_res.res_sink_names
+                self._cpp_result.res_count = new_res.res_count
+                self._cpp_result.res_correlation = new_res.res_correlation
+            else:
+                # Create new PlotData from res file
+                self._cpp_result = spef_core.create_plot_data_from_files("", path)
+            self.res_data_label.config(text=f"{os.path.basename(path)} ({self._cpp_result.res_count} pairs)", foreground="black")
         except Exception as exc:
             messagebox.showerror("Error", f"Load failed:\n{exc}")
     def _run_analysis(self) -> None:
+        """Run analysis using C++ backend."""
         ref = self.ref_var.get()
         fit = self.fit_var.get()
         if not ref or not fit or ref not in self.spefs or fit not in self.spefs:
@@ -1048,27 +1017,22 @@ class RcCorrApp:
         try:
             s1 = self.spefs[ref]
             s2 = self.spefs[fit]
+            # Always use C++ export_plot_data
             if hasattr(s1, '_cpp_spef') and s1._cpp_spef is not None and hasattr(s2, '_cpp_spef') and s2._cpp_spef is not None:
-                caps, ress, _, _ = compare_spef_cpp_objs(s1, s2)
+                self._cpp_result = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, 0)
+                self._update_plot()
             else:
-                caps, ress, _, _ = compare_spef_cpp(s1.path, s2.path)
-            self._data_caps = caps
-            self._data_ress = ress
-            self._update_plot()
+                messagebox.showerror("Error", "SPEF files not parsed with C++ backend")
         except Exception as exc:
             messagebox.showerror("Error", f"Analysis failed:\n{exc}")
     def _run_from_data(self) -> None:
-        if not self._data_caps and not self._data_ress:
+        if self._cpp_result is None or (self._cpp_result.cap_count == 0 and self._cpp_result.res_count == 0):
             messagebox.showwarning("Warning", "No data loaded")
             return
         self._update_plot()
     def _auto_run(self) -> None:
         # If preloaded C++ result (PlotData) exists, use it directly
         if self._cpp_result is not None:
-            self._update_plot()
-            return
-        # If preloaded caps/ress exist, just plot them
-        if self._data_caps or self._data_ress:
             self._update_plot()
             return
         # Otherwise run analysis from SPEF objects
@@ -1079,110 +1043,31 @@ class RcCorrApp:
             self._run_analysis()
 
     def _update_plot(self) -> None:
+        """Update plots with filters - uses C++ PlotData result."""
         self.ax_c.clear()
         self.ax_r.clear()
         
-        # If C++ result exists, extract data directly without Python conversion
-        if self._cpp_result is not None:
-            self._update_plot_from_cpp()
-            return
-        
-        # Original logic: use Python CapComparison/ResComparison objects
+        # Parse filters
         flt = self._parse_filters()
-        points_cap = []
-        for c in self._data_caps:
-            p = {"net": c.net, "c_ref": c.c1, "c_fit": c.c2, "fanout": 0}
-            points_cap.append(p)
-        points_res = []
-        for r in self._data_ress:
-            p = {"net": r.net, "driver": r.driver, "load": r.load, "r_ref": r.r1, "r_fit": r.r2, "fanout": 0}
-            points_res.append(p)
-        # 若有spefs，补充fanout
-        if hasattr(self, "spefs") and self.spefs:
-            ref_name = self.ref_var.get()
-            ref = self.spefs.get(ref_name)
-            if ref:
-                for p in points_cap:
-                    net = p["net"]
-                    if net in ref.nets:
-                        p["fanout"] = len(ref.nets[net].sinks)
-                for p in points_res:
-                    net = p["net"]
-                    if net in ref.nets:
-                        p["fanout"] = len(ref.nets[net].sinks)
-        # 过滤
-        if flt:
-            points_cap = [p for p in points_cap if self._passes_filters(p, flt)]
-            points_res = [p for p in points_res if self._passes_filters(p, flt)]
-        self._cache_plot_arrays(points_cap, points_res)
-        xs = [p["c_ref"] for p in points_cap]
-        ys = [p["c_fit"] for p in points_cap]
-        ref_name = self.ref_var.get() if hasattr(self, "ref_var") else "tool1"
-        fit_name = self.fit_var.get() if hasattr(self, "fit_var") else "tool2"
-        if xs and ys:
-            min_c = min(xs + ys)
-            max_c = max(xs + ys)
-            span_c = max_c - min_c or 1.0
-            pad_c = 0.05 * span_c
-            vmin_c = min_c - pad_c
-            vmax_c = max_c + pad_c
-            colors_c = ["red" if y > x else "blue" for x, y in zip(xs, ys)]
-            self.ax_c.plot([vmin_c, vmax_c], [vmin_c, vmax_c], "k--", linewidth=1.0)
-            # Plot red points first, then blue points
-            red_idxs = [i for i, c in enumerate(colors_c) if c == "red"]
-            blue_idxs = [i for i, c in enumerate(colors_c) if c == "blue"]
-            if red_idxs:
-                self.ax_c.plot([xs[i] for i in red_idxs], [ys[i] for i in red_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="red", alpha=0.6)
-            if blue_idxs:
-                self.ax_c.plot([xs[i] for i in blue_idxs], [ys[i] for i in blue_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
-            self.ax_c.set_xlim(vmin_c, vmax_c)
-            self.ax_c.set_ylim(vmin_c, vmax_c)
-            corr = pearson_corr(xs, ys)
-            title_c = f"Total C: {ref_name} (X) vs {fit_name} (Y)"
-            if corr is not None:
-                title_c += f"  (corr={corr:.4f})"
-                self.corr_label.config(text=f"Cap corr: {corr:.4f}")
-            self.ax_c.set_title(title_c)
-            self.ax_c.set_xlabel(f"{ref_name} C")
-            self.ax_c.set_ylabel(f"{fit_name} C")
-            self.ax_c.grid(True, alpha=0.3)
-        xs = [p["r_ref"] for p in points_res]
-        ys = [p["r_fit"] for p in points_res]
-        if xs and ys:
-            min_r = min(xs + ys)
-            max_r = max(xs + ys)
-            span_r = max_r - min_r or 1.0
-            pad_r = 0.05 * span_r
-            vmin_r = min_r - pad_r
-            vmax_r = max_r + pad_r
-            colors_r = ["red" if y > x else "blue" for x, y in zip(xs, ys)]
-            self.ax_r.plot([vmin_r, vmax_r], [vmin_r, vmax_r], "k--", linewidth=1.0)
-            # Plot red points first, then blue points
-            red_idxs = [i for i, c in enumerate(colors_r) if c == "red"]
-            blue_idxs = [i for i, c in enumerate(colors_r) if c == "blue"]
-            if red_idxs:
-                self.ax_r.plot([xs[i] for i in red_idxs], [ys[i] for i in red_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="red", alpha=0.6)
-            if blue_idxs:
-                self.ax_r.plot([xs[i] for i in blue_idxs], [ys[i] for i in blue_idxs], "o", markersize=2, markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
-            self.ax_r.set_xlim(vmin_r, vmax_r)
-            self.ax_r.set_ylim(vmin_r, vmax_r)
-            corr = pearson_corr(xs, ys)
-            title_r = f"Driver->sink R: {ref_name} (X) vs {fit_name} (Y)"
-            if corr is not None:
-                title_r += f"  (corr={corr:.4f})"
-            self.ax_r.set_title(title_r)
-            self.ax_r.set_xlabel(f"{ref_name} R")
-            self.ax_r.set_ylabel(f"{fit_name} R")
-            self.ax_r.grid(True, alpha=0.3)
+        
+        # Use C++ result - always available when data is loaded
+        if self._cpp_result is not None:
+            self._update_plot_from_plotdata(self._cpp_result, flt)
+        
         self.fig.tight_layout()
         self.canvas.draw()
 
-    def _update_plot_from_cpp(self) -> None:
-        """Extract data directly from C++ PlotData result."""
-        self._update_plot_from_plotdata(self._cpp_result)
+    def _update_plot_from_cpp(self, flt=None) -> None:
+        """Extract data directly from C++ PlotData result with optional filters."""
+        self._update_plot_from_plotdata(self._cpp_result, flt)
 
-    def _update_plot_from_plotdata(self, plot_data) -> None:
-        """Fast plotting using numpy arrays from C++ - optimized for 1M+ nets."""
+    def _update_plot_from_plotdata(self, plot_data, flt=None) -> None:
+        """Fast plotting using numpy arrays from C++ - optimized for 1M+ nets.
+        
+        Args:
+            plot_data: C++ PlotData object with numpy arrays
+            flt: Optional filter dict from _parse_filters()
+        """
         try:
             import numpy as np
         except ImportError:
@@ -1194,6 +1079,34 @@ class RcCorrApp:
         cap_c2 = np.asarray(plot_data.cap_c2)
         res_r1 = np.asarray(plot_data.res_r1)
         res_r2 = np.asarray(plot_data.res_r2)
+        cap_net_names = list(plot_data.cap_net_names)
+        res_net_names = list(plot_data.res_net_names)
+        res_sink_names = list(plot_data.res_sink_names)
+        
+        # Apply filters if provided
+        if flt:
+            # Build point dicts for filtering
+            cap_points = []
+            for i, name in enumerate(cap_net_names):
+                p = {"net": name, "c_ref": float(cap_c1[i]), "c_fit": float(cap_c2[i]), "fanout": 0}
+                cap_points.append(p)
+            res_points = []
+            for i, name in enumerate(res_net_names):
+                p = {"net": name, "r_ref": float(res_r1[i]), "r_fit": float(res_r2[i]), "fanout": 0}
+                res_points.append(p)
+            
+            # Filter
+            cap_indices = [i for i, p in enumerate(cap_points) if self._passes_filters(p, flt)]
+            res_indices = [i for i, p in enumerate(res_points) if self._passes_filters(p, flt)]
+            
+            cap_c1 = cap_c1[cap_indices]
+            cap_c2 = cap_c2[cap_indices]
+            cap_net_names = [cap_net_names[i] for i in cap_indices]
+            
+            res_r1 = res_r1[res_indices]
+            res_r2 = res_r2[res_indices]
+            res_net_names = [res_net_names[i] for i in res_indices]
+            res_sink_names = [res_sink_names[i] for i in res_indices]
         
         ref_name = self.ref_var.get() if hasattr(self, "ref_var") and self.ref_var.get() else "tool1"
         fit_name = self.fit_var.get() if hasattr(self, "fit_var") and self.fit_var.get() else "tool2"
@@ -1386,25 +1299,74 @@ class RcCorrApp:
         except ImportError:
             messagebox.showerror("Error", "numpy required")
             return
+
+        # Parse filters from UI
+        flt = self._parse_filters()
+        if flt is None:
+            return
+
         win = tk.Toplevel(self.root)
         win.title("Difference Histogram")
         fig = Figure(figsize=(8, 6))
         ax1 = fig.add_subplot(2, 1, 1)
         ax2 = fig.add_subplot(2, 1, 2)
-        if self._data_caps:
-            diffs = [abs(c.c1 - c.c2) for c in self._data_caps]
-            if diffs:
-                self._draw_diff_histogram_ax(ax1, diffs, f"Cap Diff (n={len(diffs)})")
+
+        # Helper to apply filters to data
+        def filter_cap_data(c1, c2, names):
+            if not flt.get("min_c") and not flt.get("max_c") and not flt.get("min_fanout") and not flt.get("max_fanout"):
+                return c1, c2, names
+            indices = []
+            for i in range(len(c1)):
+                p = {"net": names[i], "c_ref": float(c1[i]), "c_fit": float(c2[i]), "fanout": 0}
+                if self._passes_filters(p, flt):
+                    indices.append(i)
+            return c1[indices], c2[indices], [names[i] for i in indices]
+
+        def filter_res_data(r1, r2, net_names, sink_names):
+            if not flt.get("min_r") and not flt.get("max_r") and not flt.get("min_fanout") and not flt.get("max_fanout"):
+                return r1, r2, net_names, sink_names
+            indices = []
+            for i in range(len(r1)):
+                p = {"net": net_names[i], "r_ref": float(r1[i]), "r_fit": float(r2[i]), "fanout": 0}
+                if self._passes_filters(p, flt):
+                    indices.append(i)
+            return r1[indices], r2[indices], [net_names[i] for i in indices], [sink_names[i] for i in indices]
+
+        # Capacitance histogram
+        if self._cpp_result is not None and self._cpp_result.cap_count > 0:
+            cap_c1 = np.asarray(self._cpp_result.cap_c1)
+            cap_c2 = np.asarray(self._cpp_result.cap_c2)
+            cap_names = list(self._cpp_result.cap_net_names)
+            cap_c1_f, cap_c2_f, cap_names_f = filter_cap_data(cap_c1, cap_c2, cap_names)
+            diffs = np.abs(cap_c1_f - cap_c2_f)
+            self._draw_diff_histogram_ax(ax1, diffs, f"Cap Diff (n={len(diffs)}, filtered)")
         elif getattr(self, '_xs_c', None) is not None and len(self._xs_c):
-            diffs = np.abs(self._xs_c - self._ys_c)
-            self._draw_diff_histogram_ax(ax1, diffs, f"Cap Diff (n={len(diffs)})")
-        if self._data_ress:
-            diffs = [abs(r.r1 - r.r2) for r in self._data_ress]
-            if diffs:
-                self._draw_diff_histogram_ax(ax2, diffs, f"Res Diff (n={len(diffs)})")
+            # Use cached data from plotting
+            cap_c1 = np.asarray(self._xs_c)
+            cap_c2 = np.asarray(self._ys_c)
+            cap_names = [p["net"] for p in getattr(self, '_cap_points', [])]
+            cap_c1_f, cap_c2_f, _ = filter_cap_data(cap_c1, cap_c2, cap_names)
+            diffs = np.abs(cap_c1_f - cap_c2_f)
+            self._draw_diff_histogram_ax(ax1, diffs, f"Cap Diff (n={len(diffs)}, filtered)")
+
+        # Resistance histogram
+        if self._cpp_result is not None and self._cpp_result.res_count > 0:
+            res_r1 = np.asarray(self._cpp_result.res_r1)
+            res_r2 = np.asarray(self._cpp_result.res_r2)
+            res_net_names = list(self._cpp_result.res_net_names)
+            res_sink_names = list(self._cpp_result.res_sink_names)
+            res_r1_f, res_r2_f, _, _ = filter_res_data(res_r1, res_r2, res_net_names, res_sink_names)
+            diffs = np.abs(res_r1_f - res_r2_f)
+            self._draw_diff_histogram_ax(ax2, diffs, f"Res Diff (n={len(diffs)}, filtered)")
         elif getattr(self, '_xs_r', None) is not None and len(self._xs_r):
-            diffs = np.abs(self._xs_r - self._ys_r)
-            self._draw_diff_histogram_ax(ax2, diffs, f"Res Diff (n={len(diffs)})")
+            res_r1 = np.asarray(self._xs_r)
+            res_r2 = np.asarray(self._ys_r)
+            res_net_names = [p["net"] for p in getattr(self, '_res_points', [])]
+            res_sink_names = [p.get("load", "") for p in getattr(self, '_res_points', [])]
+            res_r1_f, res_r2_f, _, _ = filter_res_data(res_r1, res_r2, res_net_names, res_sink_names)
+            diffs = np.abs(res_r1_f - res_r2_f)
+            self._draw_diff_histogram_ax(ax2, diffs, f"Res Diff (n={len(diffs)}, filtered)")
+
         fig.tight_layout()
         FigureCanvasTkAgg(fig, master=win).get_tk_widget().pack(fill="both", expand=True)
 

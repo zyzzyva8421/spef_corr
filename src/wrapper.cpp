@@ -137,6 +137,19 @@ PYBIND11_MODULE(spef_core, m) {
           "Parse backmark res data file",
           py::arg("path"));
     
+    m.def("parse_cap_data", &parse_cap_data,
+          "Parse CSV cap data file (net,c1,c2 format)",
+          py::arg("path"));
+    
+    m.def("parse_res_data", &parse_res_data,
+          "Parse CSV res data file (net,r1,r2 format)",
+          py::arg("path"));
+    
+    m.def("create_plot_data_from_files", &create_plot_data_from_files,
+          "Create PlotData from CSV cap/res files",
+          py::arg("cap_path"),
+          py::arg("res_path"));
+    
     m.def("compute_res_segment_scales", &compute_res_segment_scales,
           "Compute resistance segment scales for backmarking",
           py::arg("net"),

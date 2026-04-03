@@ -158,6 +158,25 @@ std::unordered_map<std::string, std::unordered_map<std::string, double>> parse_b
     const std::string& path
 );
 
+// Parse CSV cap data file (net,c1,c2 format)
+std::vector<std::tuple<std::string, double, double>> parse_cap_data(
+    const std::string& path
+);
+
+// Parse CSV res data file (net,r1,r2 format)
+std::vector<std::tuple<std::string, std::string, double, double>> parse_res_data(
+    const std::string& path
+);
+
+// Forward declaration
+struct PlotData;
+
+// Create PlotData from CSV cap/res files for unified plotting
+PlotData create_plot_data_from_files(
+    const std::string& cap_path,
+    const std::string& res_path
+);
+
 // Compute segment scales for backmarking
 std::unordered_map<std::string, std::unordered_map<std::string, double>> compute_res_segment_scales(
     NetData& net,

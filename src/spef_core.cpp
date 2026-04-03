@@ -892,6 +892,198 @@ std::unordered_map<std::string, std::unordered_map<std::string, double>> parse_b
     return res_map;
 }
 
+// ============== CSV Data File Parsing ==============
+
+std::vector<std::tuple<std::string, double, double>> parse_cap_data(const std::string& path) {
+    std::vector<std::tuple<std::string, double, double>> caps;
+    
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return caps;
+    }
+    
+    std::string line;
+    // Skip header line if CSV (check if first line has comma)
+    if (std::getline(file, line)) {
+        if (line.find(',') == std::string::npos) {
+            // Not CSV - treat as backmark format (net c1 c2)
+            std::istringstream iss(line);
+            std::string net, c1_str, c2_str;
+            if (iss >> net >> c1_str >> c2_str) {
+                try {
+                    caps.emplace_back(net, std::stod(c1_str), std::stod(c2_str));
+                } catch (...) {}
+            }
+        }
+    }
+    
+    // Continue reading
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        
+        // Check format
+        if (line.find(',') != std::string::npos) {
+            // CSV format: net,c1,c2
+            std::istringstream iss(line);
+            std::string net, c1_str, c2_str;
+            if (!std::getline(iss, net, ',') || 
+                !std::getline(iss, c1_str, ',') || 
+                !std::getline(iss, c2_str, ',')) {
+                continue;
+            }
+            try {
+                caps.emplace_back(net, std::stod(c1_str), std::stod(c2_str));
+            } catch (...) {
+                continue;
+            }
+        } else {
+            // Backmark format: net c1 c2
+            std::istringstream iss(line);
+            std::string net, c1_str, c2_str;
+            if (!(iss >> net >> c1_str >> c2_str)) continue;
+            try {
+                caps.emplace_back(net, std::stod(c1_str), std::stod(c2_str));
+            } catch (...) {
+                continue;
+            }
+        }
+    }
+    
+    return caps;
+}
+
+std::vector<std::tuple<std::string, std::string, double, double>> parse_res_data(const std::string& path) {
+    std::vector<std::tuple<std::string, std::string, double, double>> ress;
+    
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return ress;
+    }
+    
+    std::string line;
+    // Skip header line if CSV
+    if (std::getline(file, line)) {
+        if (line.find(',') == std::string::npos) {
+            // Not CSV - treat as backmark format (net driver sink r1 r2)
+            std::istringstream iss(line);
+            std::string net, driver, sink, r1_str, r2_str;
+            if (iss >> net >> driver >> sink >> r1_str >> r2_str) {
+                try {
+                    ress.emplace_back(net, sink, std::stod(r1_str), std::stod(r2_str));
+                } catch (...) {}
+            }
+        }
+    }
+    
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        
+        // Check format
+        if (line.find(',') != std::string::npos) {
+            // CSV format: net,driver,sink,r1,r2
+            std::istringstream iss(line);
+            std::string net, driver, sink, r1_str, r2_str;
+            if (!std::getline(iss, net, ',') || 
+                !std::getline(iss, driver, ',') ||
+                !std::getline(iss, sink, ',') || 
+                !std::getline(iss, r1_str, ',') || 
+                !std::getline(iss, r2_str, ',')) {
+                continue;
+            }
+            try {
+                ress.emplace_back(net, sink, std::stod(r1_str), std::stod(r2_str));
+            } catch (...) {
+                continue;
+            }
+        } else {
+            // Backmark format: net driver sink r1 r2
+            std::istringstream iss(line);
+            std::string net, driver, sink, r1_str, r2_str;
+            if (!(iss >> net >> driver >> sink >> r1_str >> r2_str)) continue;
+            try {
+                ress.emplace_back(net, sink, std::stod(r1_str), std::stod(r2_str));
+            } catch (...) {
+                continue;
+            }
+        }
+    }
+    
+    return ress;
+}
+
+PlotData create_plot_data_from_files(const std::string& cap_path, const std::string& res_path) {
+    PlotData result;
+    
+    // Initialize counts to 0
+    result.cap_count = 0;
+    result.res_count = 0;
+    result.cap_correlation = 0.0;
+    result.res_correlation = 0.0;
+    
+    // Parse cap data if provided
+    if (!cap_path.empty()) {
+        auto caps = parse_cap_data(cap_path);
+        result.cap_count = caps.size();
+        
+        // Allocate arrays
+        std::vector<double> c1_vec, c2_vec;
+        c1_vec.reserve(caps.size());
+        c2_vec.reserve(caps.size());
+        
+        for (const auto& cap : caps) {
+            std::string net;
+            double c1, c2;
+            std::tie(net, c1, c2) = cap;
+            result.cap_net_names.push_back(net);
+            c1_vec.push_back(c1);
+            c2_vec.push_back(c2);
+        }
+        
+        // Create numpy arrays
+        result.cap_c1 = py::array_t<double>(c1_vec.size(), c1_vec.data());
+        result.cap_c2 = py::array_t<double>(c2_vec.size(), c2_vec.data());
+        
+        // Compute correlation
+        if (!c1_vec.empty()) {
+            auto corr = compute_pearson_correlation(c1_vec, c2_vec);
+            result.cap_correlation = corr.valid ? corr.pearson : 0.0;
+        }
+    }
+    
+    // Parse res data if provided
+    if (!res_path.empty()) {
+        auto ress = parse_res_data(res_path);
+        result.res_count = ress.size();
+        
+        // Allocate arrays
+        std::vector<double> r1_vec, r2_vec;
+        r1_vec.reserve(ress.size());
+        r2_vec.reserve(ress.size());
+        
+        for (const auto& res : ress) {
+            std::string net, sink;
+            double r1, r2;
+            std::tie(net, sink, r1, r2) = res;
+            result.res_net_names.push_back(net);
+            result.res_sink_names.push_back(sink);
+            r1_vec.push_back(r1);
+            r2_vec.push_back(r2);
+        }
+        
+        // Create numpy arrays
+        result.res_r1 = py::array_t<double>(r1_vec.size(), r1_vec.data());
+        result.res_r2 = py::array_t<double>(r2_vec.size(), r2_vec.data());
+        
+        // Compute correlation
+        if (!r1_vec.empty()) {
+            auto corr = compute_pearson_correlation(r1_vec, r2_vec);
+            result.res_correlation = corr.valid ? corr.pearson : 0.0;
+        }
+    }
+    
+    return result;
+}
+
 std::string resolve_spef_token(const std::string& tok, 
                                const std::unordered_map<std::string, std::string>& name_map) {
     if (tok.empty()) return tok;
