@@ -952,8 +952,8 @@ std::vector<std::tuple<std::string, double, double>> parse_cap_data(const std::s
     return caps;
 }
 
-std::vector<std::tuple<std::string, std::string, double, double>> parse_res_data(const std::string& path) {
-    std::vector<std::tuple<std::string, std::string, double, double>> ress;
+std::vector<std::tuple<std::string, std::string, std::string, double, double>> parse_res_data(const std::string& path) {
+    std::vector<std::tuple<std::string, std::string, std::string, double, double>> ress;
     
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -969,7 +969,7 @@ std::vector<std::tuple<std::string, std::string, double, double>> parse_res_data
             std::string net, driver, sink, r1_str, r2_str;
             if (iss >> net >> driver >> sink >> r1_str >> r2_str) {
                 try {
-                    ress.emplace_back(net, sink, std::stod(r1_str), std::stod(r2_str));
+                    ress.emplace_back(net, driver, sink, std::stod(r1_str), std::stod(r2_str));
                 } catch (...) {}
             }
         }
@@ -991,7 +991,7 @@ std::vector<std::tuple<std::string, std::string, double, double>> parse_res_data
                 continue;
             }
             try {
-                ress.emplace_back(net, sink, std::stod(r1_str), std::stod(r2_str));
+                ress.emplace_back(net, driver, sink, std::stod(r1_str), std::stod(r2_str));
             } catch (...) {
                 continue;
             }
@@ -1001,7 +1001,7 @@ std::vector<std::tuple<std::string, std::string, double, double>> parse_res_data
             std::string net, driver, sink, r1_str, r2_str;
             if (!(iss >> net >> driver >> sink >> r1_str >> r2_str)) continue;
             try {
-                ress.emplace_back(net, sink, std::stod(r1_str), std::stod(r2_str));
+                ress.emplace_back(net, driver, sink, std::stod(r1_str), std::stod(r2_str));
             } catch (...) {
                 continue;
             }
@@ -1061,10 +1061,11 @@ PlotData create_plot_data_from_files(const std::string& cap_path, const std::str
         r2_vec.reserve(ress.size());
         
         for (const auto& res : ress) {
-            std::string net, sink;
+            std::string net, driver, sink;
             double r1, r2;
-            std::tie(net, sink, r1, r2) = res;
+            std::tie(net, driver, sink, r1, r2) = res;
             result.res_net_names.push_back(net);
+            result.res_driver_names.push_back(driver);
             result.res_sink_names.push_back(sink);
             r1_vec.push_back(r1);
             r2_vec.push_back(r2);
@@ -1845,8 +1846,10 @@ PlotData export_plot_data(
     res_r2_vec.reserve(n_cap * 4);
     std::vector<std::string> res_net_names;
     std::vector<std::string> res_sink_names;
+    std::vector<std::string> res_driver_names;
     res_net_names.reserve(n_cap * 4);
     res_sink_names.reserve(n_cap * 4);
+    res_driver_names.reserve(n_cap * 4);
     
     // Parallel processing
     std::mutex result_mutex;
@@ -1860,6 +1863,7 @@ PlotData export_plot_data(
         std::vector<double> local_res_r2;
         std::vector<std::string> local_res_net_names;
         std::vector<std::string> local_res_sink_names;
+        std::vector<std::string> local_res_driver_names;
         
         local_cap_c1.reserve(n_cap / num_threads + 1);
         local_cap_c2.reserve(n_cap / num_threads + 1);
@@ -1899,6 +1903,7 @@ PlotData export_plot_data(
                 local_res_r2.push_back(convert_resistance(res2[sink], spef2.r_unit));
                 local_res_net_names.push_back(net_name);
                 local_res_sink_names.push_back(sink);
+                local_res_driver_names.push_back(net1.driver);
             }
         }
         
@@ -1913,6 +1918,7 @@ PlotData export_plot_data(
             res_r2_vec.insert(res_r2_vec.end(), local_res_r2.begin(), local_res_r2.end());
             res_net_names.insert(res_net_names.end(), local_res_net_names.begin(), local_res_net_names.end());
             res_sink_names.insert(res_sink_names.end(), local_res_sink_names.begin(), local_res_sink_names.end());
+            res_driver_names.insert(res_driver_names.end(), local_res_driver_names.begin(), local_res_driver_names.end());
         }
     };
     
@@ -1947,6 +1953,7 @@ PlotData export_plot_data(
     
     result.res_net_names = std::move(res_net_names);
     result.res_sink_names = std::move(res_sink_names);
+    result.res_driver_names = std::move(res_driver_names);
     
     // Compute correlations
     auto corr_c = compute_pearson_correlation(cap_c1_vec, cap_c2_vec);
