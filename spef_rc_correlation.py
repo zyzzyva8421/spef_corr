@@ -504,6 +504,8 @@ class RcCorrApp:
         self._data_caps: List[CapComparison] = []
         self._data_ress: List[ResComparison] = []
         self._cpp_result = preload_cpp_result  # Keep C++ result directly
+        self._fanout_cache: Optional[Dict[str, int]] = None  # net_name -> fanout count
+        self._fanout_cache_ref: Optional[str] = None  # ref SPEF name for cache
         self.ref_var = tk.StringVar()
         self.fit_var = tk.StringVar()
         self.r_agg_var = tk.StringVar(value="max")
@@ -863,13 +865,39 @@ class RcCorrApp:
             messagebox.showerror("Invalid filter", f"Filter values must be numeric.\n{exc}")
             return None
 
+    def _get_fanout_cache(self) -> Dict[str, int]:
+        """Return a net_name -> fanout (sink count) mapping from the reference SPEF.
+        
+        Returns an empty dict when no SPEF is loaded (CSV-only mode); callers
+        should treat a missing key as "unknown fanout" and skip the fanout filter
+        for that point.
+        """
+        ref_name = self.ref_var.get() if hasattr(self, 'ref_var') else None
+        if ref_name == self._fanout_cache_ref and self._fanout_cache is not None:
+            return self._fanout_cache
+        cache: Dict[str, int] = {}
+        if ref_name and ref_name in self.spefs:
+            spef = self.spefs[ref_name]
+            if hasattr(spef, '_cpp_spef') and spef._cpp_spef is not None:
+                try:
+                    for net_name, net_data in spef._cpp_spef.nets.items():
+                        cache[net_name] = len(net_data.sinks)
+                except Exception as exc:
+                    print(f"[warn] Failed to build fanout cache: {exc}")
+        self._fanout_cache = cache
+        self._fanout_cache_ref = ref_name
+        return cache
+
     def _passes_filters(self, p, flt):
         mf = flt["min_fanout"]
         xf = flt["max_fanout"]
-        if mf is not None and p.get("fanout", 0) < mf:
-            return False
-        if xf is not None and p.get("fanout", 0) > xf:
-            return False
+        fanout = p.get("fanout")
+        # None means fanout is unknown (CSV-only mode) – skip fanout filter
+        if fanout is not None:
+            if mf is not None and fanout < mf:
+                return False
+            if xf is not None and fanout > xf:
+                return False
         if "c_ref" in p:
             mc = flt["min_c"]
             xc = flt["max_c"]
@@ -1020,6 +1048,7 @@ class RcCorrApp:
             # Always use C++ export_plot_data
             if hasattr(s1, '_cpp_spef') and s1._cpp_spef is not None and hasattr(s2, '_cpp_spef') and s2._cpp_spef is not None:
                 self._cpp_result = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, 0)
+                self._fanout_cache = None  # Invalidate cache when analysis changes
                 self._update_plot()
             else:
                 messagebox.showerror("Error", "SPEF files not parsed with C++ backend")
@@ -1085,14 +1114,18 @@ class RcCorrApp:
         
         # Apply filters if provided
         if flt:
+            # Build fanout lookup when fanout filter is active
+            fanout_active = flt.get("min_fanout") is not None or flt.get("max_fanout") is not None
+            fanout_map = self._get_fanout_cache() if fanout_active else {}
+            get_fanout = fanout_map.get if fanout_active else lambda _: None
             # Build point dicts for filtering
             cap_points = []
             for i, name in enumerate(cap_net_names):
-                p = {"net": name, "c_ref": float(cap_c1[i]), "c_fit": float(cap_c2[i]), "fanout": 0}
+                p = {"net": name, "c_ref": float(cap_c1[i]), "c_fit": float(cap_c2[i]), "fanout": get_fanout(name)}
                 cap_points.append(p)
             res_points = []
             for i, name in enumerate(res_net_names):
-                p = {"net": name, "r_ref": float(res_r1[i]), "r_fit": float(res_r2[i]), "fanout": 0}
+                p = {"net": name, "r_ref": float(res_r1[i]), "r_fit": float(res_r2[i]), "fanout": get_fanout(name)}
                 res_points.append(p)
             
             # Filter
@@ -1312,12 +1345,16 @@ class RcCorrApp:
         ax2 = fig.add_subplot(2, 1, 2)
 
         # Helper to apply filters to data
+        fanout_active = flt.get("min_fanout") is not None or flt.get("max_fanout") is not None
+        fanout_map = self._get_fanout_cache() if fanout_active else {}
+        get_fanout = fanout_map.get if fanout_active else lambda _: None
+
         def filter_cap_data(c1, c2, names):
             if not flt.get("min_c") and not flt.get("max_c") and not flt.get("min_fanout") and not flt.get("max_fanout"):
                 return c1, c2, names
             indices = []
             for i in range(len(c1)):
-                p = {"net": names[i], "c_ref": float(c1[i]), "c_fit": float(c2[i]), "fanout": 0}
+                p = {"net": names[i], "c_ref": float(c1[i]), "c_fit": float(c2[i]), "fanout": get_fanout(names[i])}
                 if self._passes_filters(p, flt):
                     indices.append(i)
             return c1[indices], c2[indices], [names[i] for i in indices]
@@ -1327,7 +1364,7 @@ class RcCorrApp:
                 return r1, r2, net_names, sink_names
             indices = []
             for i in range(len(r1)):
-                p = {"net": net_names[i], "r_ref": float(r1[i]), "r_fit": float(r2[i]), "fanout": 0}
+                p = {"net": net_names[i], "r_ref": float(r1[i]), "r_fit": float(r2[i]), "fanout": get_fanout(net_names[i])}
                 if self._passes_filters(p, flt):
                     indices.append(i)
             return r1[indices], r2[indices], [net_names[i] for i in indices], [sink_names[i] for i in indices]
