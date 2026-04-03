@@ -1027,6 +1027,7 @@ class RcCorrApp:
                 self._cpp_result.res_r2 = new_res.res_r2
                 self._cpp_result.res_net_names = new_res.res_net_names
                 self._cpp_result.res_sink_names = new_res.res_sink_names
+                self._cpp_result.res_driver_names = new_res.res_driver_names
                 self._cpp_result.res_count = new_res.res_count
                 self._cpp_result.res_correlation = new_res.res_correlation
             else:
@@ -1111,6 +1112,7 @@ class RcCorrApp:
         cap_net_names = list(plot_data.cap_net_names)
         res_net_names = list(plot_data.res_net_names)
         res_sink_names = list(plot_data.res_sink_names)
+        res_driver_names = list(plot_data.res_driver_names)
         
         # Apply filters if provided
         if flt:
@@ -1140,6 +1142,7 @@ class RcCorrApp:
             res_r2 = res_r2[res_indices]
             res_net_names = [res_net_names[i] for i in res_indices]
             res_sink_names = [res_sink_names[i] for i in res_indices]
+            res_driver_names = [res_driver_names[i] for i in res_indices]
         
         ref_name = self.ref_var.get() if hasattr(self, "ref_var") and self.ref_var.get() else "tool1"
         fit_name = self.fit_var.get() if hasattr(self, "fit_var") and self.fit_var.get() else "tool2"
@@ -1229,13 +1232,11 @@ class RcCorrApp:
             # Cache for kd-tree
             self._xs_r = res_r1
             self._ys_r = res_r2
-            res_net_names = plot_data.res_net_names
-            res_sink_names = plot_data.res_sink_names
             res_r1_list = res_r1.tolist()
             res_r2_list = res_r2.tolist()
             self._res_points = [
-                {"net": n, "r_ref": r1, "r_fit": r2, "load": s}
-                for n, r1, r2, s in zip(res_net_names, res_r1_list, res_r2_list, res_sink_names)
+                {"net": n, "r_ref": r1, "r_fit": r2, "load": s, "driver": d}
+                for n, r1, r2, s, d in zip(res_net_names, res_r1_list, res_r2_list, res_sink_names, res_driver_names)
             ]
         
         self.fig.tight_layout()

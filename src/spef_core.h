@@ -164,7 +164,7 @@ std::vector<std::tuple<std::string, double, double>> parse_cap_data(
 );
 
 // Parse CSV res data file (net,r1,r2 format)
-std::vector<std::tuple<std::string, std::string, double, double>> parse_res_data(
+std::vector<std::tuple<std::string, std::string, std::string, double, double>> parse_res_data(
     const std::string& path
 );
 
@@ -233,6 +233,7 @@ struct PlotData {
     py::array_t<double> res_r2;
     std::vector<std::string> res_net_names;
     std::vector<std::string> res_sink_names;
+    std::vector<std::string> res_driver_names;
     
     // Correlation values
     double cap_correlation;

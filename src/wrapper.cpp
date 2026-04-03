@@ -183,6 +183,7 @@ PYBIND11_MODULE(spef_core, m) {
         .def_readwrite("res_r2", &PlotData::res_r2)
         .def_readwrite("res_net_names", &PlotData::res_net_names)
         .def_readwrite("res_sink_names", &PlotData::res_sink_names)
+        .def_readwrite("res_driver_names", &PlotData::res_driver_names)
         .def_readwrite("cap_correlation", &PlotData::cap_correlation)
         .def_readwrite("res_correlation", &PlotData::res_correlation)
         .def_readwrite("cap_count", &PlotData::cap_count)
