@@ -46,11 +46,18 @@ except ImportError:
 # ===================== Python data structures for GUI =====================
 
 @dataclass
-@dataclass
 class CapComparison:
     net: str
     c1: float
     c2: float
+
+@dataclass
+class CouplingCapComparison:
+    """Compare coupling capacitance between two nets across two SPEF files."""
+    net1: str  # First net name
+    net2: str  # Second net name
+    c1: float  # Coupling cap in spef1
+    c2: float  # Coupling cap in spef2
 
 @dataclass
 class ResComparison:
@@ -172,6 +179,24 @@ def compare_spef_cpp(spef1_path: str, spef2_path: str, num_threads: int = 0) -> 
     top_10_res = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.top_10_res]
     
     return caps, ress, top_10_cap, top_10_res
+
+
+def compare_coupling_caps_cpp(spef1: "SpefFile", spef2: "SpefFile") -> List[CouplingCapComparison]:
+    """Compare coupling capacitances between two SPEF files using C++ backend."""
+    if not HAS_CPP:
+        raise RuntimeError("C++ extension not available")
+    
+    if not hasattr(spef1, '_cpp_spef') or spef1._cpp_spef is None:
+        raise RuntimeError("SPEF1 not parsed with C++ backend")
+    if not hasattr(spef2, '_cpp_spef') or spef2._cpp_spef is None:
+        raise RuntimeError("SPEF2 not parsed with C++ backend")
+    
+    try:
+        cc_results = spef_core.compare_coupling_caps(spef1._cpp_spef, spef2._cpp_spef)
+        return [CouplingCapComparison(cc.net1, cc.net2, cc.c1, cc.c2) for cc in cc_results]
+    except Exception as e:
+        print(f"[warn] Coupling cap comparison failed: {e}")
+        return []
 
 
 def compare_spef_cpp_objs(spef1: "SpefFile", spef2: "SpefFile", num_threads: int = 0):
@@ -503,12 +528,15 @@ class RcCorrApp:
         self.spefs: Dict[str, SpefFile] = {}
         self._data_caps: List[CapComparison] = []
         self._data_ress: List[ResComparison] = []
+        self._data_coupling_caps: List[CouplingCapComparison] = []  # New: coupling cap comparisons
         self._cpp_result = preload_cpp_result  # Keep C++ result directly
         self._fanout_cache: Optional[Dict[str, int]] = None  # net_name -> fanout count
         self._fanout_cache_ref: Optional[str] = None  # ref SPEF name for cache
         self.ref_var = tk.StringVar()
         self.fit_var = tk.StringVar()
         self.r_agg_var = tk.StringVar(value="max")
+        self.view_mode_var = tk.StringVar(value="total_cap")  # New: view mode (total_cap or coupling_cap)
+        self.stat_metric_var = tk.StringVar(value="stddev")  # New: histogram metric (stddev or rmse)
         self._auto_run_requested = auto_run
         self._build_ui()
 
@@ -611,6 +639,11 @@ class RcCorrApp:
             return
         if event.xdata is None or event.ydata is None:
             return
+        # In coupling-cap mode, only ax_c is a scatter plot; ax_r is histogram.
+        if self.view_mode_var.get() == "coupling_cap" and ax is self.ax_r:
+            if hasattr(self, '_tooltip_window') and self._tooltip_window is not None:
+                self._hide_tooltip()
+            return
         import numpy as np
         if ax is self.ax_c and self._xs_c is not None and len(self._xs_c):
             xs_arr = self._xs_c
@@ -664,13 +697,27 @@ class RcCorrApp:
             fit_v = p["c_fit"]
             delta = fit_v - ref_v
             ratio = fit_v / ref_v if ref_v != 0 else float('inf')
-            text = (
-                f"net: {p['net']}\n"
-                f"C_ref : {fmt(ref_v)}\n"
-                f"C_fit : {fmt(fit_v)}\n"
-                f"delta : {fmt(delta)}\n"
-                f"ratio : {ratio:.4f}"
-            )
+            if "net1" in p and "net2" in p:
+                text = (
+                    f"net1: {p['net1']}\n"
+                    f"net2: {p['net2']}\n"
+                    f"Cc_ref : {fmt(ref_v)}\n"
+                    f"Cc_fit : {fmt(fit_v)}\n"
+                    f"delta  : {fmt(delta)}\n"
+                    f"ratio  : {ratio:.4f}"
+                )
+                if "pct_ref" in p:
+                    text += f"\nCc% ref: {p['pct_ref']:.4f}%"
+                if "pct_fit" in p:
+                    text += f"\nCc% fit: {p['pct_fit']:.4f}%"
+            else:
+                text = (
+                    f"net: {p['net']}\n"
+                    f"C_ref : {fmt(ref_v)}\n"
+                    f"C_fit : {fmt(fit_v)}\n"
+                    f"delta : {fmt(delta)}\n"
+                    f"ratio : {ratio:.4f}"
+                )
             if "fanout" in p:
                 text += f"\nfanout: {int(p['fanout'])}"
         else:
@@ -785,48 +832,79 @@ class RcCorrApp:
         srm = ttk.LabelFrame(self.root, text="Settings & Filters")
         srm.pack(fill="x", padx=5, pady=5)
 
+        # Row 0a: view mode selection (NEW)
+        ttk.Label(srm, text="View Mode:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        self.view_mode_combo = ttk.Combobox(srm, textvariable=self.view_mode_var, 
+                                           values=["total_cap", "coupling_cap"], 
+                                           state="readonly", width=15)
+        self.view_mode_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        self.view_mode_combo.bind("<<ComboboxSelected>>", lambda e: self._on_view_mode_change())
+        
+        # Row 0b: stat metric selection (NEW)
+        ttk.Label(srm, text="Histogram Metric:").grid(row=0, column=2, sticky="w", padx=5, pady=2)
+        self.stat_metric_combo = ttk.Combobox(srm, textvariable=self.stat_metric_var, 
+                                             values=["stddev", "rmse"], 
+                                             state="readonly", width=12)
+        self.stat_metric_combo.grid(row=0, column=3, sticky="w", padx=5, pady=2)
+
         # Row 0: reference & fit selection
-        ttk.Label(srm, text="Reference:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(srm, text="Reference:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
         self.ref_combo = ttk.Combobox(srm, textvariable=self.ref_var, state="readonly", width=15)
-        self.ref_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        self.ref_combo.grid(row=1, column=1, sticky="w", padx=5, pady=2)
 
-        ttk.Label(srm, text="Fit:").grid(row=0, column=2, sticky="w", padx=5, pady=2)
+        ttk.Label(srm, text="Fit:").grid(row=1, column=2, sticky="w", padx=5, pady=2)
         self.fit_combo = ttk.Combobox(srm, textvariable=self.fit_var, state="readonly", width=15)
-        self.fit_combo.grid(row=0, column=3, sticky="w", padx=5, pady=2)
+        self.fit_combo.grid(row=1, column=3, sticky="w", padx=5, pady=2)
 
-        # Row 1: fanout range
+        # Row 2: fanout range
         self.min_fanout_var = tk.StringVar(value="")
         self.max_fanout_var = tk.StringVar(value="")
-        ttk.Label(srm, text="Fanout range:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(srm, textvariable=self.min_fanout_var, width=8).grid(row=1, column=1, sticky="w", padx=5, pady=2)
-        ttk.Label(srm, text="to").grid(row=1, column=2, sticky="w", padx=2, pady=2)
-        ttk.Entry(srm, textvariable=self.max_fanout_var, width=8).grid(row=1, column=3, sticky="w", padx=5, pady=2)
+        ttk.Label(srm, text="Fanout range:").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        ttk.Entry(srm, textvariable=self.min_fanout_var, width=8).grid(row=2, column=1, sticky="w", padx=5, pady=2)
+        ttk.Label(srm, text="to").grid(row=2, column=2, sticky="w", padx=2, pady=2)
+        ttk.Entry(srm, textvariable=self.max_fanout_var, width=8).grid(row=2, column=3, sticky="w", padx=5, pady=2)
 
-        # Row 2: cap range (reference)
+        # Row 3: cap range (reference) - for total cap
         self.min_c_var = tk.StringVar(value="")
         self.max_c_var = tk.StringVar(value="")
-        ttk.Label(srm, text="Cap range (ref C):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(srm, textvariable=self.min_c_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=2)
-        ttk.Label(srm, text="to").grid(row=2, column=2, sticky="w", padx=2, pady=2)
-        ttk.Entry(srm, textvariable=self.max_c_var, width=10).grid(row=2, column=3, sticky="w", padx=5, pady=2)
+        ttk.Label(srm, text="Cap range (ref C):").grid(row=3, column=0, sticky="w", padx=5, pady=2)
+        ttk.Entry(srm, textvariable=self.min_c_var, width=10).grid(row=3, column=1, sticky="w", padx=5, pady=2)
+        ttk.Label(srm, text="to").grid(row=3, column=2, sticky="w", padx=2, pady=2)
+        ttk.Entry(srm, textvariable=self.max_c_var, width=10).grid(row=3, column=3, sticky="w", padx=5, pady=2)
 
-        # Row 3: R range (reference, aggregated)
+        # Row 4: coupling cap range (NEW)
+        self.min_coupling_cap_var = tk.StringVar(value="")
+        self.max_coupling_cap_var = tk.StringVar(value="")
+        ttk.Label(srm, text="Coupling cap range:").grid(row=4, column=0, sticky="w", padx=5, pady=2)
+        ttk.Entry(srm, textvariable=self.min_coupling_cap_var, width=10).grid(row=4, column=1, sticky="w", padx=5, pady=2)
+        ttk.Label(srm, text="to").grid(row=4, column=2, sticky="w", padx=2, pady=2)
+        ttk.Entry(srm, textvariable=self.max_coupling_cap_var, width=10).grid(row=4, column=3, sticky="w", padx=5, pady=2)
+
+        # Row 5: coupling cap percentage range (NEW)
+        self.min_coupling_pct_var = tk.StringVar(value="")
+        self.max_coupling_pct_var = tk.StringVar(value="")
+        ttk.Label(srm, text="Coupling % (ref):").grid(row=5, column=0, sticky="w", padx=5, pady=2)
+        ttk.Entry(srm, textvariable=self.min_coupling_pct_var, width=10).grid(row=5, column=1, sticky="w", padx=5, pady=2)
+        ttk.Label(srm, text="to").grid(row=5, column=2, sticky="w", padx=2, pady=2)
+        ttk.Entry(srm, textvariable=self.max_coupling_pct_var, width=10).grid(row=5, column=3, sticky="w", padx=5, pady=2)
+
+        # Row 6: R range (reference, aggregated)
         self.min_r_var = tk.StringVar(value="")
         self.max_r_var = tk.StringVar(value="")
-        ttk.Label(srm, text="R range (ref, agg):").grid(row=3, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(srm, textvariable=self.min_r_var, width=10).grid(row=3, column=1, sticky="w", padx=5, pady=2)
-        ttk.Label(srm, text="to").grid(row=3, column=2, sticky="w", padx=2, pady=2)
-        ttk.Entry(srm, textvariable=self.max_r_var, width=10).grid(row=3, column=3, sticky="w", padx=5, pady=2)
+        ttk.Label(srm, text="R range (ref, agg):").grid(row=6, column=0, sticky="w", padx=5, pady=2)
+        ttk.Entry(srm, textvariable=self.min_r_var, width=10).grid(row=6, column=1, sticky="w", padx=5, pady=2)
+        ttk.Label(srm, text="to").grid(row=6, column=2, sticky="w", padx=2, pady=2)
+        ttk.Entry(srm, textvariable=self.max_r_var, width=10).grid(row=6, column=3, sticky="w", padx=5, pady=2)
 
-        # Row 4: R aggregation, run button, correlation label
-        ttk.Label(srm, text="R aggregation:").grid(row=4, column=0, sticky="w", padx=5, pady=2)
-        ttk.Combobox(srm, textvariable=self.r_agg_var, values=["max", "avg", "total"], state="readonly", width=8).grid(row=4, column=1, sticky="w", padx=5, pady=2)
+        # Row 7: R aggregation, run button, correlation label
+        ttk.Label(srm, text="R aggregation:").grid(row=7, column=0, sticky="w", padx=5, pady=2)
+        ttk.Combobox(srm, textvariable=self.r_agg_var, values=["max", "avg", "total"], state="readonly", width=8).grid(row=7, column=1, sticky="w", padx=5, pady=2)
 
-        ttk.Button(srm, text="Run Analysis", command=self._run_analysis).grid(row=4, column=2, sticky="w", padx=5, pady=2)
-        ttk.Button(srm, text="Diff Histogram", command=self._show_histogram).grid(row=4, column=4, sticky="w", padx=5, pady=2)
+        ttk.Button(srm, text="Run Analysis", command=self._run_analysis).grid(row=7, column=2, sticky="w", padx=5, pady=2)
+        ttk.Button(srm, text="Diff Histogram", command=self._show_histogram).grid(row=7, column=4, sticky="w", padx=5, pady=2)
 
         self.corr_label = ttk.Label(srm, text="")
-        self.corr_label.grid(row=4, column=3, sticky="w", padx=5, pady=2)
+        self.corr_label.grid(row=7, column=3, sticky="w", padx=5, pady=2)
 
         # Plot frame
         pframe = ttk.LabelFrame(self.root, text="Correlation Plot")
@@ -857,6 +935,10 @@ class RcCorrApp:
                 "max_fanout": to_int(self.max_fanout_var.get()),
                 "min_c": to_float(self.min_c_var.get()),
                 "max_c": to_float(self.max_c_var.get()),
+                "min_coupling_cap": to_float(self.min_coupling_cap_var.get()),
+                "max_coupling_cap": to_float(self.max_coupling_cap_var.get()),
+                "min_coupling_pct": to_float(self.min_coupling_pct_var.get()),
+                "max_coupling_pct": to_float(self.max_coupling_pct_var.get()),
                 "min_r": to_float(self.min_r_var.get()),
                 "max_r": to_float(self.max_r_var.get()),
             }
@@ -864,6 +946,10 @@ class RcCorrApp:
             import tkinter.messagebox as messagebox
             messagebox.showerror("Invalid filter", f"Filter values must be numeric.\n{exc}")
             return None
+
+    def _on_view_mode_change(self) -> None:
+        """Handle view mode change between total_cap and coupling_cap."""
+        self._update_plot()
 
     def _get_fanout_cache(self) -> Dict[str, int]:
         """Return a net_name -> fanout (sink count) mapping from the reference SPEF.
@@ -904,6 +990,20 @@ class RcCorrApp:
             if mc is not None and p["c_ref"] < mc:
                 return False
             if xc is not None and p["c_ref"] > xc:
+                return False
+        if "cc_ref" in p:
+            mc = flt["min_coupling_cap"]
+            xc = flt["max_coupling_cap"]
+            if mc is not None and p["cc_ref"] < mc:
+                return False
+            if xc is not None and p["cc_ref"] > xc:
+                return False
+        if "cc_pct_ref" in p:
+            mp = flt["min_coupling_pct"]
+            xp = flt["max_coupling_pct"]
+            if mp is not None and p["cc_pct_ref"] < mp:
+                return False
+            if xp is not None and p["cc_pct_ref"] > xp:
                 return False
         if "r_ref" in p:
             mr = flt["min_r"]
@@ -1050,6 +1150,13 @@ class RcCorrApp:
             if hasattr(s1, '_cpp_spef') and s1._cpp_spef is not None and hasattr(s2, '_cpp_spef') and s2._cpp_spef is not None:
                 self._cpp_result = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, 0)
                 self._fanout_cache = None  # Invalidate cache when analysis changes
+                try:
+                    self._data_coupling_caps = compare_coupling_caps_cpp(s1, s2)
+                    print(f"Found {len(self._data_coupling_caps)} coupling cap pairs")
+                except Exception as e:
+                    print(f"[warn] Coupling cap analysis failed: {e}")
+                    self._data_coupling_caps = []
+                
                 self._update_plot()
             else:
                 messagebox.showerror("Error", "SPEF files not parsed with C++ backend")
@@ -1079,13 +1186,168 @@ class RcCorrApp:
         
         # Parse filters
         flt = self._parse_filters()
+        if flt is None:
+            return
         
-        # Use C++ result - always available when data is loaded
-        if self._cpp_result is not None:
-            self._update_plot_from_plotdata(self._cpp_result, flt)
+        view_mode = self.view_mode_var.get()
+        
+        if view_mode == "coupling_cap":
+            # Show coupling capacitance scatter plot
+            self._update_coupling_cap_plot(flt)
+        else:
+            # Show total cap + resistance correlation (existing behavior)
+            if self._cpp_result is not None:
+                self._update_plot_from_plotdata(self._cpp_result, flt)
         
         self.fig.tight_layout()
         self.canvas.draw()
+
+    def _update_coupling_cap_plot(self, flt=None) -> None:
+        """Plot coupling capacitance correlation in the ax_c and ax_r axes."""
+        try:
+            import numpy as np
+        except ImportError:
+            self.ax_c.set_title("coupling cap: numpy required")
+            return
+        
+        # If no data yet, try computing now
+        ref_name = self.ref_var.get()
+        fit_name = self.fit_var.get()
+        
+        if not self._data_coupling_caps and ref_name in self.spefs and fit_name in self.spefs:
+            try:
+                s1 = self.spefs[ref_name]
+                s2 = self.spefs[fit_name]
+                self._data_coupling_caps = compare_coupling_caps_cpp(s1, s2)
+            except Exception as e:
+                self.ax_c.set_title(f"coupling cap: failed - {e}")
+                return
+        
+        if not self._data_coupling_caps:
+            self.ax_c.set_title("No coupling capacitance data available\n(Run Analysis first)")
+            return
+        
+        # Apply filters
+        coupling_points = self._filter_coupling_cap_points(self._data_coupling_caps, flt)
+        
+        if not coupling_points:
+            self.ax_c.set_title("No coupling cap data after filtering")
+            return
+        
+        c1_arr = np.array([p["c_ref"] for p in coupling_points])
+        c2_arr = np.array([p["c_fit"] for p in coupling_points])
+        
+        min_c = float(np.minimum(c1_arr.min(), c2_arr.min()))
+        max_c = float(np.maximum(c1_arr.max(), c2_arr.max()))
+        span = max_c - min_c or 1.0
+        pad = 0.05 * span
+        vmin, vmax = min_c - pad, max_c + pad
+        
+        self.ax_c.plot([vmin, vmax], [vmin, vmax], "k--", linewidth=1.0)
+        
+        red_mask = c2_arr > c1_arr
+        if np.any(red_mask):
+            self.ax_c.plot(c1_arr[red_mask], c2_arr[red_mask], "o", markersize=3,
+                          markerfacecolor="none", markeredgecolor="red", alpha=0.6)
+        if np.any(~red_mask):
+            self.ax_c.plot(c1_arr[~red_mask], c2_arr[~red_mask], "o", markersize=3,
+                          markerfacecolor="none", markeredgecolor="blue", alpha=0.6)
+        
+        self.ax_c.set_xlim(vmin, vmax)
+        self.ax_c.set_ylim(vmin, vmax)
+        
+        corr = pearson_corr(c1_arr.tolist(), c2_arr.tolist())
+        title = f"Coupling Cap: {ref_name} (X) vs {fit_name} (Y)  n={len(coupling_points)}"
+        if corr:
+            title += f"  (corr={corr:.4f})"
+        self.ax_c.set_title(title)
+        self.ax_c.set_xlabel(f"{ref_name} Coupling Cap")
+        self.ax_c.set_ylabel(f"{fit_name} Coupling Cap")
+        self.ax_c.grid(True, alpha=0.3)
+        
+        # Cache for hover tooltip
+        self._xs_c = c1_arr
+        self._ys_c = c2_arr
+        self._cap_points = coupling_points
+        self._xs_r = None
+        self._ys_r = None
+        self._res_points = []
+        self._kd_r = None
+        
+        # Build kd-tree if numpy available
+        try:
+            from scipy.spatial import cKDTree
+            if len(coupling_points) > 100000:
+                self._kd_c = cKDTree(np.column_stack((c1_arr, c2_arr)))
+            else:
+                self._kd_c = None
+        except ImportError:
+            self._kd_c = None
+        
+        # Show delta histogram in ax_r
+        diffs = np.abs(c1_arr - c2_arr)
+        self._draw_diff_histogram_ax(self.ax_r, diffs.tolist(), 
+                                     f"Coupling Cap |Δ| Distribution (n={len(diffs)})")
+        
+        # Update corr label
+        self.corr_label.config(text=f"corr={corr:.4f}" if corr else "corr=N/A")
+
+    def _filter_coupling_cap_points(self, coupling_caps: List[CouplingCapComparison], flt) -> list:
+        """Filter coupling cap points and return list of dicts for plotting."""
+        if not coupling_caps:
+            return []
+        
+        # Build total_cap lookups for percentage filtering
+        total_cap_map_ref = {}
+        total_cap_map_fit = {}
+        ref_name = self.ref_var.get()
+        fit_name = self.fit_var.get()
+        if ref_name and ref_name in self.spefs:
+            spef = self.spefs[ref_name]
+            if hasattr(spef, '_cpp_spef') and spef._cpp_spef is not None:
+                try:
+                    for net_name, net_data in spef._cpp_spef.nets.items():
+                        total_cap_map_ref[net_name] = net_data.total_cap
+                except Exception:
+                    pass
+        if fit_name and fit_name in self.spefs:
+            spef = self.spefs[fit_name]
+            if hasattr(spef, '_cpp_spef') and spef._cpp_spef is not None:
+                try:
+                    for net_name, net_data in spef._cpp_spef.nets.items():
+                        total_cap_map_fit[net_name] = net_data.total_cap
+                except Exception:
+                    pass
+        
+        points = []
+        for cc in coupling_caps:
+            c_ref = cc.c1
+            c_fit = cc.c2
+            
+            total_ref = max(total_cap_map_ref.get(cc.net1, 0.0), total_cap_map_ref.get(cc.net2, 0.0))
+            total_fit = max(total_cap_map_fit.get(cc.net1, 0.0), total_cap_map_fit.get(cc.net2, 0.0))
+            pct_ref = (c_ref / total_ref * 100.0) if total_ref > 0 else 0.0
+            pct_fit = (c_fit / total_fit * 100.0) if total_fit > 0 else 0.0
+
+            if flt:
+                p = {
+                    "cc_ref": c_ref,
+                    "cc_fit": c_fit,
+                    "cc_pct_ref": pct_ref,
+                }
+                if not self._passes_filters(p, flt):
+                    continue
+            
+            points.append({
+                "net1": cc.net1,
+                "net2": cc.net2,
+                "c_ref": c_ref,
+                "c_fit": c_fit,
+                "pct_ref": pct_ref,
+                "pct_fit": pct_fit,
+            })
+        
+        return points
 
     def _update_plot_from_cpp(self, flt=None) -> None:
         """Extract data directly from C++ PlotData result with optional filters."""
@@ -1188,7 +1450,6 @@ class RcCorrApp:
             # Cache for kd-tree (if available)
             self._xs_c = cap_c1
             self._ys_c = cap_c2
-            cap_net_names = plot_data.cap_net_names
             cap_c1_list = cap_c1.tolist()
             cap_c2_list = cap_c2.tolist()
             self._cap_points = [
@@ -1254,6 +1515,8 @@ class RcCorrApp:
         mean = float(sum(diffs)) / len(diffs)
         variance = sum((x - mean) ** 2 for x in diffs) / max(len(diffs) - 1, 1)
         stddev = math.sqrt(variance)
+        # RMSE: sqrt(sum(x^2) / n) - root mean square of the differences
+        rmse = math.sqrt(sum(x ** 2 for x in diffs) / max(len(diffs), 1))
         dmin = min(diffs)
         dmax = max(diffs)
         counts, bin_edges = np.histogram(diffs, bins=n_bins)
@@ -1266,8 +1529,14 @@ class RcCorrApp:
         x_range = max_abs * 1.1  # Add 10% padding
         xmin = -x_range
         xmax = x_range
-        s1 = stddev
-        s2 = 2.0 * stddev
+        # Choose metric based on GUI selection
+        metric = self.stat_metric_var.get()
+        if metric == "rmse":
+            s1 = rmse
+            s2 = 2.0 * rmse
+        else:  # stddev (default)
+            s1 = stddev
+            s2 = 2.0 * stddev
         # Pink: beyond ±2σ
         ax.axvspan(xmin, mean - s2, color="#FFB3DE", zorder=0)
         ax.axvspan(mean + s2, xmax, color="#FFB3DE", zorder=0)
@@ -1276,20 +1545,33 @@ class RcCorrApp:
         ax.axvspan(mean + s1, mean + s2, color="#AAAAEE", zorder=0)
         # Yellow: within ±1σ
         ax.axvspan(mean - s1, mean + s1, color="yellow", zorder=0)
-        s3 = 3.0 * stddev
+        s3_val = 3.0 * (rmse if metric == "rmse" else stddev)
         for count, left, right in zip(counts, bin_edges[:-1], bin_edges[1:]):
             bin_center = (float(left) + float(right)) / 2.0
             dist = abs(bin_center - mean)
-            if stddev == 0.0:
-                color = "darkgreen"
-            elif dist <= s1:
-                color = "darkgreen"
-            elif dist <= s2:
-                color = "blue"
-            elif dist <= s3:
-                color = "red"
-            else:
-                color = "black"
+            if metric == "rmse":
+                ref_val = rmse
+                if ref_val == 0.0:
+                    color = "darkgreen"
+                elif dist <= s1:
+                    color = "darkgreen"
+                elif dist <= s2:
+                    color = "blue"
+                elif dist <= s3_val:
+                    color = "red"
+                else:
+                    color = "black"
+            else:  # stddev
+                if stddev == 0.0:
+                    color = "darkgreen"
+                elif dist <= s1:
+                    color = "darkgreen"
+                elif dist <= s2:
+                    color = "blue"
+                elif dist <= s3_val:
+                    color = "red"
+                else:
+                    color = "black"
             ax.bar(float(left), int(count), width=float(right - left), align="edge", color=color, zorder=2)
         ax.set_xlim(xmin, xmax)
         def _fmt(v):
@@ -1298,13 +1580,23 @@ class RcCorrApp:
             if abs(v) >= 0.001:
                 return f"{v:.4f}"
             return f"{v:.4e}"
-        stats_text = (
-            "Difference Stats:\n\n"
-            f"Mean: {_fmt(mean)}\n\n"
-            f"StdDev: {_fmt(stddev)}\n\n"
-            f"Min: {_fmt(dmin)}\n\n"
-            f"Max: {_fmt(dmax)}"
-        )
+        # Build stats text based on selected metric
+        if metric == "rmse":
+            stats_text = (
+                "Difference Stats:\n\n"
+                f"Mean: {_fmt(mean)}\n\n"
+                f"RMSE: {_fmt(rmse)}\n\n"
+                f"Min: {_fmt(dmin)}\n\n"
+                f"Max: {_fmt(dmax)}"
+            )
+        else:  # stddev
+            stats_text = (
+                "Difference Stats:\n\n"
+                f"Mean: {_fmt(mean)}\n\n"
+                f"StdDev: {_fmt(stddev)}\n\n"
+                f"Min: {_fmt(dmin)}\n\n"
+                f"Max: {_fmt(dmax)}"
+            )
         ax.text(
             0.98, 0.97,
             stats_text,
@@ -1370,40 +1662,55 @@ class RcCorrApp:
                     indices.append(i)
             return r1[indices], r2[indices], [net_names[i] for i in indices], [sink_names[i] for i in indices]
 
-        # Capacitance histogram
-        if self._cpp_result is not None and self._cpp_result.cap_count > 0:
-            cap_c1 = np.asarray(self._cpp_result.cap_c1)
-            cap_c2 = np.asarray(self._cpp_result.cap_c2)
-            cap_names = list(self._cpp_result.cap_net_names)
-            cap_c1_f, cap_c2_f, cap_names_f = filter_cap_data(cap_c1, cap_c2, cap_names)
-            diffs = np.abs(cap_c1_f - cap_c2_f)
-            self._draw_diff_histogram_ax(ax1, diffs, f"Cap Diff (n={len(diffs)}, filtered)")
-        elif getattr(self, '_xs_c', None) is not None and len(self._xs_c):
-            # Use cached data from plotting
-            cap_c1 = np.asarray(self._xs_c)
-            cap_c2 = np.asarray(self._ys_c)
-            cap_names = [p["net"] for p in getattr(self, '_cap_points', [])]
-            cap_c1_f, cap_c2_f, _ = filter_cap_data(cap_c1, cap_c2, cap_names)
-            diffs = np.abs(cap_c1_f - cap_c2_f)
-            self._draw_diff_histogram_ax(ax1, diffs, f"Cap Diff (n={len(diffs)}, filtered)")
+        if self.view_mode_var.get() == "coupling_cap":
+            points = self._filter_coupling_cap_points(self._data_coupling_caps, flt)
+            diffs = np.abs(np.asarray([p["c_ref"] for p in points]) - np.asarray([p["c_fit"] for p in points])) if points else np.asarray([])
+            self._draw_diff_histogram_ax(ax1, diffs.tolist(), f"Coupling Cap Diff (n={len(diffs)}, filtered)")
+            ax2.set_title("Coupling % (ref) Distribution")
+            if points:
+                pct = np.asarray([p.get("pct_ref", 0.0) for p in points])
+                ax2.hist(pct, bins=80, color="#3b82f6", alpha=0.8)
+                ax2.set_xlabel("Coupling % of total cap (ref)")
+                ax2.set_ylabel("Count")
+                ax2.grid(True, alpha=0.3)
+            else:
+                ax2.text(0.5, 0.5, "No data after filtering", transform=ax2.transAxes,
+                         ha="center", va="center")
+        else:
+            # Capacitance histogram
+            if self._cpp_result is not None and self._cpp_result.cap_count > 0:
+                cap_c1 = np.asarray(self._cpp_result.cap_c1)
+                cap_c2 = np.asarray(self._cpp_result.cap_c2)
+                cap_names = list(self._cpp_result.cap_net_names)
+                cap_c1_f, cap_c2_f, _ = filter_cap_data(cap_c1, cap_c2, cap_names)
+                diffs = np.abs(cap_c1_f - cap_c2_f)
+                self._draw_diff_histogram_ax(ax1, diffs, f"Cap Diff (n={len(diffs)}, filtered)")
+            elif getattr(self, '_xs_c', None) is not None and len(self._xs_c):
+                # Use cached data from plotting
+                cap_c1 = np.asarray(self._xs_c)
+                cap_c2 = np.asarray(self._ys_c)
+                cap_names = [p["net"] for p in getattr(self, '_cap_points', [])]
+                cap_c1_f, cap_c2_f, _ = filter_cap_data(cap_c1, cap_c2, cap_names)
+                diffs = np.abs(cap_c1_f - cap_c2_f)
+                self._draw_diff_histogram_ax(ax1, diffs, f"Cap Diff (n={len(diffs)}, filtered)")
 
-        # Resistance histogram
-        if self._cpp_result is not None and self._cpp_result.res_count > 0:
-            res_r1 = np.asarray(self._cpp_result.res_r1)
-            res_r2 = np.asarray(self._cpp_result.res_r2)
-            res_net_names = list(self._cpp_result.res_net_names)
-            res_sink_names = list(self._cpp_result.res_sink_names)
-            res_r1_f, res_r2_f, _, _ = filter_res_data(res_r1, res_r2, res_net_names, res_sink_names)
-            diffs = np.abs(res_r1_f - res_r2_f)
-            self._draw_diff_histogram_ax(ax2, diffs, f"Res Diff (n={len(diffs)}, filtered)")
-        elif getattr(self, '_xs_r', None) is not None and len(self._xs_r):
-            res_r1 = np.asarray(self._xs_r)
-            res_r2 = np.asarray(self._ys_r)
-            res_net_names = [p["net"] for p in getattr(self, '_res_points', [])]
-            res_sink_names = [p.get("load", "") for p in getattr(self, '_res_points', [])]
-            res_r1_f, res_r2_f, _, _ = filter_res_data(res_r1, res_r2, res_net_names, res_sink_names)
-            diffs = np.abs(res_r1_f - res_r2_f)
-            self._draw_diff_histogram_ax(ax2, diffs, f"Res Diff (n={len(diffs)}, filtered)")
+            # Resistance histogram
+            if self._cpp_result is not None and self._cpp_result.res_count > 0:
+                res_r1 = np.asarray(self._cpp_result.res_r1)
+                res_r2 = np.asarray(self._cpp_result.res_r2)
+                res_net_names = list(self._cpp_result.res_net_names)
+                res_sink_names = list(self._cpp_result.res_sink_names)
+                res_r1_f, res_r2_f, _, _ = filter_res_data(res_r1, res_r2, res_net_names, res_sink_names)
+                diffs = np.abs(res_r1_f - res_r2_f)
+                self._draw_diff_histogram_ax(ax2, diffs, f"Res Diff (n={len(diffs)}, filtered)")
+            elif getattr(self, '_xs_r', None) is not None and len(self._xs_r):
+                res_r1 = np.asarray(self._xs_r)
+                res_r2 = np.asarray(self._ys_r)
+                res_net_names = [p["net"] for p in getattr(self, '_res_points', [])]
+                res_sink_names = [p.get("load", "") for p in getattr(self, '_res_points', [])]
+                res_r1_f, res_r2_f, _, _ = filter_res_data(res_r1, res_r2, res_net_names, res_sink_names)
+                diffs = np.abs(res_r1_f - res_r2_f)
+                self._draw_diff_histogram_ax(ax2, diffs, f"Res Diff (n={len(diffs)}, filtered)")
 
         fig.tight_layout()
         FigureCanvasTkAgg(fig, master=win).get_tk_widget().pack(fill="both", expand=True)

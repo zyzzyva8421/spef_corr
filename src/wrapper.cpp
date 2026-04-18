@@ -14,6 +14,13 @@ PYBIND11_MODULE(spef_core, m) {
         .def_readwrite("to", &Edge::to)
         .def_readwrite("weight", &Edge::weight);
     
+    // CouplingCap struct
+    py::class_<CouplingCap>(m, "CouplingCap")
+        .def(py::init<>())
+        .def_readwrite("net1", &CouplingCap::net1)
+        .def_readwrite("net2", &CouplingCap::net2)
+        .def_readwrite("cap_value", &CouplingCap::cap_value);
+    
     // NetData class
     py::class_<NetData>(m, "NetData")
         .def(py::init<>())
@@ -29,10 +36,20 @@ PYBIND11_MODULE(spef_core, m) {
         .def(py::init<>())
         .def_readwrite("name_map", &ParsedSpef::name_map)
         .def_readwrite("nets", &ParsedSpef::nets)
+        .def_readwrite("coupling_caps", &ParsedSpef::coupling_caps)
         .def_readwrite("t_unit", &ParsedSpef::t_unit)
         .def_readwrite("c_unit", &ParsedSpef::c_unit)
         .def_readwrite("r_unit", &ParsedSpef::r_unit)
         .def_readwrite("l_unit", &ParsedSpef::l_unit);
+    
+    // CouplingCapComparison struct
+    py::class_<CouplingCapComparison>(m, "CouplingCapComparison")
+        .def(py::init<>())
+        .def_readwrite("net1", &CouplingCapComparison::net1)
+        .def_readwrite("net2", &CouplingCapComparison::net2)
+        .def_readwrite("c1", &CouplingCapComparison::c1)
+        .def_readwrite("c2", &CouplingCapComparison::c2);
+
     
     // ResistanceResult struct
     py::class_<ResistanceResult>(m, "ResistanceResult")
@@ -82,6 +99,11 @@ PYBIND11_MODULE(spef_core, m) {
     
     // Module functions
     m.def("parse_spef", &parse_spef, "Parse SPEF file", py::arg("filepath"));
+    
+    m.def("compare_coupling_caps", &compare_coupling_caps,
+          "Compare coupling capacitances between two SPEF files",
+          py::arg("spef1"),
+          py::arg("spef2"));
     
     m.def("shuffle_spef", &shuffle_spef, "Shuffle SPEF net IDs",
           py::arg("input_path"),

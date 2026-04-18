@@ -2,6 +2,113 @@
 #include <iomanip>
 #include <sstream>
 
+// ============== Coupling Capacitance Resolution ==============
+void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
+    auto resolve_node_to_net = [&](const std::string& node) -> std::string {
+        if (node.empty()) return "";
+        if (spef.nets.find(node) != spef.nets.end()) {
+            return node;
+        }
+        size_t colon = node.find(':');
+        std::string base = (colon == std::string::npos) ? node : node.substr(0, colon);
+        if (spef.nets.find(base) != spef.nets.end()) {
+            return base;
+        }
+        if (!base.empty() && base[0] == '*') {
+            auto it = spef.name_map.find(base);
+            if (it != spef.name_map.end()) {
+                const std::string& mapped = it->second;
+                if (spef.nets.find(mapped) != spef.nets.end()) {
+                    return mapped;
+                }
+            }
+        }
+        return "";
+    };
+
+    // Process raw coupling capacitances from each net.
+    for (auto& [net_name, net_data] : spef.nets) {
+        for (const auto& raw_entry : net_data.raw_coupling_caps) {
+            // Parse: node1_raw|node2_raw|cap_value
+            size_t pos1 = raw_entry.find('|');
+            size_t pos2 = raw_entry.rfind('|');
+            
+            if (pos1 == std::string::npos || pos2 == std::string::npos || pos1 == pos2) {
+                continue;  // Malformed entry
+            }
+            
+            std::string node1_raw = raw_entry.substr(0, pos1);
+            std::string node2_raw = raw_entry.substr(pos1 + 1, pos2 - pos1 - 1);
+            double cap_val = std::stod(raw_entry.substr(pos2 + 1));
+
+            std::string net1 = resolve_node_to_net(node1_raw);
+            std::string net2 = resolve_node_to_net(node2_raw);
+            if (net1.empty()) net1 = net_name;
+            if (net1.empty() || net2.empty()) continue;
+
+            // Only store cross-net couplings (different nets)
+            if (net1 != net2) {
+                spef.coupling_caps.push_back({net1, net2, cap_val});
+            }
+        }
+    }
+    
+    // Clear temporary storage
+    for (auto& [net_name, net_data] : spef.nets) {
+        net_data.raw_coupling_caps.clear();
+    }
+}
+
+// ============== Coupling Capacitance Comparison ==============
+std::vector<CouplingCapComparison> compare_coupling_caps(
+    const ParsedSpef& spef1,
+    const ParsedSpef& spef2
+) {
+    std::vector<CouplingCapComparison> results;
+    
+    // Build lookup maps for quick access
+    std::unordered_map<std::string, double> caps1, caps2;
+    
+    // Create normalized pair keys: sort(net1, net2)
+    auto make_pair_key = [](const std::string& a, const std::string& b) -> std::string {
+        if (a < b) return a + "|" + b;
+        return b + "|" + a;
+    };
+    
+    // Populate maps from spef1
+    for (const auto& cc : spef1.coupling_caps) {
+        std::string key = make_pair_key(cc.net1, cc.net2);
+        // If same pair appears multiple times, accumulate
+        caps1[key] += cc.cap_value;
+    }
+    
+    // Populate maps from spef2
+    for (const auto& cc : spef2.coupling_caps) {
+        std::string key = make_pair_key(cc.net1, cc.net2);
+        caps2[key] += cc.cap_value;
+    }
+    
+    // Find common pairs
+    std::set<std::string> all_keys;
+    for (const auto& [key, _] : caps1) all_keys.insert(key);
+    for (const auto& [key, _] : caps2) all_keys.insert(key);
+    
+    for (const auto& key : all_keys) {
+        double c1 = (caps1.find(key) != caps1.end()) ? caps1[key] : 0.0;
+        double c2 = (caps2.find(key) != caps2.end()) ? caps2[key] : 0.0;
+        
+        // Extract net names from key
+        size_t pos = key.find('|');
+        if (pos != std::string::npos) {
+            std::string net1 = key.substr(0, pos);
+            std::string net2 = key.substr(pos + 1);
+            results.push_back({net1, net2, c1, c2});
+        }
+    }
+    
+    return results;
+}
+
 // ============== Dijkstra Implementation ==============
 std::unordered_map<std::string, double> dijkstra_shortest_paths(
     const std::unordered_map<std::string, std::vector<Edge>>& graph,
@@ -602,8 +709,21 @@ ParsedSpef parse_spef(const std::string& filepath) {
         else if (section == SEC_CAP && tokens.size() >= 3) {
             try {
                 int idx = std::stoi(tokens[0]);
-                // It's a CAP entry, we only need total_cap from D_NET
-                // Skip detailed parsing for speed
+                // Check if this is a coupling capacitance (2 nodes) or self-capacitance (1 node)
+                if (tokens.size() >= 4) {
+                    // Potential coupling cap: idx node1 node2 cap_value
+                    // Don't resolve yet - store raw for post-processing
+                    std::string node1_raw = resolve_name_token(tokens[1]);
+                    std::string node2_raw = resolve_name_token(tokens[2]);
+                    double cap_val = parse_float(tokens[3]);
+                    
+                    // Store in temporary format for later resolution
+                    std::string temp_entry = node1_raw + "|" + node2_raw + "|" + std::to_string(cap_val);
+                    if (current_net != nullptr) {
+                        current_net->raw_coupling_caps.push_back(temp_entry);
+                    }
+                }
+                // Else it's a self-cap, we don't store these (total_cap handles those)
             } catch (...) {
                 if (tokens[0] == "*CONN") section = SEC_CONN;
                 else if (tokens[0] == "*RES") section = SEC_RES;
@@ -678,6 +798,10 @@ ParsedSpef parse_spef(const std::string& filepath) {
     auto t_end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(t_end - t_start).count();
     std::cout << "[" << filepath << "] finished parsing " << net_count << " nets in " << elapsed << "s (C++/single)" << std::endl;
+    
+    // Post-process coupling capacitances
+    resolve_coupling_caps_to_nets(spef);
+    
     return spef;
 }
 

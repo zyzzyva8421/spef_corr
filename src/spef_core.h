@@ -38,15 +38,31 @@ struct NetData {
     std::unordered_map<std::string, std::string> node_prefix_map;
     std::unordered_map<std::string, std::string> pin_to_node_cache;  // Recommendation 3: Pre-computed maps
     std::unordered_map<std::string, double> driver_sink_res_cache;
+    // Temporary storage for coupling capacitances (raw format: node1|node2|cap_value)
+    std::vector<std::string> raw_coupling_caps;
     bool cache_valid;
     bool pin_map_built;
     
     NetData() : total_cap(0.0), cache_valid(false), pin_map_built(false) {}
 };
 
+// Structure to represent coupling capacitance between two nets
+struct CouplingCap {
+    std::string net1;  // First net name (resolved)
+    std::string net2;  // Second net name (resolved)
+    double cap_value;   // Coupling capacitance value
+    
+    // For sorting and comparison
+    bool operator<(const CouplingCap& other) const {
+        if (net1 != other.net1) return net1 < other.net1;
+        return net2 < other.net2;
+    }
+};
+
 struct ParsedSpef {
     std::unordered_map<std::string, std::string> name_map;
     std::unordered_map<std::string, NetData> nets;
+    std::vector<CouplingCap> coupling_caps;  // All coupling capacitors
     std::string t_unit;
     std::string c_unit;
     std::string r_unit;
@@ -89,6 +105,13 @@ struct ResComparisonData {
     double r2;
 };
 
+struct CouplingCapComparison {
+    std::string net1;  // First net name
+    std::string net2;  // Second net name
+    double c1;         // Coupling cap in spef1
+    double c2;         // Coupling cap in spef2
+};
+
 // Dijkstra shortest path - C++ optimized
 std::unordered_map<std::string, double> dijkstra_shortest_paths(
     const std::unordered_map<std::string, std::vector<Edge>>& graph,
@@ -97,6 +120,15 @@ std::unordered_map<std::string, double> dijkstra_shortest_paths(
 
 // Recommendation 3: Pre-compute pin-to-node mapping for a net
 void build_pin_to_node_map(NetData& net);
+
+// Post-process coupling capacitances to map nodes to net names
+void resolve_coupling_caps_to_nets(ParsedSpef& spef);
+
+// Compare coupling capacitances between two SPEF files
+std::vector<CouplingCapComparison> compare_coupling_caps(
+    const ParsedSpef& spef1,
+    const ParsedSpef& spef2
+);
 
 // Compute all driver->sink resistances for a net
 std::unordered_map<std::string, double> compute_driver_sink_resistances(
