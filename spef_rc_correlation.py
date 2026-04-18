@@ -138,6 +138,25 @@ def parse_net_res_data(path: str) -> List[ResComparison]:
     return ress
 
 
+def parse_net_ccap_data(path: str) -> List[CouplingCapComparison]:
+    """Parse net_ccap.data file."""
+    caps: List[CouplingCapComparison] = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                print(f"[warn] {path}:{lineno}: expected 4 fields, got {len(parts)}, skipping")
+                continue
+            try:
+                caps.append(CouplingCapComparison(parts[0], parts[1], float(parts[2]), float(parts[3])))
+            except ValueError:
+                print(f"[warn] {path}:{lineno}: non-numeric value, skipping")
+    return caps
+
+
 def write_caps_csv(path: str, caps: List[CapComparison]) -> None:
     """Write capacitance comparisons to CSV."""
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -179,6 +198,29 @@ def compare_spef_cpp(spef1_path: str, spef2_path: str, num_threads: int = 0) -> 
     top_10_res = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.top_10_res]
     
     return caps, ress, top_10_cap, top_10_res
+
+
+def compare_spef_with_coupling_cpp(
+    spef1_path: str,
+    spef2_path: str,
+    num_threads: int = 0,
+) -> Tuple[List[CapComparison], List[ResComparison], List[CouplingCapComparison], List[CapComparison], List[ResComparison]]:
+    """Compare total cap, resistance, and coupling capacitance using one shared parse."""
+    if not HAS_CPP:
+        raise RuntimeError("C++ extension not available")
+
+    print(f"Parsing {spef1_path} and {spef2_path} in parallel (C++ threads)...")
+    cpp_spefs = spef_core.parse_spef_parallel([spef1_path, spef2_path], max(num_threads, 2))
+    result = spef_core.compare_spef_full(cpp_spefs[0], cpp_spefs[1], num_threads)
+    cc_results = spef_core.compare_coupling_caps(cpp_spefs[0], cpp_spefs[1])
+
+    caps = [CapComparison(c.net_name, c.c1, c.c2) for c in result.cap_rows]
+    ress = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.res_rows]
+    coupling_caps = [CouplingCapComparison(cc.net1, cc.net2, cc.c1, cc.c2) for cc in cc_results]
+    top_10_cap = [CapComparison(c.net_name, c.c1, c.c2) for c in result.top_10_cap]
+    top_10_res = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.top_10_res]
+
+    return caps, ress, coupling_caps, top_10_cap, top_10_res
 
 
 def compare_coupling_caps_cpp(spef1: "SpefFile", spef2: "SpefFile") -> List[CouplingCapComparison]:
@@ -350,6 +392,7 @@ def main() -> None:
     parser.add_argument("--gui-auto-run", action="store_true", help="Auto-run in GUI")
     parser.add_argument("--net-cap-data", metavar="FILE", help="Pre-computed cap data file")
     parser.add_argument("--net-res-data", metavar="FILE", help="Pre-computed res data file")
+    parser.add_argument("--net-ccap-data", metavar="FILE", help="Pre-computed coupling cap data file")
     parser.add_argument("--backmark", action="store_true", help="Backmark mode")
     parser.add_argument("--shuffle", action="store_true", help="Shuffle mode")
     parser.add_argument("--seed", type=int, default=None, metavar="INT", help="Random seed")
@@ -412,14 +455,18 @@ def main() -> None:
         else:
             cap_out = args.net_cap_data or "net_cap.data"
             res_out = args.net_res_data or "net_res.data"
-            caps, ress, top_10_cap, top_10_res = compare_spef_cpp(args.spef1, args.spef2, args.threads)
-            with open(cap_out, 'w') as fc, open(res_out, 'w') as fr:
+            ccap_out = args.net_ccap_data or "net_ccap.data"
+            caps, ress, coupling_caps, top_10_cap, top_10_res = compare_spef_with_coupling_cpp(args.spef1, args.spef2, args.threads)
+            with open(cap_out, 'w') as fc, open(res_out, 'w') as fr, open(ccap_out, 'w') as fcc:
                 for cap in caps:
                     print(f"{cap.net} {cap.c1} {cap.c2}", file=fc)
                 for res in ress:
                     print(f"{res.net} {res.driver} {res.load} {res.r1} {res.r2}", file=fr)
+                for ccap in coupling_caps:
+                    print(f"{ccap.net1} {ccap.net2} {ccap.c1} {ccap.c2}", file=fcc)
             print(f"Cap data written to: {cap_out}")
             print(f"Res data written to: {res_out}")
+            print(f"Coupling cap data written to: {ccap_out}")
             summarize_and_print(caps, ress, args.spef1, args.spef2, args.r_agg)
 
             print("\nTop 10 Cap Deviations:")
@@ -437,18 +484,20 @@ def main() -> None:
         return
 
     # Data-file mode
-    if args.net_cap_data or args.net_res_data:
+    if args.net_cap_data or args.net_res_data or args.net_ccap_data:
         if args.gui or args.gui_auto_run:
             launch_gui(
                 collect_spef_paths([p for p in [args.spef1, args.spef2] if p]),
                 auto_run=args.gui_auto_run,
                 preload_cap_data=args.net_cap_data,
                 preload_res_data=args.net_res_data,
+                preload_ccap_data=args.net_ccap_data,
             )
             return
 
         caps = parse_net_cap_data(args.net_cap_data) if args.net_cap_data else []
         ress = parse_net_res_data(args.net_res_data) if args.net_res_data else []
+        coupling_caps = parse_net_ccap_data(args.net_ccap_data) if args.net_ccap_data else []
 
         print("=== Summary (from data files) ===")
         if caps:
@@ -459,6 +508,10 @@ def main() -> None:
             print(f"Res entries: {len(ress)}")
             corr_r = pearson_corr([r.r1 for r in ress], [r.r2 for r in ress])
             print(f"Res correlation: {corr_r:.6f}" if corr_r else "Res correlation: N/A")
+        if coupling_caps:
+            print(f"Coupling cap entries: {len(coupling_caps)}")
+            corr_cc = pearson_corr([c.c1 for c in coupling_caps], [c.c2 for c in coupling_caps])
+            print(f"Coupling cap correlation: {corr_cc:.6f}" if corr_cc else "Coupling cap correlation: N/A")
 
         if args.csv_prefix:
             if caps: write_caps_csv(f"{args.csv_prefix}_caps.csv", caps)
@@ -501,8 +554,10 @@ def launch_gui(
     auto_run: bool = False,
     preload_cap_data: Optional[str] = None,
     preload_res_data: Optional[str] = None,
+    preload_ccap_data: Optional[str] = None,
     preload_caps: Optional[List[CapComparison]] = None,
     preload_ress: Optional[List[ResComparison]] = None,
+    preload_ccaps: Optional[List[CouplingCapComparison]] = None,
     preload_spef_objs: Optional[list] = None,
     preload_cpp_result: Optional[object] = None
 ) -> None:
@@ -514,14 +569,14 @@ def launch_gui(
 
     root = tk.Tk()
     root.protocol("WM_DELETE_WINDOW", root.destroy)
-    RcCorrApp(root, preload_paths, auto_run, preload_cap_data, preload_res_data, preload_caps, preload_ress, preload_spef_objs, preload_cpp_result)
+    RcCorrApp(root, preload_paths, auto_run, preload_cap_data, preload_res_data, preload_ccap_data, preload_caps, preload_ress, preload_ccaps, preload_spef_objs, preload_cpp_result)
     root.mainloop()
 
 
 class RcCorrApp:
     def __init__(self, root, preload_paths=None, auto_run=False,
-                 preload_cap_data=None, preload_res_data=None,
-                 preload_caps=None, preload_ress=None, preload_spef_objs=None,
+                 preload_cap_data=None, preload_res_data=None, preload_ccap_data=None,
+                 preload_caps=None, preload_ress=None, preload_ccaps=None, preload_spef_objs=None,
                  preload_cpp_result=None):
         self.root = root
         self.root.title("SPEF RC Correlation")
@@ -553,19 +608,26 @@ class RcCorrApp:
             self._load_cap_data(preload_cap_data)
         if preload_res_data:
             self._load_res_data(preload_res_data)
+        if preload_ccap_data:
+            self._load_ccap_data(preload_ccap_data)
         if preload_caps:
             self._data_caps = list(preload_caps)
             self.cap_data_label.config(text=f"(preloaded) ({len(preload_caps)} nets)", foreground="black")
         if preload_ress:
             self._data_ress = list(preload_ress)
             self.res_data_label.config(text=f"(preloaded) ({len(preload_ress)} pairs)", foreground="black")
+        if preload_ccaps:
+            self._data_coupling_caps = list(preload_ccaps)
+            self.ccap_data_label.config(text=f"(preloaded) ({len(preload_ccaps)} pairs)", foreground="black")
+            if self._cpp_result is None or (self._cpp_result.cap_count == 0 and self._cpp_result.res_count == 0):
+                self.view_mode_var.set("coupling_cap")
 
         # 自动分析逻辑：如果 auto_run=True 且 spef 文件数>=2，则自动运行分析
         if self._auto_run_requested:
             if len(self.spefs) >= 2:
                 self.root.after(0, self._auto_run)
             # 也可根据需求支持 data file 自动分析
-            elif self._data_caps or self._data_ress:
+            elif self._data_caps or self._data_ress or self._data_coupling_caps:
                 self.root.after(0, self._run_from_data)
             self._auto_run_requested = False
 
@@ -824,6 +886,13 @@ class RcCorrApp:
         self.res_data_label = ttk.Label(res_row, text="(none)", foreground="gray", anchor="w")
         self.res_data_label.pack(side="left", padx=5, fill="x", expand=True)
         ttk.Button(res_row, text="Load...", command=self._add_res_data).pack(side="right")
+
+        ccap_row = ttk.Frame(dfrm)
+        ccap_row.pack(fill="x", padx=5, pady=2)
+        ttk.Label(ccap_row, text="Ccap Data File:").pack(side="left")
+        self.ccap_data_label = ttk.Label(ccap_row, text="(none)", foreground="gray", anchor="w")
+        self.ccap_data_label.pack(side="left", padx=5, fill="x", expand=True)
+        ttk.Button(ccap_row, text="Load...", command=self._add_ccap_data).pack(side="right")
 
         ttk.Frame(dfrm, height=5).pack()
         ttk.Button(dfrm, text="Run from Data Files", command=self._run_from_data).pack(fill="x", padx=5, pady=(0, 4))
@@ -1094,15 +1163,27 @@ class RcCorrApp:
         path = filedialog.askopenfilename(title="Res Data", filetypes=[("Data", "*.data"), ("All", "*.*")])
         if path:
             self._load_res_data(path)
+
+    def _add_ccap_data(self) -> None:
+        path = filedialog.askopenfilename(title="Coupling Cap Data", filetypes=[("Data", "*.data"), ("All", "*.*")])
+        if path:
+            self._load_ccap_data(path)
     
     def _load_cap_data(self, path: str) -> None:
         """Load cap data using C++ backend."""
         try:
-            # If we already have res data in _cpp_result, merge; otherwise create new
-            if self._cpp_result is not None and self._cpp_result.res_count > 0:
+            has_existing = (
+                self._cpp_result is not None and
+                (
+                    getattr(self._cpp_result, "res_count", 0) > 0 or
+                    getattr(self._cpp_result, "ccap_count", 0) > 0
+                )
+            )
+            # If we already have non-cap data in _cpp_result, merge; otherwise create new
+            if has_existing:
                 # Merge with existing res data
-                new_cap = spef_core.create_plot_data_from_files(path, "")
-                # Copy res data from current result
+                new_cap = spef_core.create_plot_data_from_files(path, "", "")
+                # Copy cap data to current result
                 self._cpp_result.cap_c1 = new_cap.cap_c1
                 self._cpp_result.cap_c2 = new_cap.cap_c2
                 self._cpp_result.cap_net_names = new_cap.cap_net_names
@@ -1110,7 +1191,7 @@ class RcCorrApp:
                 self._cpp_result.cap_correlation = new_cap.cap_correlation
             else:
                 # Create new PlotData from cap file
-                self._cpp_result = spef_core.create_plot_data_from_files(path, "")
+                self._cpp_result = spef_core.create_plot_data_from_files(path, "", "")
             self.cap_data_label.config(text=f"{os.path.basename(path)} ({self._cpp_result.cap_count} nets)", foreground="black")
         except Exception as exc:
             messagebox.showerror("Error", f"Load failed:\n{exc}")
@@ -1118,10 +1199,17 @@ class RcCorrApp:
     def _load_res_data(self, path: str) -> None:
         """Load res data using C++ backend."""
         try:
-            # If we already have cap data in _cpp_result, merge; otherwise create new
-            if self._cpp_result is not None and self._cpp_result.cap_count > 0:
-                # Merge with existing cap data
-                new_res = spef_core.create_plot_data_from_files("", path)
+            has_existing = (
+                self._cpp_result is not None and
+                (
+                    getattr(self._cpp_result, "cap_count", 0) > 0 or
+                    getattr(self._cpp_result, "ccap_count", 0) > 0
+                )
+            )
+            # If we already have non-res data in _cpp_result, merge; otherwise create new
+            if has_existing:
+                # Merge with existing cap/ccap data
+                new_res = spef_core.create_plot_data_from_files("", path, "")
                 # Copy res data to current result
                 self._cpp_result.res_r1 = new_res.res_r1
                 self._cpp_result.res_r2 = new_res.res_r2
@@ -1132,10 +1220,49 @@ class RcCorrApp:
                 self._cpp_result.res_correlation = new_res.res_correlation
             else:
                 # Create new PlotData from res file
-                self._cpp_result = spef_core.create_plot_data_from_files("", path)
+                self._cpp_result = spef_core.create_plot_data_from_files("", path, "")
             self.res_data_label.config(text=f"{os.path.basename(path)} ({self._cpp_result.res_count} pairs)", foreground="black")
         except Exception as exc:
             messagebox.showerror("Error", f"Load failed:\n{exc}")
+
+    def _load_ccap_data(self, path: str) -> None:
+        """Load coupling cap data using C++ backend."""
+        try:
+            has_existing = (
+                self._cpp_result is not None and
+                (
+                    getattr(self._cpp_result, "cap_count", 0) > 0 or
+                    getattr(self._cpp_result, "res_count", 0) > 0
+                )
+            )
+
+            new_ccap = spef_core.create_plot_data_from_files("", "", path)
+            if has_existing:
+                self._cpp_result.ccap_c1 = new_ccap.ccap_c1
+                self._cpp_result.ccap_c2 = new_ccap.ccap_c2
+                self._cpp_result.ccap_net1_names = new_ccap.ccap_net1_names
+                self._cpp_result.ccap_net2_names = new_ccap.ccap_net2_names
+                self._cpp_result.ccap_count = new_ccap.ccap_count
+                self._cpp_result.ccap_correlation = new_ccap.ccap_correlation
+            else:
+                self._cpp_result = new_ccap
+
+            net1_names = list(getattr(self._cpp_result, "ccap_net1_names", []))
+            net2_names = list(getattr(self._cpp_result, "ccap_net2_names", []))
+            c1_vals = list(getattr(self._cpp_result, "ccap_c1", []))
+            c2_vals = list(getattr(self._cpp_result, "ccap_c2", []))
+            n = min(len(net1_names), len(net2_names), len(c1_vals), len(c2_vals))
+            self._data_coupling_caps = [
+                CouplingCapComparison(net1_names[i], net2_names[i], float(c1_vals[i]), float(c2_vals[i]))
+                for i in range(n)
+            ]
+
+            self.ccap_data_label.config(text=f"{os.path.basename(path)} ({len(self._data_coupling_caps)} pairs)", foreground="black")
+            if self._cpp_result is None or (self._cpp_result.cap_count == 0 and self._cpp_result.res_count == 0):
+                self.view_mode_var.set("coupling_cap")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Load failed:\n{exc}")
+
     def _run_analysis(self) -> None:
         """Run analysis using C++ backend."""
         ref = self.ref_var.get()
@@ -1163,7 +1290,9 @@ class RcCorrApp:
         except Exception as exc:
             messagebox.showerror("Error", f"Analysis failed:\n{exc}")
     def _run_from_data(self) -> None:
-        if self._cpp_result is None or (self._cpp_result.cap_count == 0 and self._cpp_result.res_count == 0):
+        has_plot_data = self._cpp_result is not None and (self._cpp_result.cap_count > 0 or self._cpp_result.res_count > 0)
+        has_coupling_data = bool(self._data_coupling_caps)
+        if not has_plot_data and not has_coupling_data:
             messagebox.showwarning("Warning", "No data loaded")
             return
         self._update_plot()

@@ -168,9 +168,10 @@ PYBIND11_MODULE(spef_core, m) {
           py::arg("path"));
     
     m.def("create_plot_data_from_files", &create_plot_data_from_files,
-          "Create PlotData from CSV cap/res files",
+          "Create PlotData from cap/res/ccap files",
           py::arg("cap_path"),
-          py::arg("res_path"));
+          py::arg("res_path"),
+          py::arg("ccap_path") = "");
     
     m.def("compute_res_segment_scales", &compute_res_segment_scales,
           "Compute resistance segment scales for backmarking",
@@ -206,10 +207,16 @@ PYBIND11_MODULE(spef_core, m) {
         .def_readwrite("res_net_names", &PlotData::res_net_names)
         .def_readwrite("res_sink_names", &PlotData::res_sink_names)
         .def_readwrite("res_driver_names", &PlotData::res_driver_names)
+            .def_readwrite("ccap_c1", &PlotData::ccap_c1)
+            .def_readwrite("ccap_c2", &PlotData::ccap_c2)
+            .def_readwrite("ccap_net1_names", &PlotData::ccap_net1_names)
+            .def_readwrite("ccap_net2_names", &PlotData::ccap_net2_names)
         .def_readwrite("cap_correlation", &PlotData::cap_correlation)
         .def_readwrite("res_correlation", &PlotData::res_correlation)
+            .def_readwrite("ccap_correlation", &PlotData::ccap_correlation)
         .def_readwrite("cap_count", &PlotData::cap_count)
-        .def_readwrite("res_count", &PlotData::res_count);
+            .def_readwrite("res_count", &PlotData::res_count)
+            .def_readwrite("ccap_count", &PlotData::ccap_count);
     
     // ComparisonChunk struct bindings
     py::class_<ComparisonChunk>(m, "ComparisonChunk")

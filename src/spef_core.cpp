@@ -1135,14 +1135,60 @@ std::vector<std::tuple<std::string, std::string, std::string, double, double>> p
     return ress;
 }
 
-PlotData create_plot_data_from_files(const std::string& cap_path, const std::string& res_path) {
+std::vector<std::tuple<std::string, std::string, double, double>> parse_ccap_data(const std::string& path) {
+    std::vector<std::tuple<std::string, std::string, double, double>> ccaps;
+
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return ccaps;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        // Support space format: net1 net2 c1 c2
+        if (line.find(',') == std::string::npos) {
+            std::istringstream iss(line);
+            std::string net1, net2, c1_str, c2_str;
+            if (!(iss >> net1 >> net2 >> c1_str >> c2_str)) continue;
+            try {
+                ccaps.emplace_back(net1, net2, std::stod(c1_str), std::stod(c2_str));
+            } catch (...) {
+                continue;
+            }
+            continue;
+        }
+
+        // Also accept CSV format: net1,net2,c1,c2
+        std::istringstream iss(line);
+        std::string net1, net2, c1_str, c2_str;
+        if (!std::getline(iss, net1, ',') ||
+            !std::getline(iss, net2, ',') ||
+            !std::getline(iss, c1_str, ',') ||
+            !std::getline(iss, c2_str, ',')) {
+            continue;
+        }
+        try {
+            ccaps.emplace_back(net1, net2, std::stod(c1_str), std::stod(c2_str));
+        } catch (...) {
+            continue;
+        }
+    }
+
+    return ccaps;
+}
+
+PlotData create_plot_data_from_files(const std::string& cap_path, const std::string& res_path, const std::string& ccap_path) {
     PlotData result;
     
     // Initialize counts to 0
     result.cap_count = 0;
     result.res_count = 0;
+    result.ccap_count = 0;
     result.cap_correlation = 0.0;
     result.res_correlation = 0.0;
+    result.ccap_correlation = 0.0;
     
     // Parse cap data if provided
     if (!cap_path.empty()) {
@@ -1203,6 +1249,34 @@ PlotData create_plot_data_from_files(const std::string& cap_path, const std::str
         if (!r1_vec.empty()) {
             auto corr = compute_pearson_correlation(r1_vec, r2_vec);
             result.res_correlation = corr.valid ? corr.pearson : 0.0;
+        }
+    }
+
+    // Parse coupling cap data if provided
+    if (!ccap_path.empty()) {
+        auto ccaps = parse_ccap_data(ccap_path);
+        result.ccap_count = ccaps.size();
+
+        std::vector<double> c1_vec, c2_vec;
+        c1_vec.reserve(ccaps.size());
+        c2_vec.reserve(ccaps.size());
+
+        for (const auto& ccap : ccaps) {
+            std::string net1, net2;
+            double c1, c2;
+            std::tie(net1, net2, c1, c2) = ccap;
+            result.ccap_net1_names.push_back(net1);
+            result.ccap_net2_names.push_back(net2);
+            c1_vec.push_back(c1);
+            c2_vec.push_back(c2);
+        }
+
+        result.ccap_c1 = py::array_t<double>(c1_vec.size(), c1_vec.data());
+        result.ccap_c2 = py::array_t<double>(c2_vec.size(), c2_vec.data());
+
+        if (!c1_vec.empty()) {
+            auto corr = compute_pearson_correlation(c1_vec, c2_vec);
+            result.ccap_correlation = corr.valid ? corr.pearson : 0.0;
         }
     }
     

@@ -200,13 +200,19 @@ std::vector<std::tuple<std::string, std::string, std::string, double, double>> p
     const std::string& path
 );
 
+// Parse coupling cap data file (net1 net2 c1 c2)
+std::vector<std::tuple<std::string, std::string, double, double>> parse_ccap_data(
+    const std::string& path
+);
+
 // Forward declaration
 struct PlotData;
 
-// Create PlotData from CSV cap/res files for unified plotting
+// Create PlotData from cap/res/ccap files for unified plotting
 PlotData create_plot_data_from_files(
     const std::string& cap_path,
-    const std::string& res_path
+    const std::string& res_path,
+    const std::string& ccap_path = ""
 );
 
 // Compute segment scales for backmarking
@@ -266,12 +272,20 @@ struct PlotData {
     std::vector<std::string> res_net_names;
     std::vector<std::string> res_sink_names;
     std::vector<std::string> res_driver_names;
+
+    // Coupling capacitance data (num_pairs x 1)
+    py::array_t<double> ccap_c1;
+    py::array_t<double> ccap_c2;
+    std::vector<std::string> ccap_net1_names;
+    std::vector<std::string> ccap_net2_names;
     
     // Correlation values
     double cap_correlation;
     double res_correlation;
+    double ccap_correlation;
     size_t cap_count;
     size_t res_count;
+    size_t ccap_count;
 };
 
 PlotData export_plot_data(
