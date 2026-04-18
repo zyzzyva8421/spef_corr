@@ -177,6 +177,7 @@ void backmark_spef(
     const std::string& spef_path,
     const std::string& cap_data_path,
     const std::string& res_data_path,
+    const std::string& ccap_data_path,
     const std::string& output_path
 );
 

@@ -1473,6 +1473,7 @@ void backmark_spef(
     const std::string& spef_path,
     const std::string& cap_data_path,
     const std::string& res_data_path,
+    const std::string& ccap_data_path,
     const std::string& output_path
 ) {
     std::cout << "[backmark] Parsing SPEF..." << std::endl;
@@ -1484,6 +1485,40 @@ void backmark_spef(
     for (const auto& [net_id, net_name] : spef.name_map) {
         reverse_name_map[net_name] = net_id;
     }
+
+    auto resolve_net_token = [&](const std::string& net_tok) -> std::string {
+        if (net_tok.empty()) return "";
+        if (spef.nets.find(net_tok) != spef.nets.end()) return net_tok;
+        if (net_tok[0] == '*') {
+            auto it = spef.name_map.find(net_tok);
+            if (it != spef.name_map.end() && spef.nets.find(it->second) != spef.nets.end()) {
+                return it->second;
+            }
+        }
+        return net_tok;
+    };
+
+    auto resolve_node_to_net = [&](const std::string& node_tok) -> std::string {
+        if (node_tok.empty()) return "";
+        if (spef.nets.find(node_tok) != spef.nets.end()) return node_tok;
+
+        size_t colon = node_tok.find(':');
+        std::string base = (colon == std::string::npos) ? node_tok : node_tok.substr(0, colon);
+        if (spef.nets.find(base) != spef.nets.end()) return base;
+
+        if (!base.empty() && base[0] == '*') {
+            auto it = spef.name_map.find(base);
+            if (it != spef.name_map.end() && spef.nets.find(it->second) != spef.nets.end()) {
+                return it->second;
+            }
+        }
+        return "";
+    };
+
+    auto make_pair_key = [](const std::string& n1, const std::string& n2) -> std::string {
+        if (n1 <= n2) return n1 + "\n" + n2;
+        return n2 + "\n" + n1;
+    };
     
     // Load cap data
     std::unordered_map<std::string, double> cap_ratio;
@@ -1548,9 +1583,134 @@ void backmark_spef(
             res_segment_scales[net_name] = compute_res_segment_scales(net, sink_ratios, avg);
         }
     }
+
+    // Load coupling-cap targets from file: use LAST column as target value
+    // Format example: net1 net2 ccap1 ccap2 -> use ccap2
+    const bool use_ccap_backmark = !ccap_data_path.empty();
+    std::unordered_map<std::string, double> ccap_target_by_pair;
+    std::unordered_map<std::string, double> ccap_old_total_by_pair;
+    std::unordered_map<std::string, size_t> ccap_old_count_by_pair;
+    std::unordered_map<std::string, std::unordered_map<std::string, double>> ccap_old_by_net_pair;
+    std::unordered_map<std::string, double> old_noncoupling_by_net;
+    std::unordered_map<std::string, double> noncoupling_scale_by_net;
+
+    if (use_ccap_backmark) {
+        auto raw_ccap = parse_ccap_data(ccap_data_path);
+        for (const auto& row : raw_ccap) {
+            std::string n1, n2;
+            double unused_old = 0.0;
+            double target_ccap = 0.0;
+            std::tie(n1, n2, unused_old, target_ccap) = row;
+
+            std::string net1 = resolve_net_token(n1);
+            std::string net2 = resolve_net_token(n2);
+            if (net1.empty() || net2.empty() || net1 == net2) continue;
+
+            ccap_target_by_pair[make_pair_key(net1, net2)] = target_ccap;
+        }
+
+        // First pass over original SPEF:
+        // 1) collect original coupling totals per pair and per net section,
+        // 2) collect original non-coupling CAP totals per net section.
+        std::ifstream fscan(spef_path);
+        if (!fscan.is_open()) {
+            throw std::runtime_error("Cannot open input file for coupling scan: " + spef_path);
+        }
+
+        enum Section { SEC_NONE, SEC_CONN, SEC_CAP, SEC_RES };
+        Section section_scan = SEC_NONE;
+        std::string current_net_scan;
+        std::string line_scan;
+
+        while (std::getline(fscan, line_scan)) {
+            std::string raw_scan = trim(line_scan);
+
+            if (raw_scan.compare(0, 7, "*D_NET ") == 0) {
+                std::istringstream iss(raw_scan);
+                std::string token, net_id_tok, cap_str;
+                iss >> token >> net_id_tok >> cap_str;
+                current_net_scan = resolve_net_token(net_id_tok);
+                section_scan = SEC_NONE;
+                continue;
+            }
+            if (raw_scan == "*END") {
+                current_net_scan.clear();
+                section_scan = SEC_NONE;
+                continue;
+            }
+            if (current_net_scan.empty()) continue;
+            if (raw_scan == "*CONN") {
+                section_scan = SEC_CONN;
+                continue;
+            }
+            if (raw_scan == "*CAP") {
+                section_scan = SEC_CAP;
+                continue;
+            }
+            if (raw_scan == "*RES") {
+                section_scan = SEC_RES;
+                continue;
+            }
+
+            if (section_scan != SEC_CAP) continue;
+
+            std::istringstream iss(raw_scan);
+            std::vector<std::string> tokens;
+            std::string tok;
+            while (iss >> tok) tokens.push_back(tok);
+
+            try {
+                double old_v = std::stod(tokens.back());
+
+                // Coupling cap line: idx node1 node2 value
+                if (tokens.size() >= 4) {
+                    std::string net1 = resolve_node_to_net(tokens[1]);
+                    std::string net2 = resolve_node_to_net(tokens[2]);
+                    if (!net1.empty() && !net2.empty() && net1 != net2) {
+                        std::string pair_key = make_pair_key(net1, net2);
+                        ccap_old_total_by_pair[pair_key] += old_v;
+                        ccap_old_count_by_pair[pair_key] += 1;
+                        ccap_old_by_net_pair[current_net_scan][pair_key] += old_v;
+                    }
+                } else {
+                    // Non-coupling CAP (e.g. self-cap): idx node value
+                    old_noncoupling_by_net[current_net_scan] += old_v;
+                }
+            } catch (...) {
+                continue;
+            }
+        }
+
+        // Compute per-net non-coupling scale when total cap update exists.
+        // target_noncoupling = target_total_cap - target_coupling_sum
+        for (const auto& [net_name, target_total_cap] : new_total_caps) {
+            double target_coupling_sum = 0.0;
+            auto it_net_pairs = ccap_old_by_net_pair.find(net_name);
+            if (it_net_pairs != ccap_old_by_net_pair.end()) {
+                for (const auto& [pair_key, old_net_pair_sum] : it_net_pairs->second) {
+                    double old_pair_total = ccap_old_total_by_pair[pair_key];
+                    if (old_pair_total <= 0.0) continue;
+
+                    auto it_target = ccap_target_by_pair.find(pair_key);
+                    double pair_target_total = (it_target != ccap_target_by_pair.end())
+                        ? it_target->second
+                        : old_pair_total;
+
+                    target_coupling_sum += pair_target_total * (old_net_pair_sum / old_pair_total);
+                }
+            }
+
+            double target_noncoupling = target_total_cap - target_coupling_sum;
+            double old_noncoupling = old_noncoupling_by_net[net_name];
+            if (old_noncoupling > 0.0) {
+                noncoupling_scale_by_net[net_name] = target_noncoupling / old_noncoupling;
+            }
+        }
+    }
     
     std::cout << "[backmark] Nets with cap update: " << cap_ratio.size() << std::endl;
     std::cout << "[backmark] Nets with res update: " << res_avg_ratio.size() << std::endl;
+    std::cout << "[backmark] Coupling pairs with ccap update: " << ccap_target_by_pair.size() << std::endl;
     
     // Rewrite SPEF line by line
     std::ifstream fin(spef_path);
@@ -1569,6 +1729,7 @@ void backmark_spef(
     std::string current_net_name;
     std::string current_net_id;
     double c_scale = 1.0;
+    double noncoupling_scale = 1.0;
     double r_avg_scale = 1.0;
     std::unordered_map<std::string, std::unordered_map<std::string, double>> r_edge_scales;
     
@@ -1599,6 +1760,10 @@ void backmark_spef(
             auto it_cap = cap_ratio.find(net_name_resolved);
             if (it_cap != cap_ratio.end()) c_scale = it_cap->second;
             else c_scale = 1.0;
+
+            auto it_nc = noncoupling_scale_by_net.find(net_name_resolved);
+            if (it_nc != noncoupling_scale_by_net.end()) noncoupling_scale = it_nc->second;
+            else noncoupling_scale = 1.0;
             
             auto it_avg = res_avg_ratio.find(net_name_resolved);
             if (it_avg != res_avg_ratio.end()) r_avg_scale = it_avg->second;
@@ -1645,6 +1810,7 @@ void backmark_spef(
                 current_net_id.clear();
                 section = SEC_NONE;
                 c_scale = 1.0;
+                noncoupling_scale = 1.0;
                 r_avg_scale = 1.0;
                 r_edge_scales.clear();
                 fout << line << "\n";
@@ -1652,38 +1818,78 @@ void backmark_spef(
                 continue;
             }
             
-            // CAP section: scale cap values
-            if (section == SEC_CAP && c_scale != 1.0) {
-                // Check if this is a cap data line (starts with number)
+            // CAP section: update coupling first (if ccap target provided), otherwise apply cap scale.
+            if (section == SEC_CAP) {
                 if (std::regex_search(raw, re_cap_idx)) {
                     std::istringstream iss(raw);
                     std::vector<std::string> tokens;
                     std::string tok;
                     while (iss >> tok) tokens.push_back(tok);
-                    
+
                     if (tokens.size() >= 3) {
                         try {
-                            // Try to parse last token as float (cap value)
-                            std::string cap_tok = tokens.back();
-                            double old_val = std::stod(cap_tok);
-                            double new_val = old_val * c_scale;
-                            tokens.back() = fmt_float(new_val);
-                            
-                            // Reconstruct line
-                            std::string lead;
-                            size_t non_space = line.find_first_not_of(" \t");
-                            if (non_space != std::string::npos) {
-                                lead = line.substr(0, non_space);
+                            double old_val = std::stod(tokens.back());
+                            double new_val = old_val;
+                            bool updated = false;
+
+                            // Coupling cap line: idx node1 node2 value
+                            if (tokens.size() >= 4 && use_ccap_backmark) {
+                                std::string net1 = resolve_node_to_net(tokens[1]);
+                                std::string net2 = resolve_node_to_net(tokens[2]);
+                                if (!net1.empty() && !net2.empty() && net1 != net2) {
+                                    std::string pair_key = make_pair_key(net1, net2);
+                                    auto it_target = ccap_target_by_pair.find(pair_key);
+                                    if (it_target != ccap_target_by_pair.end()) {
+                                        double target_total = it_target->second;
+                                        double old_total = ccap_old_total_by_pair[pair_key];
+                                        size_t old_count = ccap_old_count_by_pair[pair_key];
+
+                                        if (old_total > 0.0) {
+                                            // Preserve original per-part ratio for this counterpart pair.
+                                            new_val = target_total * (old_val / old_total);
+                                        } else if (old_count > 0) {
+                                            // If original total is zero, split evenly as a fallback.
+                                            new_val = target_total / static_cast<double>(old_count);
+                                        } else {
+                                            new_val = target_total;
+                                        }
+                                        updated = true;
+                                    }
+                                }
                             }
-                            
-                            for (size_t i = 0; i < tokens.size(); i++) {
-                                fout << (i == 0 ? lead : " ") << tokens[i];
+
+                            // Fallback:
+                            // - without --net-ccap-data: apply total-cap scale to all CAP entries.
+                            // - with --net-ccap-data: apply (total-cap - coupling-cap) scale to self-cap entries.
+                            bool is_coupling_line = (tokens.size() >= 4);
+                            if (!updated) {
+                                if (!use_ccap_backmark && c_scale != 1.0) {
+                                    new_val = old_val * c_scale;
+                                    updated = true;
+                                } else if (use_ccap_backmark && !is_coupling_line && noncoupling_scale != 1.0) {
+                                    new_val = old_val * noncoupling_scale;
+                                    updated = true;
+                                }
                             }
-                            fout << "\n";
-                            lines_written++;
-                            continue;
+
+                            if (updated) {
+                                tokens.back() = fmt_float(new_val);
+
+                                std::string lead;
+                                size_t non_space = line.find_first_not_of(" \t");
+                                if (non_space != std::string::npos) {
+                                    lead = line.substr(0, non_space);
+                                }
+
+                                for (size_t i = 0; i < tokens.size(); i++) {
+                                    fout << (i == 0 ? lead : " ") << tokens[i];
+                                }
+                                fout << "\n";
+                                lines_written++;
+                                continue;
+                            }
                         } catch (...) {
-                            // Not a cap line, fall through
+                            // Not a CAP data line, fall through
                         }
                     }
                 }

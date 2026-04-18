@@ -145,10 +145,11 @@ PYBIND11_MODULE(spef_core, m) {
           py::arg("num_threads") = 0);
     
     m.def("backmark_spef", &backmark_spef,
-          "Rewrite SPEF with updated cap/res values from data files",
+          "Rewrite SPEF with updated cap/res/coupling-cap values from data files",
           py::arg("spef_path"),
           py::arg("cap_data_path"),
           py::arg("res_data_path"),
+          py::arg("ccap_data_path"),
           py::arg("output_path"));
     
     m.def("parse_backmark_cap_data", &parse_backmark_cap_data,

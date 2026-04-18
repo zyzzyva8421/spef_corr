@@ -253,11 +253,17 @@ def compare_spef_cpp_objs(spef1: "SpefFile", spef2: "SpefFile", num_threads: int
     return caps, ress, top_10_cap, top_10_res
 
 
-def backmark_spef_cpp(spef_path: str, cap_data_path: Optional[str], res_data_path: Optional[str], output_path: str) -> None:
+def backmark_spef_cpp(
+    spef_path: str,
+    cap_data_path: Optional[str],
+    res_data_path: Optional[str],
+    ccap_data_path: Optional[str],
+    output_path: str,
+) -> None:
     """Apply new RC values to SPEF using C++ backend."""
     if not HAS_CPP:
         raise RuntimeError("C++ extension not available")
-    spef_core.backmark_spef(spef_path, cap_data_path or "", res_data_path or "", output_path)
+    spef_core.backmark_spef(spef_path, cap_data_path or "", res_data_path or "", ccap_data_path or "", output_path)
 
 
 def shuffle_spef_cpp(spef_path: str, output_path: str, seed: Optional[int] = None) -> None:
@@ -405,11 +411,11 @@ def main() -> None:
     if args.backmark:
         if not args.spef1:
             parser.error("--backmark requires spef1")
-        if not args.net_cap_data and not args.net_res_data:
-            parser.error("--backmark requires at least one of --net-cap-data or --net-res-data")
+        if not args.net_cap_data and not args.net_res_data and not args.net_ccap_data:
+            parser.error("--backmark requires at least one of --net-cap-data, --net-res-data, or --net-ccap-data")
         out = args.output or os.path.splitext(args.spef1)[0] + "_backmarked.spef"
         print(f"[backmark] Processing {args.spef1}...")
-        backmark_spef_cpp(args.spef1, args.net_cap_data, args.net_res_data, out)
+        backmark_spef_cpp(args.spef1, args.net_cap_data, args.net_res_data, args.net_ccap_data, out)
         print(f"[backmark] Done: {out}")
         return
 
