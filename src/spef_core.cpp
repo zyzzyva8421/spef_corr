@@ -26,24 +26,25 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         return "";
     };
 
-    // Track already-seen pairs to avoid double-counting: each (netA, netB) pair
-    // appears in both netA's and netB's CAP sections in SPEF format.
+    // Create normalized pair key (sort so A|B and B|A map to the same key)
     auto make_pair_key = [](const std::string& a, const std::string& b) -> std::string {
         return (a < b) ? (a + "|" + b) : (b + "|" + a);
     };
-    std::unordered_set<std::string> seen_pairs;
 
-    // Process raw coupling capacitances from each net.
-    for (auto& [net_name, net_data] : spef.nets) {
+    // First pass: accumulate capacitance for each pair across all nets.
+    // This handles multiple entries for the same pair in one net's CAP section,
+    // and also ensures each pair is counted once even though it appears in both
+    // nets' CAP sections in SPEF format.
+    std::unordered_map<std::string, double> cap_accumulator;
+
+    for (const auto& [net_name, net_data] : spef.nets) {
         for (const auto& raw_entry : net_data.raw_coupling_caps) {
-            // Parse: node1_raw|node2_raw|cap_value
             size_t pos1 = raw_entry.find('|');
             size_t pos2 = raw_entry.rfind('|');
-            
             if (pos1 == std::string::npos || pos2 == std::string::npos || pos1 == pos2) {
                 continue;  // Malformed entry
             }
-            
+
             std::string node1_raw = raw_entry.substr(0, pos1);
             std::string node2_raw = raw_entry.substr(pos1 + 1, pos2 - pos1 - 1);
             double cap_val = std::stod(raw_entry.substr(pos2 + 1));
@@ -53,18 +54,20 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
             if (net1.empty()) net1 = net_name;
             if (net1.empty() || net2.empty()) continue;
 
-            // Only store cross-net couplings (different nets)
             if (net1 != net2) {
-                // Skip duplicate pairs (same pair appears in both nets' CAP sections)
                 std::string pair_key = make_pair_key(net1, net2);
-                if (seen_pairs.count(pair_key)) continue;
-                seen_pairs.insert(pair_key);
-
-                // Convert to standard unit (PF) before storing
                 double cap_converted = convert_capacitance(cap_val, spef.c_unit);
-                spef.coupling_caps.push_back({net1, net2, cap_converted});
+                cap_accumulator[pair_key] += cap_converted;
             }
         }
+    }
+
+    // Second pass: store the accumulated totals
+    for (const auto& [pair_key, cap_total] : cap_accumulator) {
+        size_t sep = pair_key.find('|');
+        std::string net1 = pair_key.substr(0, sep);
+        std::string net2 = pair_key.substr(sep + 1);
+        spef.coupling_caps.push_back({net1, net2, cap_total});
     }
     
     // Clear temporary storage
@@ -528,7 +531,6 @@ ParsedSpef parse_spef(const std::string& filepath) {
     bool in_name_map = false;
     std::string current_net_name;
     NetData* current_net = nullptr;
-    bool r_is_kohm = false;
     size_t net_count = 0;
     auto t_start = std::chrono::steady_clock::now();
     
@@ -639,7 +641,6 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 std::string token, num, unit;
                 iss >> token >> num >> unit;
                 spef.r_unit = unit;
-                r_is_kohm = (unit == "KOHM");
                 continue;
             }
             if (code_part.find("*C_UNIT") == 0) {
@@ -709,7 +710,6 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 std::string node1 = resolve_name_token(tokens[1]);
                 std::string node2 = resolve_name_token(tokens[2]);
                 double rval = parse_float(tokens[3]);
-                if (r_is_kohm) rval *= 1000.0;
                 
                 current_net->res_graph[node1].push_back({node2, rval});
                 current_net->res_graph[node2].push_back({node1, rval});
