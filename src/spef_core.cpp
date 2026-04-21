@@ -407,6 +407,8 @@ ParsedSpef parse_spef(const std::string& filepath) {
     bool in_name_map = false;
     std::string current_net_name;
     NetData* current_net = nullptr;
+    bool current_net_has_cap_entries = false;
+    std::unordered_set<std::string> counted_coupling_directions;
     bool r_is_kohm = false;
     size_t net_count = 0;
     auto t_start = std::chrono::steady_clock::now();
@@ -441,6 +443,12 @@ ParsedSpef parse_spef(const std::string& filepath) {
         while ((pos = out.find("\\]")) != std::string::npos) out.replace(pos, 2, "]");
         return out;
     };
+
+    auto extract_net_name_from_node = [](const std::string& node) -> std::string {
+        size_t colon = node.find(':');
+        if (colon == std::string::npos) return node;
+        return node.substr(0, colon);
+    };
     
     while (std::getline(file, line)) {
         line_num++;
@@ -470,6 +478,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
             }
             if (code_part.find("*D_NET") == 0) {
                 // New net
+                in_name_map = false;
                 std::istringstream iss(code_part);
                 std::string token, net_id, net_name, total_cap_str;
                 iss >> token >> net_id >> total_cap_str;
@@ -487,6 +496,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 current_net = &spef.nets[current_net_name];
                 current_net->name = resolved_name;
                 current_net->total_cap = parse_float(total_cap_str);
+                current_net_has_cap_entries = false;
                 section = SEC_NONE;
                 net_count++;
                 if (net_count % 5000 == 0) {
@@ -498,6 +508,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
             }
             if (code_part.find("*END") == 0) {
                 current_net = nullptr;
+                current_net_has_cap_entries = false;
                 section = SEC_NONE;
                 continue;
             }
@@ -596,18 +607,47 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 // Not a RES entry, might be section header
                 if (tokens[0] == "*CAP") section = SEC_CAP;
                 else if (tokens[0] == "*CONN") section = SEC_CONN;
-                else if (tokens[0] == "*END") { current_net = nullptr; section = SEC_NONE; }
+                else if (tokens[0] == "*END") { current_net = nullptr; current_net_has_cap_entries = false; section = SEC_NONE; }
             }
         }
         else if (section == SEC_CAP && tokens.size() >= 3) {
             try {
                 int idx = std::stoi(tokens[0]);
-                // It's a CAP entry, we only need total_cap from D_NET
-                // Skip detailed parsing for speed
+                double cap_value = parse_float(tokens.back());
+                if (!current_net_has_cap_entries) {
+                    current_net->total_cap = 0.0;
+                    current_net_has_cap_entries = true;
+                }
+
+                if (tokens.size() >= 4) {
+                    std::string node1 = resolve_name_token(tokens[1]);
+                    std::string node2 = resolve_name_token(tokens[2]);
+                    std::string net1 = extract_net_name_from_node(node1);
+                    std::string net2 = extract_net_name_from_node(node2);
+
+                    std::string other_net;
+                    if (net1 == current_net_name && net2 != current_net_name) {
+                        other_net = net2;
+                    } else if (net2 == current_net_name && net1 != current_net_name) {
+                        other_net = net1;
+                    } else {
+                        other_net = net2;
+                    }
+
+                    if (!other_net.empty() && other_net != current_net_name) {
+                        std::string reverse_key = other_net + "|" + current_net_name;
+                        if (counted_coupling_directions.find(reverse_key) != counted_coupling_directions.end()) {
+                            continue;
+                        }
+                        counted_coupling_directions.insert(current_net_name + "|" + other_net);
+                    }
+                }
+
+                current_net->total_cap += cap_value;
             } catch (...) {
                 if (tokens[0] == "*CONN") section = SEC_CONN;
                 else if (tokens[0] == "*RES") section = SEC_RES;
-                else if (tokens[0] == "*END") { current_net = nullptr; section = SEC_NONE; }
+                else if (tokens[0] == "*END") { current_net = nullptr; current_net_has_cap_entries = false; section = SEC_NONE; }
             }
         }
         else if (section == SEC_CONN && tokens.size() >= 3) {
@@ -647,6 +687,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 }
                 else if (header == "*END") {
                     current_net = nullptr;
+                    current_net_has_cap_entries = false;
                     continue;
                 }
                 // Also handle *I (input) and *P (port) as CONN entries when no explicit *CONN header
