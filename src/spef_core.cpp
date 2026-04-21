@@ -26,6 +26,13 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         return "";
     };
 
+    // Track already-seen pairs to avoid double-counting: each (netA, netB) pair
+    // appears in both netA's and netB's CAP sections in SPEF format.
+    auto make_pair_key = [](const std::string& a, const std::string& b) -> std::string {
+        return (a < b) ? (a + "|" + b) : (b + "|" + a);
+    };
+    std::unordered_set<std::string> seen_pairs;
+
     // Process raw coupling capacitances from each net.
     for (auto& [net_name, net_data] : spef.nets) {
         for (const auto& raw_entry : net_data.raw_coupling_caps) {
@@ -48,7 +55,14 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
 
             // Only store cross-net couplings (different nets)
             if (net1 != net2) {
-                spef.coupling_caps.push_back({net1, net2, cap_val});
+                // Skip duplicate pairs (same pair appears in both nets' CAP sections)
+                std::string pair_key = make_pair_key(net1, net2);
+                if (seen_pairs.count(pair_key)) continue;
+                seen_pairs.insert(pair_key);
+
+                // Convert to standard unit (PF) before storing
+                double cap_converted = convert_capacitance(cap_val, spef.c_unit);
+                spef.coupling_caps.push_back({net1, net2, cap_converted});
             }
         }
     }
