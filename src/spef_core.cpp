@@ -478,6 +478,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
             }
             if (code_part.find("*D_NET") == 0) {
                 // New net
+                // Leave NAME_MAP mode when entering first net section.
                 in_name_map = false;
                 std::istringstream iss(code_part);
                 std::string token, net_id, net_name, total_cap_str;
@@ -615,6 +616,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 int idx = std::stoi(tokens[0]);
                 double cap_value = parse_float(tokens.back());
                 if (!current_net_has_cap_entries) {
+                    // Prefer CAP-section sum when explicit CAP entries are present.
                     current_net->total_cap = 0.0;
                     current_net_has_cap_entries = true;
                 }
@@ -626,7 +628,9 @@ ParsedSpef parse_spef(const std::string& filepath) {
                     std::string net2 = extract_net_name_from_node(node2);
 
                     std::string other_net;
-                    if (net1 == current_net_name && net2 != current_net_name) {
+                    if (net1 == current_net_name && net2 == current_net_name) {
+                        other_net.clear();
+                    } else if (net1 == current_net_name && net2 != current_net_name) {
                         other_net = net2;
                     } else if (net2 == current_net_name && net1 != current_net_name) {
                         other_net = net1;
