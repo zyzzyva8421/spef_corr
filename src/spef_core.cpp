@@ -1443,22 +1443,98 @@ std::unordered_map<std::string, std::unordered_map<std::string, double>> compute
         sinks_below[node] = std::move(s);
     }
     
-    // Assign scale factors to tree edges
+    // Helper: look up the weight of an edge in res_graph (stored undirectionally).
+    auto get_edge_weight = [&](const std::string& from_node, const std::string& to_node) -> double {
+        auto it = net.res_graph.find(from_node);
+        if (it != net.res_graph.end()) {
+            for (const auto& edge : it->second) {
+                if (edge.to == to_node) return edge.weight;
+            }
+        }
+        // Try the reverse direction (SPEF resistance entries are bidirectional)
+        auto it2 = net.res_graph.find(to_node);
+        if (it2 != net.res_graph.end()) {
+            for (const auto& edge : it2->second) {
+                if (edge.to == from_node) return edge.weight;
+            }
+        }
+        return 0.0;
+    };
+
+    // Assign scale factors to tree edges using the following strategy:
+    //   - Shared edges (subtree covers more than one sink): use avg_ratio uniformly.
+    //   - Exclusive edges (subtree covers exactly one sink): use a per-sink scale
+    //     computed so that the rescaled driver-to-sink resistance strictly equals the
+    //     target value.
+    //
+    // Math for sink S with ratio r = new_R / old_R:
+    //   target_res        = path_total * r
+    //   shared_scaled     = shared_old_sum * avg_ratio
+    //   exclusive_scale   = (target_res - shared_scaled) / exclusive_old_sum
+    //
+    // This guarantees:
+    //   shared_scaled + exclusive_old_sum * exclusive_scale == target_res  (exact)
+
+    // Pass 1: assign avg_ratio to all shared edges.
     for (const auto& [child_node, par_node] : parent) {
         if (par_node.empty()) continue;
-        
-        double scale;
         auto sinks_it = sinks_below.find(child_node);
-        if (sinks_it != sinks_below.end() && sinks_it->second.size() == 1) {
-            scale = sink_node_to_ratio[*sinks_it->second.begin()];
-        } else {
-            scale = avg_ratio;
+        bool is_shared = (sinks_it == sinks_below.end() || sinks_it->second.size() != 1);
+        if (is_shared) {
+            result[par_node][child_node] = avg_ratio;
+            result[child_node][par_node] = avg_ratio;
         }
-        
-        result[par_node][child_node] = scale;
-        result[child_node][par_node] = scale;
     }
-    
+
+    // Pass 2: for each sink, compute and assign a per-sink exclusive scale.
+    for (const auto& [sink_node, ratio] : sink_node_to_ratio) {
+        // Trace the path from sink back to driver using the BFS parent map.
+        std::vector<std::pair<std::string, std::string>> path_edges; // (parent, child)
+        std::string cur = sink_node;
+        while (true) {
+            auto pit = parent.find(cur);
+            if (pit == parent.end() || pit->second.empty()) break;
+            path_edges.push_back({pit->second, cur});
+            cur = pit->second;
+        }
+
+        double shared_old_sum = 0.0;
+        double exclusive_old_sum = 0.0;
+        for (const auto& [par, child] : path_edges) {
+            double w = get_edge_weight(par, child);
+            auto sinks_it = sinks_below.find(child);
+            bool is_shared = (sinks_it == sinks_below.end() || sinks_it->second.size() != 1);
+            if (is_shared) {
+                shared_old_sum += w;
+            } else {
+                exclusive_old_sum += w;
+            }
+        }
+
+        double path_total    = shared_old_sum + exclusive_old_sum;
+        double target_res    = path_total * ratio;
+        double shared_scaled = shared_old_sum * avg_ratio;
+        double exclusive_target = target_res - shared_scaled;
+
+        double exclusive_scale;
+        if (exclusive_old_sum > 1e-15 && exclusive_target > 0.0) {
+            exclusive_scale = exclusive_target / exclusive_old_sum;
+        } else {
+            // Fallback: no exclusive segments, or degenerate target – keep avg_ratio.
+            exclusive_scale = avg_ratio;
+        }
+
+        // Assign exclusive_scale to all exclusive edges on this sink's path.
+        for (const auto& [par, child] : path_edges) {
+            auto sinks_it = sinks_below.find(child);
+            bool is_exclusive = (sinks_it != sinks_below.end() && sinks_it->second.size() == 1);
+            if (is_exclusive) {
+                result[par][child] = exclusive_scale;
+                result[child][par] = exclusive_scale;
+            }
+        }
+    }
+
     return result;
 }
 
