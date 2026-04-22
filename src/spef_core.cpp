@@ -1559,6 +1559,32 @@ std::string fmt_float(double val) {
     return s;
 }
 
+static double convert_capacitance_from_pf(double value_pf, const std::string& to_unit) {
+    if (to_unit == "PF" || to_unit == "pf") {
+        return value_pf;
+    } else if (to_unit == "NF" || to_unit == "nf") {
+        return value_pf / 1000.0;  // 1 PF = 0.001 NF
+    } else if (to_unit == "UF" || to_unit == "uf" || to_unit == "µF") {
+        return value_pf / 1000000.0;  // 1 PF = 1e-6 µF
+    } else if (to_unit == "FF" || to_unit == "ff") {
+        return value_pf * 1000.0;  // 1 PF = 1000 FF
+    }
+    // Default: assume already in target unit
+    return value_pf;
+}
+
+static double convert_resistance_from_ohm(double value_ohm, const std::string& to_unit) {
+    if (to_unit == "OHM" || to_unit == "ohm") {
+        return value_ohm;
+    } else if (to_unit == "KOHM" || to_unit == "kohm") {
+        return value_ohm / 1000.0;  // 1 OHM = 0.001 KOHM
+    } else if (to_unit == "MOHM" || to_unit == "mohm") {
+        return value_ohm / 1000000.0;  // 1 Ω = 1e-6 MΩ
+    }
+    // Default: assume already in target unit
+    return value_ohm;
+}
+
 void backmark_spef(
     const std::string& spef_path,
     const std::string& cap_data_path,
@@ -1616,7 +1642,7 @@ void backmark_spef(
     
     if (!cap_data_path.empty()) {
         auto raw_cap = parse_backmark_cap_data(cap_data_path);
-        for (const auto& [key, new_cap] : raw_cap) {
+        for (const auto& [key, new_cap_pf] : raw_cap) {
             std::string net_name = key;
             if (key[0] == '*') {
                 auto it = spef.name_map.find(key);
@@ -1629,6 +1655,7 @@ void backmark_spef(
             if (net_it == spef.nets.end()) continue;
             
             double old_cap = net_it->second.total_cap;
+            double new_cap = convert_capacitance_from_pf(new_cap_pf, spef.c_unit);
             new_total_caps[net_name] = new_cap;
             cap_ratio[net_name] = (old_cap != 0.0) ? (new_cap / old_cap) : 1.0;
         }
@@ -1657,9 +1684,10 @@ void backmark_spef(
             if (old_dr.empty()) continue;
             
             std::unordered_map<std::string, double> sink_ratios;
-            for (const auto& [sink, new_r] : sink_map) {
+            for (const auto& [sink, new_r_ohm] : sink_map) {
                 auto old_r_it = old_dr.find(sink);
                 if (old_r_it != old_dr.end() && old_r_it->second > 0.0) {
+                    double new_r = convert_resistance_from_ohm(new_r_ohm, spef.r_unit);
                     sink_ratios[sink] = new_r / old_r_it->second;
                 }
             }
@@ -1696,7 +1724,8 @@ void backmark_spef(
             std::string net2 = resolve_net_token(n2);
             if (net1.empty() || net2.empty() || net1 == net2) continue;
 
-            ccap_target_by_pair[make_pair_key(net1, net2)] = target_ccap;
+            ccap_target_by_pair[make_pair_key(net1, net2)] =
+                convert_capacitance_from_pf(target_ccap, spef.c_unit);
         }
 
         // First pass over original SPEF:
