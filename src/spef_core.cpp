@@ -564,7 +564,111 @@ ParsedSpef parse_spef(const std::string& filepath) {
         while ((pos = out.find("\\]")) != std::string::npos) out.replace(pos, 2, "]");
         return out;
     };
-    
+
+    auto process_conn_entry = [&](const std::vector<std::string> &tokens) {
+
+        if (current_net == nullptr || tokens.size() < 3)
+
+            return;
+
+
+
+        const std::string &header = tokens[0];
+
+        if (header != "*I" && header != "*P")
+
+            return;
+
+
+
+        std::string pin = resolve_name_token(tokens[1]);
+
+        std::string dir;
+
+        for (size_t i = 2; i < tokens.size(); i++)
+
+        {
+
+            if (!tokens[i].empty() && (tokens[i][0] == 'O' || tokens[i][0] == 'B' || tokens[i][0] == 'I'))
+
+            {
+
+                dir = tokens[i];
+
+                break;
+
+            }
+
+        }
+
+
+
+        if (dir.empty())
+
+            return;
+
+
+
+        bool is_driver = false;
+
+        bool is_sink = false;
+
+
+
+        if (dir[0] == 'B')
+
+        {
+
+            is_driver = true;
+
+        }
+
+        else if (header == "*I")
+
+        {
+
+            is_driver = (dir[0] == 'O');
+
+            is_sink = (dir[0] == 'I');
+
+        }
+
+        else if (header == "*P")
+
+        {
+
+            is_driver = (dir[0] == 'I');
+
+            is_sink = (dir[0] == 'O');
+
+        }
+
+
+
+        if (is_driver)
+
+        {
+
+            if (current_net->driver.empty())
+
+            {
+
+                current_net->driver = pin;
+
+            }
+
+        }
+
+        else if (is_sink)
+
+        {
+
+            current_net->sinks.push_back(pin);
+
+        }
+
+    };
+
     while (std::getline(file, line)) {
         line_num++;
         // Skip empty lines
@@ -745,23 +849,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
             }
         }
         else if (section == SEC_CONN && tokens.size() >= 3) {
-            std::string pin = resolve_name_token(tokens[1]);
-            // Direction is the first token that starts with O, B, or I
-            std::string dir;
-            for (size_t i = 2; i < tokens.size(); i++) {
-                if (!tokens[i].empty() && (tokens[i][0] == 'O' || tokens[i][0] == 'B' || tokens[i][0] == 'I')) {
-                    dir = tokens[i];
-                    break;
-                }
-            }
-            
-            if (!dir.empty() && (dir[0] == 'O' || dir[0] == 'B')) {
-                if (current_net->driver.empty()) {
-                    current_net->driver = pin;
-                }
-            } else if (!dir.empty() && (dir[0] == 'I')) {
-                current_net->sinks.push_back(pin);
-            }
+            process_conn_entry(tokens);
         }
         else if (section == SEC_NONE) {
             // Look for section header
@@ -786,22 +874,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 // Also handle *I (input) and *P (port) as CONN entries when no explicit *CONN header
                 else if ((header == "*I" || header == "*P") && tokens.size() >= 3) {
                     section = SEC_CONN;
-                    // Process this line as CONN
-                    std::string pin = resolve_name_token(tokens[1]);
-                    std::string dir;
-                    for (size_t i = 2; i < tokens.size(); i++) {
-                        if (!tokens[i].empty() && (tokens[i][0] == 'O' || tokens[i][0] == 'B' || tokens[i][0] == 'I')) {
-                            dir = tokens[i];
-                            break;
-                        }
-                    }
-                    if (!dir.empty() && (dir[0] == 'O' || dir[0] == 'B')) {
-                        if (current_net && current_net->driver.empty()) {
-                            current_net->driver = pin;
-                        }
-                    } else if (!dir.empty() && dir[0] == 'I') {
-                        if (current_net) current_net->sinks.push_back(pin);
-                    }
+                    process_conn_entry(tokens);
                     continue;
                 }
             }
