@@ -150,7 +150,8 @@ PYBIND11_MODULE(spef_core, m) {
           py::arg("cap_data_path"),
           py::arg("res_data_path"),
           py::arg("ccap_data_path"),
-          py::arg("output_path"));
+          py::arg("output_path"),
+          py::arg("res_method") = 0);
     
     m.def("parse_backmark_cap_data", &parse_backmark_cap_data,
           "Parse backmark cap data file",
@@ -179,12 +180,19 @@ PYBIND11_MODULE(spef_core, m) {
           py::arg("net"),
           py::arg("sink_ratios"),
           py::arg("avg_ratio"));
+
+    m.def("compute_equivalent_resistance", &compute_equivalent_resistance,
+          "Compute Thevenin equivalent resistance between two nodes using nodal analysis",
+          py::arg("graph"),
+          py::arg("source"),
+          py::arg("sink"));
     
     m.def("compare_spef_full", &compare_spef_full,
           "Compare two SPEFs and return all results",
           py::arg("spef1"),
           py::arg("spef2"),
-          py::arg("num_threads") = 0);
+          py::arg("num_threads") = 0,
+          py::arg("res_method") = 0);
     
     m.def("summarize_comparison", &summarize_comparison,
           "Generate text summary of comparison result",
@@ -236,7 +244,8 @@ PYBIND11_MODULE(spef_core, m) {
           "Export comparison results as numpy arrays for fast plotting",
           py::arg("spef1"),
           py::arg("spef2"),
-          py::arg("num_threads") = 0);
+          py::arg("num_threads") = 0,
+          py::arg("res_method") = 0);
     
     m.def("compare_spef_chunk", &compare_spef_chunk,
           "Compare SPEF files in chunks for large datasets",
