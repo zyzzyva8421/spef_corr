@@ -181,7 +181,7 @@ def write_res_csv(path: str, ress: List[ResComparison], r_agg: str) -> None:
 
 # ===================== C++ wrapper functions =====================
 
-def compare_spef_cpp(spef1_path: str, spef2_path: str, num_threads: int = 0) -> Tuple[List[CapComparison], List[ResComparison], List[CapComparison], List[ResComparison]]:
+def compare_spef_cpp(spef1_path: str, spef2_path: str, num_threads: int = 0, res_method: int = 0) -> Tuple[List[CapComparison], List[ResComparison], List[CapComparison], List[ResComparison]]:
     """Compare two SPEF files using C++ backend."""
     if not HAS_CPP:
         raise RuntimeError("C++ extension not available")
@@ -190,7 +190,7 @@ def compare_spef_cpp(spef1_path: str, spef2_path: str, num_threads: int = 0) -> 
     spef1 = spef_core.parse_spef(spef1_path)
     spef2 = spef_core.parse_spef(spef2_path)
     
-    result = spef_core.compare_spef_full(spef1, spef2, num_threads)
+    result = spef_core.compare_spef_full(spef1, spef2, num_threads, res_method)
     
     caps = [CapComparison(c.net_name, c.c1, c.c2) for c in result.cap_rows]
     ress = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.res_rows]
@@ -204,6 +204,7 @@ def compare_spef_with_coupling_cpp(
     spef1_path: str,
     spef2_path: str,
     num_threads: int = 0,
+    res_method: int = 0,
 ) -> Tuple[List[CapComparison], List[ResComparison], List[CouplingCapComparison], List[CapComparison], List[ResComparison]]:
     """Compare total cap, resistance, and coupling capacitance using one shared parse."""
     if not HAS_CPP:
@@ -211,7 +212,7 @@ def compare_spef_with_coupling_cpp(
 
     print(f"Parsing {spef1_path} and {spef2_path} in parallel (C++ threads)...")
     cpp_spefs = spef_core.parse_spef_parallel([spef1_path, spef2_path], max(num_threads, 2))
-    result = spef_core.compare_spef_full(cpp_spefs[0], cpp_spefs[1], num_threads)
+    result = spef_core.compare_spef_full(cpp_spefs[0], cpp_spefs[1], num_threads, res_method)
     cc_results = spef_core.compare_coupling_caps(cpp_spefs[0], cpp_spefs[1])
 
     caps = [CapComparison(c.net_name, c.c1, c.c2) for c in result.cap_rows]
@@ -241,11 +242,11 @@ def compare_coupling_caps_cpp(spef1: "SpefFile", spef2: "SpefFile") -> List[Coup
         return []
 
 
-def compare_spef_cpp_objs(spef1: "SpefFile", spef2: "SpefFile", num_threads: int = 0):
+def compare_spef_cpp_objs(spef1: "SpefFile", spef2: "SpefFile", num_threads: int = 0, res_method: int = 0):
     """Compare two already-parsed SPEF objects using C++ backend."""
     if not HAS_CPP:
         raise RuntimeError("C++ extension not available")
-    result = spef_core.compare_spef_full(spef1._cpp_spef, spef2._cpp_spef, num_threads)
+    result = spef_core.compare_spef_full(spef1._cpp_spef, spef2._cpp_spef, num_threads, res_method)
     caps = [CapComparison(c.net_name, c.c1, c.c2) for c in result.cap_rows]
     ress = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.res_rows]
     top_10_cap = [CapComparison(c.net_name, c.c1, c.c2) for c in result.top_10_cap]
@@ -259,11 +260,12 @@ def backmark_spef_cpp(
     res_data_path: Optional[str],
     ccap_data_path: Optional[str],
     output_path: str,
+    res_method: int = 0,
 ) -> None:
     """Apply new RC values to SPEF using C++ backend."""
     if not HAS_CPP:
         raise RuntimeError("C++ extension not available")
-    spef_core.backmark_spef(spef_path, cap_data_path or "", res_data_path or "", ccap_data_path or "", output_path)
+    spef_core.backmark_spef(spef_path, cap_data_path or "", res_data_path or "", ccap_data_path or "", output_path, res_method)
 
 
 def shuffle_spef_cpp(spef_path: str, output_path: str, seed: Optional[int] = None) -> None:
@@ -404,8 +406,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None, metavar="INT", help="Random seed")
     parser.add_argument("--output", "-o", metavar="FILE", help="Output path")
     parser.add_argument("--threads", "-t", type=int, default=0, help="Number of threads")
+    parser.add_argument("--res-method", choices=["dijkstra", "equivalent"], default="dijkstra",
+                        help="Driver-sink resistance method: 'dijkstra' (min-path, default) or "
+                             "'equivalent' (Thevenin equivalent/nodal analysis)")
 
     args = parser.parse_args()
+
+    # Translate res_method string to integer for C++
+    _res_method_int = 1 if args.res_method == "equivalent" else 0
 
     # Backmark mode
     if args.backmark:
@@ -414,8 +422,8 @@ def main() -> None:
         if not args.net_cap_data and not args.net_res_data and not args.net_ccap_data:
             parser.error("--backmark requires at least one of --net-cap-data, --net-res-data, or --net-ccap-data")
         out = args.output or os.path.splitext(args.spef1)[0] + "_backmarked.spef"
-        print(f"[backmark] Processing {args.spef1}...")
-        backmark_spef_cpp(args.spef1, args.net_cap_data, args.net_res_data, args.net_ccap_data, out)
+        print(f"[backmark] Processing {args.spef1} (res_method={args.res_method})...")
+        backmark_spef_cpp(args.spef1, args.net_cap_data, args.net_res_data, args.net_ccap_data, out, _res_method_int)
         print(f"[backmark] Done: {out}")
         return
 
@@ -434,7 +442,7 @@ def main() -> None:
         if args.gui_auto_run:
             # Use numpy export for maximum performance with large datasets
             s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
-            plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads)
+            plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads, _res_method_int)
             launch_gui(
                 preload_paths=None,
                 auto_run=True,
@@ -462,7 +470,7 @@ def main() -> None:
             cap_out = args.net_cap_data or "net_cap.data"
             res_out = args.net_res_data or "net_res.data"
             ccap_out = args.net_ccap_data or "net_ccap.data"
-            caps, ress, coupling_caps, top_10_cap, top_10_res = compare_spef_with_coupling_cpp(args.spef1, args.spef2, args.threads)
+            caps, ress, coupling_caps, top_10_cap, top_10_res = compare_spef_with_coupling_cpp(args.spef1, args.spef2, args.threads, _res_method_int)
             with open(cap_out, 'w') as fc, open(res_out, 'w') as fr, open(ccap_out, 'w') as fcc:
                 for cap in caps:
                     print(f"{cap.net} {cap.c1} {cap.c2}", file=fc)
@@ -596,6 +604,7 @@ class RcCorrApp:
         self.ref_var = tk.StringVar()
         self.fit_var = tk.StringVar()
         self.r_agg_var = tk.StringVar(value="max")
+        self.res_method_var = tk.StringVar(value="dijkstra")
         self.view_mode_var = tk.StringVar(value="total_cap")  # New: view mode (total_cap or coupling_cap)
         self.stat_metric_var = tk.StringVar(value="stddev")  # New: histogram metric (stddev or rmse)
         self._auto_run_requested = auto_run
@@ -971,9 +980,14 @@ class RcCorrApp:
         ttk.Label(srm, text="to").grid(row=6, column=2, sticky="w", padx=2, pady=2)
         ttk.Entry(srm, textvariable=self.max_r_var, width=10).grid(row=6, column=3, sticky="w", padx=5, pady=2)
 
-        # Row 7: R aggregation, run button, correlation label
+        # Row 7: R aggregation, res method, run button, correlation label
         ttk.Label(srm, text="R aggregation:").grid(row=7, column=0, sticky="w", padx=5, pady=2)
         ttk.Combobox(srm, textvariable=self.r_agg_var, values=["max", "avg", "total"], state="readonly", width=8).grid(row=7, column=1, sticky="w", padx=5, pady=2)
+
+        ttk.Label(srm, text="Res Method:").grid(row=8, column=0, sticky="w", padx=5, pady=2)
+        ttk.Combobox(srm, textvariable=self.res_method_var,
+                     values=["dijkstra", "equivalent"],
+                     state="readonly", width=12).grid(row=8, column=1, sticky="w", padx=5, pady=2)
 
         ttk.Button(srm, text="Run Analysis", command=self._run_analysis).grid(row=7, column=2, sticky="w", padx=5, pady=2)
         ttk.Button(srm, text="Diff Histogram", command=self._show_histogram).grid(row=7, column=4, sticky="w", padx=5, pady=2)
@@ -1281,7 +1295,8 @@ class RcCorrApp:
             s2 = self.spefs[fit]
             # Always use C++ export_plot_data
             if hasattr(s1, '_cpp_spef') and s1._cpp_spef is not None and hasattr(s2, '_cpp_spef') and s2._cpp_spef is not None:
-                self._cpp_result = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, 0)
+                res_method_int = 1 if self.res_method_var.get() == "equivalent" else 0
+                self._cpp_result = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, 0, res_method_int)
                 self._fanout_cache = None  # Invalidate cache when analysis changes
                 try:
                     self._data_coupling_caps = compare_coupling_caps_cpp(s1, s2)

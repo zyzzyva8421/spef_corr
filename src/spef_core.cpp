@@ -164,6 +164,105 @@ std::unordered_map<std::string, double> dijkstra_shortest_paths(
     return dist;
 }
 
+// ============== Equivalent Resistance (Nodal Analysis) ==============
+
+double compute_equivalent_resistance(
+    const std::unordered_map<std::string, std::vector<Edge>>& graph,
+    const std::string& source,
+    const std::string& sink
+) {
+    if (source == sink || graph.empty()) return 0.0;
+
+    // Build ordered node list
+    std::vector<std::string> nodes;
+    nodes.reserve(graph.size());
+    std::unordered_map<std::string, int> node_idx;
+    node_idx.reserve(graph.size());
+
+    for (const auto& [node, _] : graph) {
+        node_idx[node] = (int)nodes.size();
+        nodes.push_back(node);
+    }
+
+    int n = (int)nodes.size();
+    if (n < 2) return 0.0;
+
+    auto src_it = node_idx.find(source);
+    auto snk_it = node_idx.find(sink);
+    if (src_it == node_idx.end() || snk_it == node_idx.end()) return 0.0;
+
+    int src_idx = src_it->second;
+    int snk_idx = snk_it->second;
+
+    // Build conductance Laplacian (dense matrix)
+    std::vector<std::vector<double>> G(n, std::vector<double>(n, 0.0));
+    for (const auto& [node, edges] : graph) {
+        int i = node_idx.at(node);
+        for (const auto& edge : edges) {
+            auto it = node_idx.find(edge.to);
+            if (it == node_idx.end() || edge.weight <= 1e-15) continue;
+            int j = it->second;
+            double g = 1.0 / edge.weight;  // conductance = 1/resistance
+            G[i][i] += g;
+            G[i][j] -= g;
+        }
+    }
+
+    // RHS: inject 1A at source, extract 1A at sink
+    std::vector<double> b(n, 0.0);
+    b[src_idx] = 1.0;
+    b[snk_idx] = -1.0;
+
+    // Ground the sink node (V[sink] = 0) to make the system non-singular
+    for (int j = 0; j < n; j++) G[snk_idx][j] = 0.0;
+    G[snk_idx][snk_idx] = 1.0;
+    b[snk_idx] = 0.0;
+
+    // Gaussian elimination with partial pivoting
+    for (int col = 0; col < n; col++) {
+        int pivot = -1;
+        double max_val = 0.0;
+        for (int row = col; row < n; row++) {
+            if (std::abs(G[row][col]) > max_val) {
+                max_val = std::abs(G[row][col]);
+                pivot = row;
+            }
+        }
+        if (pivot < 0 || max_val < 1e-15) return 0.0;  // Singular (disconnected net)
+
+        if (pivot != col) {
+            std::swap(G[col], G[pivot]);
+            std::swap(b[col], b[pivot]);
+        }
+
+        double diag = G[col][col];
+        for (int row = col + 1; row < n; row++) {
+            double factor = G[row][col] / diag;
+            if (std::abs(factor) < 1e-30) continue;
+            G[row][col] = 0.0;
+            for (int c = col + 1; c < n; c++) {
+                G[row][c] -= factor * G[col][c];
+            }
+            b[row] -= factor * b[col];
+        }
+    }
+
+    // Back substitution
+    std::vector<double> v(n, 0.0);
+    for (int row = n - 1; row >= 0; row--) {
+        double sum = b[row];
+        for (int c = row + 1; c < n; c++) {
+            sum -= G[row][c] * v[c];
+        }
+        if (std::abs(G[row][row]) < 1e-15) return 0.0;
+        v[row] = sum / G[row][row];
+    }
+
+    // R_equiv = V[source] - V[sink] = V[source]  (V[sink] = 0 by grounding)
+    double r_equiv = v[src_idx];
+    return (r_equiv > 0.0) ? r_equiv : 0.0;
+}
+
 // ============== Driver-Sink Resistances ==============
 std::unordered_map<std::string, double> compute_driver_sink_resistances(
     NetData& net
@@ -232,7 +331,78 @@ std::unordered_map<std::string, double> compute_driver_sink_resistances(
     return net.driver_sink_res_cache;
 }
 
-// ============== RECOMMENDATION 3: Pre-computed Pin Prefix Maps ==============
+// ============== Equivalent Driver-Sink Resistances ==============
+std::unordered_map<std::string, double> compute_driver_sink_equivalent_resistances(
+    NetData& net
+) {
+    if (net.equiv_res_cache_valid && !net.driver_sink_equiv_res_cache.empty()) {
+        return net.driver_sink_equiv_res_cache;
+    }
+
+    net.driver_sink_equiv_res_cache.clear();
+
+    if (net.driver.empty() || net.sinks.empty() || net.res_graph.empty()) {
+        net.equiv_res_cache_valid = true;
+        return net.driver_sink_equiv_res_cache;
+    }
+
+    // Find best matching driver node
+    std::string driver_node = net.driver;
+    if (net.res_graph.find(net.driver) == net.res_graph.end()) {
+        size_t colon_pos = net.driver.find(':');
+        std::string base = (colon_pos != std::string::npos) ?
+            net.driver.substr(0, colon_pos) : net.driver;
+        for (const auto& [node, _] : net.res_graph) {
+            size_t nc = node.find(':');
+            std::string nb = (nc != std::string::npos) ? node.substr(0, nc) : node;
+            if (nb == base) { driver_node = node; break; }
+        }
+    }
+
+    if (net.res_graph.find(driver_node) == net.res_graph.end()) {
+        net.equiv_res_cache_valid = true;
+        return net.driver_sink_equiv_res_cache;
+    }
+
+    for (const auto& sink : net.sinks) {
+        // Resolve sink to graph node
+        std::string sink_node = sink;
+        if (net.res_graph.find(sink) == net.res_graph.end()) {
+            size_t colon_pos = sink.find(':');
+            std::string base = (colon_pos != std::string::npos) ?
+                sink.substr(0, colon_pos) : sink;
+            for (const auto& [node, _] : net.res_graph) {
+                size_t nc = node.find(':');
+                std::string nb = (nc != std::string::npos) ? node.substr(0, nc) : node;
+                if (nb == base) { sink_node = node; break; }
+            }
+        }
+
+        if (net.res_graph.find(sink_node) == net.res_graph.end()) continue;
+        if (sink_node == driver_node) continue;
+
+        double r_eq = compute_equivalent_resistance(net.res_graph, driver_node, sink_node);
+        if (r_eq > 0.0) {
+            net.driver_sink_equiv_res_cache[sink] = r_eq;
+        }
+    }
+
+    net.equiv_res_cache_valid = true;
+    return net.driver_sink_equiv_res_cache;
+}
+
+// Dispatch driver-sink resistance computation by method (0=dijkstra, 1=equivalent)
+std::unordered_map<std::string, double> compute_driver_sink_res_by_method(
+    NetData& net,
+    int res_method
+) {
+    if (res_method == 1) {
+        return compute_driver_sink_equivalent_resistances(net);
+    }
+    return compute_driver_sink_resistances(net);
+}
+
+
 void build_pin_to_node_map(NetData& net) {
     if (net.pin_map_built) return;
     
@@ -1663,7 +1833,8 @@ void backmark_spef(
     const std::string& cap_data_path,
     const std::string& res_data_path,
     const std::string& ccap_data_path,
-    const std::string& output_path
+    const std::string& output_path,
+    int res_method
 ) {
     std::cout << "[backmark] Parsing SPEF..." << std::endl;
     // Parse SPEF
@@ -1753,7 +1924,7 @@ void backmark_spef(
             if (net_it == spef.nets.end()) continue;
             
             NetData& net = net_it->second;
-            auto old_dr = compute_driver_sink_resistances(net);
+            auto old_dr = compute_driver_sink_res_by_method(net, res_method);
             if (old_dr.empty()) continue;
             
             std::unordered_map<std::string, double> sink_ratios;
@@ -2181,7 +2352,8 @@ double convert_resistance(double value, const std::string& from_unit) {
 ComparisonResult compare_spef_full(
     ParsedSpef& spef1,
     ParsedSpef& spef2,
-    int num_threads
+    int num_threads,
+    int res_method
 ) {
     std::cout << "[compare] Starting comparison with " << num_threads << " threads..." << std::endl;
     ComparisonResult result;
@@ -2226,8 +2398,8 @@ ComparisonResult compare_spef_full(
             }
             
             // Resistance comparison - convert to standard unit (OHM)
-            auto res1 = compute_driver_sink_resistances(net1);
-            auto res2 = compute_driver_sink_resistances(net2);
+            auto res1 = compute_driver_sink_res_by_method(net1, res_method);
+            auto res2 = compute_driver_sink_res_by_method(net2, res_method);
             
             // Find common sinks
             std::vector<std::string> sinks1_vec, sinks2_vec;
@@ -2408,7 +2580,8 @@ std::vector<ParsedSpef> parse_spef_parallel(
 PlotData export_plot_data(
     ParsedSpef& spef1,
     ParsedSpef& spef2,
-    int num_threads
+    int num_threads,
+    int res_method
 ) {
     PlotData result;
     
@@ -2476,8 +2649,8 @@ PlotData export_plot_data(
             local_cap_names.push_back(net_name);
             
             // Resistance - convert to standard unit (OHM)
-            auto res1 = compute_driver_sink_resistances(net1);
-            auto res2 = compute_driver_sink_resistances(net2);
+            auto res1 = compute_driver_sink_res_by_method(net1, res_method);
+            auto res2 = compute_driver_sink_res_by_method(net2, res_method);
             
             // Find common sinks
             std::vector<std::string> sinks1_vec, sinks2_vec;

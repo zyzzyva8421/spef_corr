@@ -38,12 +38,14 @@ struct NetData {
     std::unordered_map<std::string, std::string> node_prefix_map;
     std::unordered_map<std::string, std::string> pin_to_node_cache;  // Recommendation 3: Pre-computed maps
     std::unordered_map<std::string, double> driver_sink_res_cache;
+    std::unordered_map<std::string, double> driver_sink_equiv_res_cache;  // Equivalent-resistance cache
     // Temporary storage for coupling capacitances (raw format: node1|node2|cap_value)
     std::vector<std::string> raw_coupling_caps;
     bool cache_valid;
+    bool equiv_res_cache_valid;
     bool pin_map_built;
     
-    NetData() : total_cap(0.0), cache_valid(false), pin_map_built(false) {}
+    NetData() : total_cap(0.0), cache_valid(false), equiv_res_cache_valid(false), pin_map_built(false) {}
 };
 
 // Structure to represent coupling capacitance between two nets
@@ -118,6 +120,13 @@ std::unordered_map<std::string, double> dijkstra_shortest_paths(
     const std::string& source
 );
 
+// Compute equivalent (Thevenin) resistance between two nodes using nodal analysis
+double compute_equivalent_resistance(
+    const std::unordered_map<std::string, std::vector<Edge>>& graph,
+    const std::string& source,
+    const std::string& sink
+);
+
 // Recommendation 3: Pre-compute pin-to-node mapping for a net
 void build_pin_to_node_map(NetData& net);
 
@@ -130,9 +139,20 @@ std::vector<CouplingCapComparison> compare_coupling_caps(
     const ParsedSpef& spef2
 );
 
-// Compute all driver->sink resistances for a net
+// Compute all driver->sink resistances for a net (Dijkstra shortest path)
 std::unordered_map<std::string, double> compute_driver_sink_resistances(
     NetData& net
+);
+
+// Compute all driver->sink equivalent (Thevenin) resistances for a net
+std::unordered_map<std::string, double> compute_driver_sink_equivalent_resistances(
+    NetData& net
+);
+
+// Dispatch: compute driver-sink resistances by method (0=dijkstra, 1=equivalent)
+std::unordered_map<std::string, double> compute_driver_sink_res_by_method(
+    NetData& net,
+    int res_method
 );
 
 // Recommendation 1: Batch compute driver-sink resistances for multiple nets
@@ -178,7 +198,8 @@ void backmark_spef(
     const std::string& cap_data_path,
     const std::string& res_data_path,
     const std::string& ccap_data_path,
-    const std::string& output_path
+    const std::string& output_path,
+    int res_method = 0
 );
 
 // Parse backmark cap data
@@ -241,7 +262,8 @@ struct ComparisonResult {
 ComparisonResult compare_spef_full(
     ParsedSpef& spef1,
     ParsedSpef& spef2,
-    int num_threads = 0
+    int num_threads = 0,
+    int res_method = 0
 );
 
 // Summarize comparison results
@@ -292,7 +314,8 @@ struct PlotData {
 PlotData export_plot_data(
     ParsedSpef& spef1,
     ParsedSpef& spef2,
-    int num_threads = 0
+    int num_threads = 0,
+    int res_method = 0
 );
 
 // Chunked comparison for very large datasets (1M+ nets)
