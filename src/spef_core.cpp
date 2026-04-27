@@ -1942,7 +1942,17 @@ void backmark_spef(
             for (const auto& [_, r] : sink_ratios) sum += r;
             double avg = sum / sink_ratios.size();
             res_avg_ratio[net_name] = avg;
-            res_segment_scales[net_name] = compute_res_segment_scales(net, sink_ratios, avg);
+            // For the equivalent (Thevenin) method every resistance segment is a
+            // linear contributor to all driver-sink equivalent resistances.  Scaling
+            // all segments by a single uniform factor k scales every equivalent
+            // resistance by the same k, so using avg_ratio globally is both correct
+            // and exact.  The shared/exclusive-segment decomposition performed by
+            // compute_res_segment_scales is only meaningful for the Dijkstra (path
+            // sum) method and must be skipped here to avoid the fallback error that
+            // arises when exclusive_target turns negative.
+            if (res_method != 1 /* not equivalent/Thevenin */) {
+                res_segment_scales[net_name] = compute_res_segment_scales(net, sink_ratios, avg);
+            }
         }
     }
 
