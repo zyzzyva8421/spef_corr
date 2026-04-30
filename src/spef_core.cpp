@@ -105,24 +105,40 @@ std::vector<CouplingCapComparison> compare_coupling_caps(
         caps2[key] += cc.cap_value;
     }
     
-    // Find common pairs
-    std::set<std::string> all_keys;
-    for (const auto& [key, _] : caps1) all_keys.insert(key);
-    for (const auto& [key, _] : caps2) all_keys.insert(key);
-    
-    for (const auto& key : all_keys) {
-        double c1 = (caps1.find(key) != caps1.end()) ? caps1[key] : 0.0;
-        double c2 = (caps2.find(key) != caps2.end()) ? caps2[key] : 0.0;
-        
-        // Extract net names from key
+    // Only keep pairs present in both SPEFs (intersection); print unmatched pairs.
+    std::vector<std::string> only_in_spef1, only_in_spef2;
+
+    for (const auto& [key, c1] : caps1) {
         size_t pos = key.find('|');
-        if (pos != std::string::npos) {
-            std::string net1 = key.substr(0, pos);
-            std::string net2 = key.substr(pos + 1);
-            results.push_back({net1, net2, c1, c2});
+        if (pos == std::string::npos) continue;
+        std::string net1 = key.substr(0, pos);
+        std::string net2 = key.substr(pos + 1);
+        auto it = caps2.find(key);
+        if (it != caps2.end()) {
+            results.push_back({net1, net2, c1, it->second});
+        } else {
+            only_in_spef1.push_back(net1 + " " + net2);
         }
     }
-    
+
+    for (const auto& [key, _] : caps2) {
+        if (caps1.find(key) == caps1.end()) {
+            size_t pos = key.find('|');
+            if (pos != std::string::npos)
+                only_in_spef2.push_back(key.substr(0, pos) + " " + key.substr(pos + 1));
+        }
+    }
+
+    if (!only_in_spef1.empty() || !only_in_spef2.empty()) {
+        std::sort(only_in_spef1.begin(), only_in_spef1.end());
+        std::sort(only_in_spef2.begin(), only_in_spef2.end());
+        std::cout << "[ccap] Unmatched net pairs (only in spef1, count=" << only_in_spef1.size() << "):\n";
+        for (const auto& s : only_in_spef1) std::cout << "  " << s << "\n";
+        std::cout << "[ccap] Unmatched net pairs (only in spef2, count=" << only_in_spef2.size() << "):\n";
+        for (const auto& s : only_in_spef2) std::cout << "  " << s << "\n";
+        std::cout << "[ccap] Matched pairs: " << results.size() << "\n";
+    }
+
     return results;
 }
 
