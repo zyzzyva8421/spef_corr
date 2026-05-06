@@ -32,12 +32,15 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     };
 
     // First pass: accumulate capacitance for each pair across all nets.
-    // This handles multiple entries for the same pair in one net's CAP section,
-    // and also ensures each pair is counted once even though it appears in both
-    // nets' CAP sections in SPEF format.
+    // Each net's section is summed into a local map first (handles multiple
+    // entries for the same pair within one net's CAP section).  The local
+    // result is then merged into the global accumulator with try_emplace so
+    // that the symmetric entry in the other net's CAP section is ignored.
+    // This ensures each pair is counted exactly once.
     std::unordered_map<std::string, double> cap_accumulator;
 
     for (const auto& [net_name, net_data] : spef.nets) {
+        std::unordered_map<std::string, double> local_caps;
         for (const auto& raw_entry : net_data.raw_coupling_caps) {
             size_t pos1 = raw_entry.find('|');
             size_t pos2 = raw_entry.rfind('|');
@@ -57,8 +60,14 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
             if (net1 != net2) {
                 std::string pair_key = make_pair_key(net1, net2);
                 double cap_converted = spef.c_scale * convert_capacitance(cap_val, spef.c_unit);
-                cap_accumulator[pair_key] += cap_converted;
+                local_caps[pair_key] += cap_converted;
             }
+        }
+        // Merge: only insert pairs not already present in the global accumulator.
+        // Because SPEF lists each coupling cap in both nets' CAP sections, the
+        // second net's entry would be a duplicate — try_emplace skips it.
+        for (const auto& [key, val] : local_caps) {
+            cap_accumulator.try_emplace(key, val);
         }
     }
 
