@@ -23,7 +23,7 @@ import argparse
 import csv
 import math
 import os
-from typing import Dict, List, Tuple, Optional, Iterable
+from typing import Dict, List, Tuple, Optional, Iterable, Any
 try:
     import spef_core
     HAS_CPP = True
@@ -327,7 +327,7 @@ class RcCorrApp:
                  preload_spef_objs=None, preload_cpp_result=None):
         self.root = root
         self.root.title("SPEF RC Correlation")
-        self.spefs: Dict[str, object] = {}
+        self.spefs: Dict[str, Any] = {}  # name -> ParsedSpef (spef_core.ParsedSpef)
         self.spef_paths: Dict[str, str] = {}
         self._cpp_result = preload_cpp_result  # PlotData from C++
         self._fanout_cache: Optional[Dict[str, int]] = None  # net_name -> fanout count
@@ -772,12 +772,11 @@ class RcCorrApp:
         cache: Dict[str, int] = {}
         if ref_name and ref_name in self.spefs:
             spef = self.spefs[ref_name]
-            if spef is not None:
-                try:
-                    for net_name, net_data in spef.nets.items():
-                        cache[net_name] = len(net_data.sinks)
-                except Exception as exc:
-                    print(f"[warn] Failed to build fanout cache: {exc}")
+            try:
+                for net_name, net_data in spef.nets.items():
+                    cache[net_name] = len(net_data.sinks)
+            except Exception as exc:
+                print(f"[warn] Failed to build fanout cache: {exc}")
         self._fanout_cache = cache
         self._fanout_cache_ref = ref_name
         return cache
@@ -1005,13 +1004,10 @@ class RcCorrApp:
         try:
             s1 = self.spefs[ref]
             s2 = self.spefs[fit]
-            if s1 is not None and s2 is not None:
-                res_method_int = 1 if self.res_method_var.get() == "equivalent" else 0
-                self._cpp_result = spef_core.export_plot_data(s1, s2, 0, res_method_int)
-                self._fanout_cache = None
-                self._update_plot()
-            else:
-                messagebox.showerror("Error", "SPEF files not loaded")
+            res_method_int = 1 if self.res_method_var.get() == "equivalent" else 0
+            self._cpp_result = spef_core.export_plot_data(s1, s2, 0, res_method_int)
+            self._fanout_cache = None
+            self._update_plot()
         except Exception as exc:
             messagebox.showerror("Error", f"Analysis failed:\n{exc}")
 
@@ -1157,20 +1153,18 @@ class RcCorrApp:
         fit_name = self.fit_var.get()
         if ref_name and ref_name in self.spefs:
             spef = self.spefs[ref_name]
-            if spef is not None:
-                try:
-                    for net_name, net_data in spef.nets.items():
-                        total_cap_map_ref[net_name] = net_data.total_cap
-                except Exception:
-                    pass
+            try:
+                for net_name, net_data in spef.nets.items():
+                    total_cap_map_ref[net_name] = net_data.total_cap
+            except Exception:
+                pass
         if fit_name and fit_name in self.spefs:
             spef = self.spefs[fit_name]
-            if spef is not None:
-                try:
-                    for net_name, net_data in spef.nets.items():
-                        total_cap_map_fit[net_name] = net_data.total_cap
-                except Exception:
-                    pass
+            try:
+                for net_name, net_data in spef.nets.items():
+                    total_cap_map_fit[net_name] = net_data.total_cap
+            except Exception:
+                pass
 
         points = []
         for i in range(len(net1s)):
