@@ -39,7 +39,9 @@ PYBIND11_MODULE(spef_core, m) {
         .def_readwrite("t_unit", &ParsedSpef::t_unit)
         .def_readwrite("c_unit", &ParsedSpef::c_unit)
         .def_readwrite("r_unit", &ParsedSpef::r_unit)
-        .def_readwrite("l_unit", &ParsedSpef::l_unit);
+        .def_readwrite("l_unit", &ParsedSpef::l_unit)
+        .def_readwrite("c_scale", &ParsedSpef::c_scale)
+        .def_readwrite("r_scale", &ParsedSpef::r_scale);
 
     // PlotData struct bindings
     py::class_<PlotData>(m, "PlotData")

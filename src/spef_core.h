@@ -66,8 +66,11 @@ struct ParsedSpef {
     std::string c_unit;
     std::string r_unit;
     std::string l_unit;
+    double c_scale;  // *C_UNIT coefficient (e.g. 0.001 for "*C_UNIT 0.001 PF")
+    double r_scale;  // *R_UNIT coefficient
     
-    ParsedSpef() : t_unit("NS"), c_unit("PF"), r_unit("OHM"), l_unit("HENRY") {}
+    ParsedSpef() : t_unit("NS"), c_unit("PF"), r_unit("OHM"), l_unit("HENRY"),
+                   c_scale(1.0), r_scale(1.0) {}
 };
 
 // Dijkstra shortest path - C++ optimized
