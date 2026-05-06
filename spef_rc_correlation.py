@@ -11,7 +11,6 @@ is delegated to the C++ extension (spef_core) for maximum performance.
 Python provides:
 - CLI argument parsing and command dispatch
 - GUI (Tkinter) interface
-- Data file I/O and CSV output
 - Simple statistics (Pearson correlation)
 
 Usage:
@@ -24,7 +23,6 @@ import argparse
 import csv
 import math
 import os
-from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Iterable
 try:
     import spef_core
@@ -43,216 +41,8 @@ except ImportError:
     Figure = None
     # GUI will fail gracefully if not available
 
-# ===================== Python data structures for GUI =====================
-
-@dataclass
-class CapComparison:
-    net: str
-    c1: float
-    c2: float
-
-@dataclass
-class CouplingCapComparison:
-    """Compare coupling capacitance between two nets across two SPEF files."""
-    net1: str  # First net name
-    net2: str  # Second net name
-    c1: float  # Coupling cap in spef1
-    c2: float  # Coupling cap in spef2
-
-@dataclass
-class ResComparison:
-    net: str
-    driver: str
-    load: str
-    r1: float
-    r2: float
-
-@dataclass
-class NetRC:
-    name: str
-    total_cap: float
-    driver: Optional[str] = None
-    sinks: List[str] = None
-    res_graph: Dict[str, List[Tuple[str, float]]] = None
-    def __post_init__(self):
-        if self.sinks is None:
-            self.sinks = []
-        if self.res_graph is None:
-            self.res_graph = {}
-
-
-def pearson_corr(xs: Iterable[float], ys: Iterable[float]) -> Optional[float]:
-    """Compute Pearson correlation coefficient."""
-    xs = list(xs)
-    ys = list(ys)
-    if len(xs) != len(ys) or len(xs) == 0:
-        return None
-    n = len(xs)
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-    den_x = math.sqrt(sum((x - mean_x) ** 2 for x in xs))
-    den_y = math.sqrt(sum((y - mean_y) ** 2 for y in ys))
-    if den_x == 0.0 or den_y == 0.0:
-        return None
-    return num / (den_x * den_y)
-
-
-# ===================== Data file functions =====================
-
-def parse_net_cap_data(path: str) -> List[CapComparison]:
-    """Parse net_cap.data file."""
-    caps: List[CapComparison] = []
-    with open(path, 'r', encoding='utf-8') as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split()
-            if len(parts) < 3:
-                print(f"[warn] {path}:{lineno}: expected 3 fields, got {len(parts)}, skipping")
-                continue
-            try:
-                caps.append(CapComparison(parts[0], float(parts[1]), float(parts[2])))
-            except ValueError:
-                print(f"[warn] {path}:{lineno}: non-numeric value, skipping")
-    return caps
-
-
-def parse_net_res_data(path: str) -> List[ResComparison]:
-    """Parse net_res.data file."""
-    ress: List[ResComparison] = []
-    with open(path, 'r', encoding='utf-8') as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split()
-            if len(parts) < 5:
-                print(f"[warn] {path}:{lineno}: expected 5 fields, skipping")
-                continue
-            try:
-                ress.append(ResComparison(parts[0], parts[1], parts[2], float(parts[3]), float(parts[4])))
-            except ValueError:
-                print(f"[warn] {path}:{lineno}: non-numeric value, skipping")
-    return ress
-
-
-def parse_net_ccap_data(path: str) -> List[CouplingCapComparison]:
-    """Parse net_ccap.data file."""
-    caps: List[CouplingCapComparison] = []
-    with open(path, 'r', encoding='utf-8') as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split()
-            if len(parts) < 4:
-                print(f"[warn] {path}:{lineno}: expected 4 fields, got {len(parts)}, skipping")
-                continue
-            try:
-                caps.append(CouplingCapComparison(parts[0], parts[1], float(parts[2]), float(parts[3])))
-            except ValueError:
-                print(f"[warn] {path}:{lineno}: non-numeric value, skipping")
-    return caps
-
-
-def write_caps_csv(path: str, caps: List[CapComparison]) -> None:
-    """Write capacitance comparisons to CSV."""
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["net", "C_tool1", "C_tool2", "ratio", "delta"])
-        for row in caps:
-            ratio = (row.c2 / row.c1) if row.c1 != 0 else "inf"
-            delta = row.c2 - row.c1
-            w.writerow([row.net, row.c1, row.c2, ratio, delta])
-
-
-def write_res_csv(path: str, ress: List[ResComparison], r_agg: str) -> None:
-    """Write resistance comparisons to CSV."""
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["net", f"R_{r_agg}_tool1", f"R_{r_agg}_tool2", "ratio", "delta"])
-        for row in ress:
-            ratio = (row.r2 / row.r1) if row.r1 != 0 else "inf"
-            delta = row.r2 - row.r1
-            w.writerow([row.net, row.r1, row.r2, ratio, delta])
-
 
 # ===================== C++ wrapper functions =====================
-
-def compare_spef_cpp(spef1_path: str, spef2_path: str, num_threads: int = 0, res_method: int = 0) -> Tuple[List[CapComparison], List[ResComparison], List[CapComparison], List[ResComparison]]:
-    """Compare two SPEF files using C++ backend."""
-    if not HAS_CPP:
-        raise RuntimeError("C++ extension not available")
-    
-    print(f"Parsing {spef1_path} and {spef2_path}...")
-    spef1 = spef_core.parse_spef(spef1_path)
-    spef2 = spef_core.parse_spef(spef2_path)
-    
-    result = spef_core.compare_spef_full(spef1, spef2, num_threads, res_method)
-    
-    caps = [CapComparison(c.net_name, c.c1, c.c2) for c in result.cap_rows]
-    ress = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.res_rows]
-    top_10_cap = [CapComparison(c.net_name, c.c1, c.c2) for c in result.top_10_cap]
-    top_10_res = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.top_10_res]
-    
-    return caps, ress, top_10_cap, top_10_res
-
-
-def compare_spef_with_coupling_cpp(
-    spef1_path: str,
-    spef2_path: str,
-    num_threads: int = 0,
-    res_method: int = 0,
-) -> Tuple[List[CapComparison], List[ResComparison], List[CouplingCapComparison], List[CapComparison], List[ResComparison]]:
-    """Compare total cap, resistance, and coupling capacitance using one shared parse."""
-    if not HAS_CPP:
-        raise RuntimeError("C++ extension not available")
-
-    print(f"Parsing {spef1_path} and {spef2_path} in parallel (C++ threads)...")
-    cpp_spefs = spef_core.parse_spef_parallel([spef1_path, spef2_path], max(num_threads, 2))
-    result = spef_core.compare_spef_full(cpp_spefs[0], cpp_spefs[1], num_threads, res_method)
-    cc_results = spef_core.compare_coupling_caps(cpp_spefs[0], cpp_spefs[1])
-
-    caps = [CapComparison(c.net_name, c.c1, c.c2) for c in result.cap_rows]
-    ress = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.res_rows]
-    coupling_caps = [CouplingCapComparison(cc.net1, cc.net2, cc.c1, cc.c2) for cc in cc_results]
-    top_10_cap = [CapComparison(c.net_name, c.c1, c.c2) for c in result.top_10_cap]
-    top_10_res = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.top_10_res]
-
-    return caps, ress, coupling_caps, top_10_cap, top_10_res
-
-
-def compare_coupling_caps_cpp(spef1: "SpefFile", spef2: "SpefFile") -> List[CouplingCapComparison]:
-    """Compare coupling capacitances between two SPEF files using C++ backend."""
-    if not HAS_CPP:
-        raise RuntimeError("C++ extension not available")
-    
-    if not hasattr(spef1, '_cpp_spef') or spef1._cpp_spef is None:
-        raise RuntimeError("SPEF1 not parsed with C++ backend")
-    if not hasattr(spef2, '_cpp_spef') or spef2._cpp_spef is None:
-        raise RuntimeError("SPEF2 not parsed with C++ backend")
-    
-    try:
-        cc_results = spef_core.compare_coupling_caps(spef1._cpp_spef, spef2._cpp_spef)
-        return [CouplingCapComparison(cc.net1, cc.net2, cc.c1, cc.c2) for cc in cc_results]
-    except Exception as e:
-        print(f"[warn] Coupling cap comparison failed: {e}")
-        return []
-
-
-def compare_spef_cpp_objs(spef1: "SpefFile", spef2: "SpefFile", num_threads: int = 0, res_method: int = 0):
-    """Compare two already-parsed SPEF objects using C++ backend."""
-    if not HAS_CPP:
-        raise RuntimeError("C++ extension not available")
-    result = spef_core.compare_spef_full(spef1._cpp_spef, spef2._cpp_spef, num_threads, res_method)
-    caps = [CapComparison(c.net_name, c.c1, c.c2) for c in result.cap_rows]
-    ress = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.res_rows]
-    top_10_cap = [CapComparison(c.net_name, c.c1, c.c2) for c in result.top_10_cap]
-    top_10_res = [ResComparison(r.net_name, r.driver, r.sink, r.r1, r.r2) for r in result.top_10_res]
-    return caps, ress, top_10_cap, top_10_res
-
 
 def backmark_spef_cpp(
     spef_path: str,
@@ -276,9 +66,9 @@ def shuffle_spef_cpp(spef_path: str, output_path: str, seed: Optional[int] = Non
     spef_core.shuffle_spef(spef_path, output_path, actual_seed)
 
 
-def parse_spefs_parallel(path1: str, path2: str) -> Tuple[SpefFile, SpefFile]:
+def parse_spefs_parallel(path1: str, path2: str) -> Tuple["SpefFile", "SpefFile"]:
     """Parse two SPEF files concurrently using C++ multithreaded backend.
-    
+
     Optimized for 1M+ nets: keeps data in C++ format, no Python conversion.
     """
     if not HAS_CPP:
@@ -286,8 +76,7 @@ def parse_spefs_parallel(path1: str, path2: str) -> Tuple[SpefFile, SpefFile]:
     print(f"Parsing {path1} and {path2} in parallel (C++ threads)...")
     try:
         cpp_spefs = spef_core.parse_spef_parallel([path1, path2], 2)
-        
-        # Wrap in SpefFile - keep data in C++ format for performance
+
         s1 = SpefFile(path1)
         s1._cpp_spef = cpp_spefs[0]
         s1.name_map = dict(cpp_spefs[0].name_map)
@@ -295,9 +84,7 @@ def parse_spefs_parallel(path1: str, path2: str) -> Tuple[SpefFile, SpefFile]:
         s1.c_unit = cpp_spefs[0].c_unit
         s1.r_unit = cpp_spefs[0].r_unit
         s1.l_unit = cpp_spefs[0].l_unit
-        # DON'T build s1.nets Python dict - keep in C++!
-        # Lazy load nets only when needed for tree view display
-        s1._net_count = len(cpp_spefs[0].nets)  # Store count from C++
+        s1._net_count = len(cpp_spefs[0].nets)
 
         s2 = SpefFile(path2)
         s2._cpp_spef = cpp_spefs[1]
@@ -306,8 +93,8 @@ def parse_spefs_parallel(path1: str, path2: str) -> Tuple[SpefFile, SpefFile]:
         s2.c_unit = cpp_spefs[1].c_unit
         s2.r_unit = cpp_spefs[1].r_unit
         s2.l_unit = cpp_spefs[1].l_unit
-        s2._net_count = len(cpp_spefs[1].nets)  # Store count from C++
-        
+        s2._net_count = len(cpp_spefs[1].nets)
+
         return s1, s2
     except Exception as exc:
         print(f"[warn] C++ parallel parse failed ({exc}), falling back to sequential")
@@ -323,14 +110,13 @@ class SpefFile:
     def __init__(self, path: str):
         self.path = path
         self.name_map: Dict[str, str] = {}
-        self.nets: Dict[str, NetRC] = {}  # Lazy-loaded on demand
         self.t_unit = 'NS'
         self.c_unit = 'PF'
         self.r_unit = 'OHM'
         self.l_unit = 'HENRY'
         self._cpp_spef = None
-        self._net_count = 0  # Cached net count
-    
+        self._net_count = 0
+
     def parse(self) -> None:
         """Parse SPEF file using C++ backend."""
         if not HAS_CPP:
@@ -344,45 +130,63 @@ class SpefFile:
         self.l_unit = self._cpp_spef.l_unit
         self._net_count = len(self._cpp_spef.nets)
         print(f"[{self.path}] parsed {self._net_count} nets... (C++)")
-    
+
     def __len__(self) -> int:
-        """Return net count - from C++ if available, else from Python dict."""
         if self._cpp_spef is not None:
             return len(self._cpp_spef.nets)
-        return len(self.nets)
-    
+        return 0
+
     def get_net_count(self) -> int:
         """Get net count without building Python dict - optimized for 1M+ nets."""
         if self._net_count > 0:
             return self._net_count
         if self._cpp_spef is not None:
             return len(self._cpp_spef.nets)
-        return len(self.nets)
+        return 0
 
 
-def summarize_and_print(caps: List[CapComparison], ress: List[ResComparison], 
-                        spef1_path: str, spef2_path: str, r_agg: str) -> None:
-    """Print human-readable summary."""
+def _write_plot_data_csvs(prefix: str, plot_data, r_agg: str) -> None:
+    """Write cap and res CSVs from a PlotData object."""
+    import numpy as np
+    if plot_data.cap_count > 0:
+        cap_c1 = list(plot_data.cap_c1)
+        cap_c2 = list(plot_data.cap_c2)
+        cap_names = list(plot_data.cap_net_names)
+        cap_path = f"{prefix}_caps.csv"
+        with open(cap_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["net", "C_tool1", "C_tool2", "ratio", "delta"])
+            for net, c1, c2 in zip(cap_names, cap_c1, cap_c2):
+                ratio = (c2 / c1) if c1 != 0 else "inf"
+                w.writerow([net, c1, c2, ratio, c2 - c1])
+        print(f"Cap CSV written: {cap_path}")
+    if plot_data.res_count > 0:
+        res_r1 = list(plot_data.res_r1)
+        res_r2 = list(plot_data.res_r2)
+        res_names = list(plot_data.res_net_names)
+        res_path = f"{prefix}_res_{r_agg}.csv"
+        with open(res_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["net", f"R_{r_agg}_tool1", f"R_{r_agg}_tool2", "ratio", "delta"])
+            for net, r1, r2 in zip(res_names, res_r1, res_r2):
+                ratio = (r2 / r1) if r1 != 0 else "inf"
+                w.writerow([net, r1, r2, ratio, r2 - r1])
+        print(f"Res CSV written: {res_path}")
+
+
+def summarize_and_print(plot_data, spef1_path: str, spef2_path: str) -> None:
+    """Print human-readable summary from a PlotData object."""
     print("=== SPEF RC Correlation Summary ===")
     print(f"Tool1 SPEF: {spef1_path}")
     print(f"Tool2 SPEF: {spef2_path}")
-    print(f"Common nets: {len({c.net for c in caps})}")
-    print(f"Cap rows: {len(caps)}")
-    print(f"Res rows: {len(ress)}")
-    
-    xs_c = [c.c1 for c in caps]
-    ys_c = [c.c2 for c in caps]
-    corr_c = pearson_corr(xs_c, ys_c)
-    if corr_c is not None:
-        print(f"Total C correlation (Pearson): {corr_c:.6f} over {len(caps)} nets")
+    print(f"Cap rows: {plot_data.cap_count}")
+    print(f"Res rows: {plot_data.res_count}")
+    if plot_data.cap_count > 0:
+        print(f"Total C correlation (Pearson): {plot_data.cap_correlation:.6f} over {plot_data.cap_count} nets")
     else:
         print("Total C correlation: N/A")
-    
-    xs_r = [r.r1 for r in ress]
-    ys_r = [r.r2 for r in ress]
-    corr_r = pearson_corr(xs_r, ys_r)
-    if corr_r is not None:
-        print(f"Driver->sink R correlation (Pearson, agg={r_agg}): {corr_r:.6f} over {len(ress)} nets")
+    if plot_data.res_count > 0:
+        print(f"Driver->sink R correlation (Pearson): {plot_data.res_correlation:.6f} over {plot_data.res_count} nets")
     else:
         print("Driver->sink R correlation: N/A")
 
@@ -439,62 +243,59 @@ def main() -> None:
 
     # Normal SPEF mode
     if args.spef1 and args.spef2:
-        if args.gui_auto_run:
-            # Use numpy export for maximum performance with large datasets
+        if args.gui or args.gui_auto_run:
             s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
-            plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads, _res_method_int)
+            plot_data = None
+            if args.gui_auto_run:
+                plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads, _res_method_int)
             launch_gui(
                 preload_paths=None,
-                auto_run=True,
-                preload_caps=None,
-                preload_ress=None,
+                auto_run=args.gui_auto_run,
                 preload_spef_objs=[
                     (os.path.splitext(os.path.basename(args.spef1))[0], s1),
                     (os.path.splitext(os.path.basename(args.spef2))[0], s2)
                 ],
-                preload_cpp_result=plot_data  # Pass PlotData with numpy arrays
+                preload_cpp_result=plot_data,
             )
             return
-        elif args.gui:
-            # --gui: 也并行解析 spef，传递给 GUI
-            s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
-            launch_gui(
-                preload_paths=None,
-                auto_run=False,
-                preload_spef_objs=[
-                    (os.path.splitext(os.path.basename(args.spef1))[0], s1),
-                    (os.path.splitext(os.path.basename(args.spef2))[0], s2)
-                ]
-            )
         else:
+            s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
+            plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads, _res_method_int)
+            summarize_and_print(plot_data, args.spef1, args.spef2)
+
             cap_out = args.net_cap_data or "net_cap.data"
             res_out = args.net_res_data or "net_res.data"
             ccap_out = args.net_ccap_data or "net_ccap.data"
-            caps, ress, coupling_caps, top_10_cap, top_10_res = compare_spef_with_coupling_cpp(args.spef1, args.spef2, args.threads, _res_method_int)
-            with open(cap_out, 'w') as fc, open(res_out, 'w') as fr, open(ccap_out, 'w') as fcc:
-                for cap in caps:
-                    print(f"{cap.net} {cap.c1} {cap.c2}", file=fc)
-                for res in ress:
-                    print(f"{res.net} {res.driver} {res.load} {res.r1} {res.r2}", file=fr)
-                for ccap in coupling_caps:
-                    print(f"{ccap.net1} {ccap.net2} {ccap.c1} {ccap.c2}", file=fcc)
-            print(f"Cap data written to: {cap_out}")
-            print(f"Res data written to: {res_out}")
-            print(f"Coupling cap data written to: {ccap_out}")
-            summarize_and_print(caps, ress, args.spef1, args.spef2, args.r_agg)
-
-            print("\nTop 10 Cap Deviations:")
-            for cap in top_10_cap:
-                print(f"  {cap.net}: {cap.c1:.6f} vs {cap.c2:.6f} (delta={abs(cap.c2-cap.c1):.6f})")
-
-            print("\nTop 10 Res Deviations:")
-            for res in top_10_res:
-                print(f"  {res.net}/{res.load}: {res.r1:.6f} vs {res.r2:.6f} (delta={abs(res.r2-res.r1):.6f})")
+            if plot_data.cap_count > 0:
+                cap_names = list(plot_data.cap_net_names)
+                cap_c1 = list(plot_data.cap_c1)
+                cap_c2 = list(plot_data.cap_c2)
+                with open(cap_out, 'w') as fc:
+                    for net, c1, c2 in zip(cap_names, cap_c1, cap_c2):
+                        print(f"{net} {c1} {c2}", file=fc)
+                print(f"Cap data written to: {cap_out}")
+            if plot_data.res_count > 0:
+                res_names = list(plot_data.res_net_names)
+                res_drivers = list(plot_data.res_driver_names)
+                res_sinks = list(plot_data.res_sink_names)
+                res_r1 = list(plot_data.res_r1)
+                res_r2 = list(plot_data.res_r2)
+                with open(res_out, 'w') as fr:
+                    for net, drv, snk, r1, r2 in zip(res_names, res_drivers, res_sinks, res_r1, res_r2):
+                        print(f"{net} {drv} {snk} {r1} {r2}", file=fr)
+                print(f"Res data written to: {res_out}")
+            if plot_data.ccap_count > 0:
+                net1s = list(plot_data.ccap_net1_names)
+                net2s = list(plot_data.ccap_net2_names)
+                cc1 = list(plot_data.ccap_c1)
+                cc2 = list(plot_data.ccap_c2)
+                with open(ccap_out, 'w') as fcc:
+                    for n1, n2, c1, c2 in zip(net1s, net2s, cc1, cc2):
+                        print(f"{n1} {n2} {c1} {c2}", file=fcc)
+                print(f"Coupling cap data written to: {ccap_out}")
 
             if args.csv_prefix:
-                write_caps_csv(f"{args.csv_prefix}_caps.csv", caps)
-                write_res_csv(f"{args.csv_prefix}_res_{args.r_agg}.csv", ress, args.r_agg)
-                print(f"\nCSV written: {args.csv_prefix}_caps.csv, {args.csv_prefix}_res_{args.r_agg}.csv")
+                _write_plot_data_csvs(args.csv_prefix, plot_data, args.r_agg)
         return
 
     # Data-file mode
@@ -509,27 +310,24 @@ def main() -> None:
             )
             return
 
-        caps = parse_net_cap_data(args.net_cap_data) if args.net_cap_data else []
-        ress = parse_net_res_data(args.net_res_data) if args.net_res_data else []
-        coupling_caps = parse_net_ccap_data(args.net_ccap_data) if args.net_ccap_data else []
-
+        plot_data = spef_core.create_plot_data_from_files(
+            args.net_cap_data or "",
+            args.net_res_data or "",
+            args.net_ccap_data or "",
+        )
         print("=== Summary (from data files) ===")
-        if caps:
-            print(f"Cap entries: {len(caps)}")
-            corr_c = pearson_corr([c.c1 for c in caps], [c.c2 for c in caps])
-            print(f"Cap correlation: {corr_c:.6f}" if corr_c else "Cap correlation: N/A")
-        if ress:
-            print(f"Res entries: {len(ress)}")
-            corr_r = pearson_corr([r.r1 for r in ress], [r.r2 for r in ress])
-            print(f"Res correlation: {corr_r:.6f}" if corr_r else "Res correlation: N/A")
-        if coupling_caps:
-            print(f"Coupling cap entries: {len(coupling_caps)}")
-            corr_cc = pearson_corr([c.c1 for c in coupling_caps], [c.c2 for c in coupling_caps])
-            print(f"Coupling cap correlation: {corr_cc:.6f}" if corr_cc else "Coupling cap correlation: N/A")
+        if plot_data.cap_count > 0:
+            print(f"Cap entries: {plot_data.cap_count}")
+            print(f"Cap correlation: {plot_data.cap_correlation:.6f}")
+        if plot_data.res_count > 0:
+            print(f"Res entries: {plot_data.res_count}")
+            print(f"Res correlation: {plot_data.res_correlation:.6f}")
+        if plot_data.ccap_count > 0:
+            print(f"Coupling cap entries: {plot_data.ccap_count}")
+            print(f"Coupling cap correlation: {plot_data.ccap_correlation:.6f}")
 
         if args.csv_prefix:
-            if caps: write_caps_csv(f"{args.csv_prefix}_caps.csv", caps)
-            if ress: write_res_csv(f"{args.csv_prefix}_res.csv", ress, args.r_agg)
+            _write_plot_data_csvs(args.csv_prefix, plot_data, args.r_agg)
         return
 
     # GUI only
@@ -569,9 +367,6 @@ def launch_gui(
     preload_cap_data: Optional[str] = None,
     preload_res_data: Optional[str] = None,
     preload_ccap_data: Optional[str] = None,
-    preload_caps: Optional[List[CapComparison]] = None,
-    preload_ress: Optional[List[ResComparison]] = None,
-    preload_ccaps: Optional[List[CouplingCapComparison]] = None,
     preload_spef_objs: Optional[list] = None,
     preload_cpp_result: Optional[object] = None
 ) -> None:
@@ -583,22 +378,18 @@ def launch_gui(
 
     root = tk.Tk()
     root.protocol("WM_DELETE_WINDOW", root.destroy)
-    RcCorrApp(root, preload_paths, auto_run, preload_cap_data, preload_res_data, preload_ccap_data, preload_caps, preload_ress, preload_ccaps, preload_spef_objs, preload_cpp_result)
+    RcCorrApp(root, preload_paths, auto_run, preload_cap_data, preload_res_data, preload_ccap_data, preload_spef_objs, preload_cpp_result)
     root.mainloop()
 
 
 class RcCorrApp:
     def __init__(self, root, preload_paths=None, auto_run=False,
                  preload_cap_data=None, preload_res_data=None, preload_ccap_data=None,
-                 preload_caps=None, preload_ress=None, preload_ccaps=None, preload_spef_objs=None,
-                 preload_cpp_result=None):
+                 preload_spef_objs=None, preload_cpp_result=None):
         self.root = root
         self.root.title("SPEF RC Correlation")
         self.spefs: Dict[str, SpefFile] = {}
-        self._data_caps: List[CapComparison] = []
-        self._data_ress: List[ResComparison] = []
-        self._data_coupling_caps: List[CouplingCapComparison] = []  # New: coupling cap comparisons
-        self._cpp_result = preload_cpp_result  # Keep C++ result directly
+        self._cpp_result = preload_cpp_result  # PlotData from C++
         self._fanout_cache: Optional[Dict[str, int]] = None  # net_name -> fanout count
         self._fanout_cache_ref: Optional[str] = None  # ref SPEF name for cache
         self.ref_var = tk.StringVar()
@@ -613,8 +404,7 @@ class RcCorrApp:
         if preload_spef_objs:
             for name, spef in preload_spef_objs:
                 self.spefs[name] = spef
-                # Use get_net_count() to avoid building Python dict for 1M+ nets
-                net_count = spef.get_net_count() if hasattr(spef, 'get_net_count') else len(spef.nets)
+                net_count = spef.get_net_count() if hasattr(spef, 'get_net_count') else 0
                 self.tree.insert("", "end", iid=name, values=(name, net_count, spef.path))
             self._refresh_choices()
         elif preload_paths:
@@ -625,24 +415,12 @@ class RcCorrApp:
             self._load_res_data(preload_res_data)
         if preload_ccap_data:
             self._load_ccap_data(preload_ccap_data)
-        if preload_caps:
-            self._data_caps = list(preload_caps)
-            self.cap_data_label.config(text=f"(preloaded) ({len(preload_caps)} nets)", foreground="black")
-        if preload_ress:
-            self._data_ress = list(preload_ress)
-            self.res_data_label.config(text=f"(preloaded) ({len(preload_ress)} pairs)", foreground="black")
-        if preload_ccaps:
-            self._data_coupling_caps = list(preload_ccaps)
-            self.ccap_data_label.config(text=f"(preloaded) ({len(preload_ccaps)} pairs)", foreground="black")
-            if self._cpp_result is None or (self._cpp_result.cap_count == 0 and self._cpp_result.res_count == 0):
-                self.view_mode_var.set("coupling_cap")
 
-        # 自动分析逻辑：如果 auto_run=True 且 spef 文件数>=2，则自动运行分析
+        # Auto-run logic
         if self._auto_run_requested:
             if len(self.spefs) >= 2:
                 self.root.after(0, self._auto_run)
-            # 也可根据需求支持 data file 自动分析
-            elif self._data_caps or self._data_ress or self._data_coupling_caps:
+            elif self._cpp_result is not None:
                 self.root.after(0, self._run_from_data)
             self._auto_run_requested = False
 
@@ -1267,17 +1045,8 @@ class RcCorrApp:
             else:
                 self._cpp_result = new_ccap
 
-            net1_names = list(getattr(self._cpp_result, "ccap_net1_names", []))
-            net2_names = list(getattr(self._cpp_result, "ccap_net2_names", []))
-            c1_vals = list(getattr(self._cpp_result, "ccap_c1", []))
-            c2_vals = list(getattr(self._cpp_result, "ccap_c2", []))
-            n = min(len(net1_names), len(net2_names), len(c1_vals), len(c2_vals))
-            self._data_coupling_caps = [
-                CouplingCapComparison(net1_names[i], net2_names[i], float(c1_vals[i]), float(c2_vals[i]))
-                for i in range(n)
-            ]
-
-            self.ccap_data_label.config(text=f"{os.path.basename(path)} ({len(self._data_coupling_caps)} pairs)", foreground="black")
+            ccap_count = getattr(self._cpp_result, "ccap_count", 0)
+            self.ccap_data_label.config(text=f"{os.path.basename(path)} ({ccap_count} pairs)", foreground="black")
             if self._cpp_result is None or (self._cpp_result.cap_count == 0 and self._cpp_result.res_count == 0):
                 self.view_mode_var.set("coupling_cap")
         except Exception as exc:
@@ -1293,27 +1062,21 @@ class RcCorrApp:
         try:
             s1 = self.spefs[ref]
             s2 = self.spefs[fit]
-            # Always use C++ export_plot_data
             if hasattr(s1, '_cpp_spef') and s1._cpp_spef is not None and hasattr(s2, '_cpp_spef') and s2._cpp_spef is not None:
                 res_method_int = 1 if self.res_method_var.get() == "equivalent" else 0
                 self._cpp_result = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, 0, res_method_int)
-                self._fanout_cache = None  # Invalidate cache when analysis changes
-                try:
-                    self._data_coupling_caps = compare_coupling_caps_cpp(s1, s2)
-                    print(f"Found {len(self._data_coupling_caps)} coupling cap pairs")
-                except Exception as e:
-                    print(f"[warn] Coupling cap analysis failed: {e}")
-                    self._data_coupling_caps = []
-                
+                self._fanout_cache = None
                 self._update_plot()
             else:
                 messagebox.showerror("Error", "SPEF files not parsed with C++ backend")
         except Exception as exc:
             messagebox.showerror("Error", f"Analysis failed:\n{exc}")
+
     def _run_from_data(self) -> None:
-        has_plot_data = self._cpp_result is not None and (self._cpp_result.cap_count > 0 or self._cpp_result.res_count > 0)
-        has_coupling_data = bool(self._data_coupling_caps)
-        if not has_plot_data and not has_coupling_data:
+        has_data = self._cpp_result is not None and (
+            self._cpp_result.cap_count > 0 or self._cpp_result.res_count > 0 or self._cpp_result.ccap_count > 0
+        )
+        if not has_data:
             messagebox.showwarning("Warning", "No data loaded")
             return
         self._update_plot()
@@ -1359,31 +1122,18 @@ class RcCorrApp:
         except ImportError:
             self.ax_c.set_title("coupling cap: numpy required")
             return
-        
-        # If no data yet, try computing now
-        ref_name = self.ref_var.get()
-        fit_name = self.fit_var.get()
-        
-        if not self._data_coupling_caps and ref_name in self.spefs and fit_name in self.spefs:
-            try:
-                s1 = self.spefs[ref_name]
-                s2 = self.spefs[fit_name]
-                self._data_coupling_caps = compare_coupling_caps_cpp(s1, s2)
-            except Exception as e:
-                self.ax_c.set_title(f"coupling cap: failed - {e}")
-                return
-        
-        if not self._data_coupling_caps:
+
+        if self._cpp_result is None or self._cpp_result.ccap_count == 0:
             self.ax_c.set_title("No coupling capacitance data available\n(Run Analysis first)")
             return
-        
-        # Apply filters
-        coupling_points = self._filter_coupling_cap_points(self._data_coupling_caps, flt)
-        
+
+        # Apply filters and build points list from _cpp_result
+        coupling_points = self._filter_coupling_cap_points(flt)
+
         if not coupling_points:
             self.ax_c.set_title("No coupling cap data after filtering")
             return
-        
+
         c1_arr = np.array([p["c_ref"] for p in coupling_points])
         c2_arr = np.array([p["c_fit"] for p in coupling_points])
         
@@ -1406,7 +1156,7 @@ class RcCorrApp:
         self.ax_c.set_xlim(vmin, vmax)
         self.ax_c.set_ylim(vmin, vmax)
         
-        corr = pearson_corr(c1_arr.tolist(), c2_arr.tolist())
+        corr = self._cpp_result.ccap_correlation if self._cpp_result is not None else 0.0
         title = f"Coupling Cap: {ref_name} (X) vs {fit_name} (Y)  n={len(coupling_points)}"
         if corr:
             title += f"  (corr={corr:.4f})"
@@ -1442,11 +1192,21 @@ class RcCorrApp:
         # Update corr label
         self.corr_label.config(text=f"corr={corr:.4f}" if corr else "corr=N/A")
 
-    def _filter_coupling_cap_points(self, coupling_caps: List[CouplingCapComparison], flt) -> list:
-        """Filter coupling cap points and return list of dicts for plotting."""
-        if not coupling_caps:
+    def _filter_coupling_cap_points(self, flt) -> list:
+        """Filter coupling cap points from _cpp_result and return list of dicts for plotting."""
+        if self._cpp_result is None or self._cpp_result.ccap_count == 0:
             return []
-        
+
+        try:
+            import numpy as np
+        except ImportError:
+            return []
+
+        cc1 = np.asarray(self._cpp_result.ccap_c1)
+        cc2 = np.asarray(self._cpp_result.ccap_c2)
+        net1s = list(self._cpp_result.ccap_net1_names)
+        net2s = list(self._cpp_result.ccap_net2_names)
+
         # Build total_cap lookups for percentage filtering
         total_cap_map_ref = {}
         total_cap_map_fit = {}
@@ -1468,35 +1228,28 @@ class RcCorrApp:
                         total_cap_map_fit[net_name] = net_data.total_cap
                 except Exception:
                     pass
-        
+
         points = []
-        for cc in coupling_caps:
-            c_ref = cc.c1
-            c_fit = cc.c2
-            
-            total_ref = max(total_cap_map_ref.get(cc.net1, 0.0), total_cap_map_ref.get(cc.net2, 0.0))
-            total_fit = max(total_cap_map_fit.get(cc.net1, 0.0), total_cap_map_fit.get(cc.net2, 0.0))
+        for i in range(len(net1s)):
+            n1, n2 = net1s[i], net2s[i]
+            c_ref = float(cc1[i])
+            c_fit = float(cc2[i])
+            total_ref = max(total_cap_map_ref.get(n1, 0.0), total_cap_map_ref.get(n2, 0.0))
+            total_fit = max(total_cap_map_fit.get(n1, 0.0), total_cap_map_fit.get(n2, 0.0))
             pct_ref = (c_ref / total_ref * 100.0) if total_ref > 0 else 0.0
             pct_fit = (c_fit / total_fit * 100.0) if total_fit > 0 else 0.0
 
             if flt:
-                p = {
-                    "cc_ref": c_ref,
-                    "cc_fit": c_fit,
-                    "cc_pct_ref": pct_ref,
-                }
+                p = {"cc_ref": c_ref, "cc_fit": c_fit, "cc_pct_ref": pct_ref}
                 if not self._passes_filters(p, flt):
                     continue
-            
+
             points.append({
-                "net1": cc.net1,
-                "net2": cc.net2,
-                "c_ref": c_ref,
-                "c_fit": c_fit,
-                "pct_ref": pct_ref,
-                "pct_fit": pct_fit,
+                "net1": n1, "net2": n2,
+                "c_ref": c_ref, "c_fit": c_fit,
+                "pct_ref": pct_ref, "pct_fit": pct_fit,
             })
-        
+
         return points
 
     def _update_plot_from_cpp(self, flt=None) -> None:
@@ -1813,7 +1566,7 @@ class RcCorrApp:
             return r1[indices], r2[indices], [net_names[i] for i in indices], [sink_names[i] for i in indices]
 
         if self.view_mode_var.get() == "coupling_cap":
-            points = self._filter_coupling_cap_points(self._data_coupling_caps, flt)
+            points = self._filter_coupling_cap_points(flt)
             diffs = np.abs(np.asarray([p["c_ref"] for p in points]) - np.asarray([p["c_fit"] for p in points])) if points else np.asarray([])
             self._draw_diff_histogram_ax(ax1, diffs.tolist(), f"Coupling Cap Diff (n={len(diffs)}, filtered)")
             ax2.set_title("Coupling % (ref) Distribution")
