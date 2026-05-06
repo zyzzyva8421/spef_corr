@@ -11,7 +11,7 @@ is delegated to the C++ extension (spef_core) for maximum performance.
 Python provides:
 - CLI argument parsing and command dispatch
 - GUI (Tkinter) interface
-- Simple statistics (Pearson correlation)
+- CSV export from PlotData
 
 Usage:
     python spef_rc_correlation.py spef1.spef spef2.spef --csv-prefix output
@@ -243,11 +243,9 @@ def main() -> None:
 
     # Normal SPEF mode
     if args.spef1 and args.spef2:
+        s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
         if args.gui or args.gui_auto_run:
-            s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
-            plot_data = None
-            if args.gui_auto_run:
-                plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads, _res_method_int)
+            plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads, _res_method_int) if args.gui_auto_run else None
             launch_gui(
                 preload_paths=None,
                 auto_run=args.gui_auto_run,
@@ -259,7 +257,6 @@ def main() -> None:
             )
             return
         else:
-            s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
             plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads, _res_method_int)
             summarize_and_print(plot_data, args.spef1, args.spef2)
 
