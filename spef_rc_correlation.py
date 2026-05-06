@@ -704,9 +704,11 @@ class RcCorrApp:
         ttk.Combobox(srm, textvariable=self.r_agg_var, values=["max", "avg", "total"], state="readonly", width=8).grid(row=7, column=1, sticky="w", padx=5, pady=2)
 
         ttk.Label(srm, text="Res Method:").grid(row=8, column=0, sticky="w", padx=5, pady=2)
-        ttk.Combobox(srm, textvariable=self.res_method_var,
+        res_method_combo = ttk.Combobox(srm, textvariable=self.res_method_var,
                      values=["dijkstra", "equivalent"],
-                     state="readonly", width=12).grid(row=8, column=1, sticky="w", padx=5, pady=2)
+                     state="readonly", width=12)
+        res_method_combo.grid(row=8, column=1, sticky="w", padx=5, pady=2)
+        res_method_combo.bind("<<ComboboxSelected>>", lambda e: self._run_analysis())
 
         ttk.Button(srm, text="Run Analysis", command=self._run_analysis).grid(row=7, column=2, sticky="w", padx=5, pady=2)
         ttk.Button(srm, text="Diff Histogram", command=self._show_histogram).grid(row=7, column=4, sticky="w", padx=5, pady=2)

@@ -56,7 +56,7 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
 
             if (net1 != net2) {
                 std::string pair_key = make_pair_key(net1, net2);
-                double cap_converted = convert_capacitance(cap_val, spef.c_unit);
+                double cap_converted = spef.c_scale * convert_capacitance(cap_val, spef.c_unit);
                 cap_accumulator[pair_key] += cap_converted;
             }
         }
@@ -653,6 +653,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 std::string token, num, unit;
                 iss >> token >> num >> unit;
                 spef.r_unit = unit;
+                try { spef.r_scale = std::stod(num); } catch (...) { spef.r_scale = 1.0; }
                 continue;
             }
             if (code_part.find("*C_UNIT") == 0) {
@@ -660,6 +661,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 std::string token, num, unit;
                 iss >> token >> num >> unit;
                 spef.c_unit = unit;
+                try { spef.c_scale = std::stod(num); } catch (...) { spef.c_scale = 1.0; }
                 continue;
             }
             if (code_part.find("*T_UNIT") == 0) {
@@ -744,7 +746,10 @@ ParsedSpef parse_spef(const std::string& filepath) {
                     double cap_val = parse_float(tokens[3]);
                     
                     // Store in temporary format for later resolution
-                    std::string temp_entry = node1_raw + "|" + node2_raw + "|" + std::to_string(cap_val);
+                    // Use full double precision to avoid rounding very small values to zero
+                    char cap_buf[32];
+                    std::snprintf(cap_buf, sizeof(cap_buf), "%.17g", cap_val);
+                    std::string temp_entry = node1_raw + "|" + node2_raw + "|" + cap_buf;
                     if (current_net != nullptr) {
                         current_net->raw_coupling_caps.push_back(temp_entry);
                     }
@@ -1538,14 +1543,16 @@ std::string fmt_float(double val) {
 }
 
 static double convert_capacitance_from_pf(double value_pf, const std::string& to_unit) {
-    if (to_unit == "PF" || to_unit == "pf") {
+    if (to_unit == "PF" || to_unit == "pf" || to_unit == "pF") {
         return value_pf;
-    } else if (to_unit == "NF" || to_unit == "nf") {
+    } else if (to_unit == "NF" || to_unit == "nf" || to_unit == "nF") {
         return value_pf / 1000.0;  // 1 PF = 0.001 NF
-    } else if (to_unit == "UF" || to_unit == "uf" || to_unit == "µF") {
+    } else if (to_unit == "UF" || to_unit == "uf" || to_unit == "uF" || to_unit == "µF") {
         return value_pf / 1000000.0;  // 1 PF = 1e-6 µF
-    } else if (to_unit == "FF" || to_unit == "ff") {
+    } else if (to_unit == "FF" || to_unit == "ff" || to_unit == "fF") {
         return value_pf * 1000.0;  // 1 PF = 1000 FF
+    } else if (to_unit == "F" || to_unit == "f") {
+        return value_pf * 1.0e-12;  // 1 PF = 1e-12 F
     }
     // Default: assume already in target unit
     return value_pf;
@@ -1634,7 +1641,7 @@ void backmark_spef(
             if (net_it == spef.nets.end()) continue;
             
             double old_cap = net_it->second.total_cap;
-            double new_cap = convert_capacitance_from_pf(new_cap_pf, spef.c_unit);
+            double new_cap = convert_capacitance_from_pf(new_cap_pf, spef.c_unit) / spef.c_scale;
             new_total_caps[net_name] = new_cap;
             cap_ratio[net_name] = (old_cap != 0.0) ? (new_cap / old_cap) : 1.0;
         }
@@ -1714,7 +1721,7 @@ void backmark_spef(
             if (net1.empty() || net2.empty() || net1 == net2) continue;
 
             ccap_target_by_pair[make_pair_key(net1, net2)] =
-                convert_capacitance_from_pf(target_ccap, spef.c_unit);
+                convert_capacitance_from_pf(target_ccap, spef.c_unit) / spef.c_scale;
         }
 
         // First pass over original SPEF:
@@ -2066,14 +2073,16 @@ void backmark_spef(
 
 double convert_capacitance(double value, const std::string& from_unit) {
     // Convert to PF (picofarad) as standard
-    if (from_unit == "PF" || from_unit == "pf") {
+    if (from_unit == "PF" || from_unit == "pf" || from_unit == "pF") {
         return value;
-    } else if (from_unit == "NF" || from_unit == "nf") {
+    } else if (from_unit == "NF" || from_unit == "nf" || from_unit == "nF") {
         return value * 1000.0;  // 1 NF = 1000 PF
-    } else if (from_unit == "UF" || from_unit == "uf" || from_unit == "µF") {
+    } else if (from_unit == "UF" || from_unit == "uf" || from_unit == "uF" || from_unit == "µF") {
         return value * 1000000.0;  // 1 µF = 1000000 PF
-    } else if (from_unit == "FF" || from_unit == "ff") {
+    } else if (from_unit == "FF" || from_unit == "ff" || from_unit == "fF") {
         return value * 0.001;  // 1 FF = 0.001 PF
+    } else if (from_unit == "F" || from_unit == "f") {
+        return value * 1.0e12;  // 1 F = 1e12 PF
     }
     // Default: assume already PF
     return value;
@@ -2213,9 +2222,9 @@ PlotData export_plot_data(
             auto& net1 = spef1.nets[net_name];
             auto& net2 = spef2.nets[net_name];
             
-            // Capacitance - convert to standard unit (PF)
-            local_cap_c1.push_back(convert_capacitance(net1.total_cap, spef1.c_unit));
-            local_cap_c2.push_back(convert_capacitance(net2.total_cap, spef2.c_unit));
+            // Capacitance - convert to standard unit (PF), apply *C_UNIT coefficient
+            local_cap_c1.push_back(spef1.c_scale * convert_capacitance(net1.total_cap, spef1.c_unit));
+            local_cap_c2.push_back(spef2.c_scale * convert_capacitance(net2.total_cap, spef2.c_unit));
             local_cap_names.push_back(net_name);
             
             // Resistance - convert to standard unit (OHM)
@@ -2237,9 +2246,9 @@ PlotData export_plot_data(
             );
             
             for (const auto& sink : common_sinks) {
-                // Convert resistance to standard unit (OHM)
-                local_res_r1.push_back(convert_resistance(res1[sink], spef1.r_unit));
-                local_res_r2.push_back(convert_resistance(res2[sink], spef2.r_unit));
+                // Convert resistance to standard unit (OHM), apply *R_UNIT coefficient
+                local_res_r1.push_back(spef1.r_scale * convert_resistance(res1[sink], spef1.r_unit));
+                local_res_r2.push_back(spef2.r_scale * convert_resistance(res2[sink], spef2.r_unit));
                 local_res_net_names.push_back(net_name);
                 local_res_sink_names.push_back(sink);
                 local_res_driver_names.push_back(net1.driver);
