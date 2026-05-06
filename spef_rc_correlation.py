@@ -23,7 +23,7 @@ import argparse
 import csv
 import math
 import os
-from typing import Dict, List, Tuple, Optional, Iterable
+from typing import Dict, List, Tuple, Optional, Iterable, Any
 try:
     import spef_core
     HAS_CPP = True
@@ -66,83 +66,25 @@ def shuffle_spef_cpp(spef_path: str, output_path: str, seed: Optional[int] = Non
     spef_core.shuffle_spef(spef_path, output_path, actual_seed)
 
 
-def parse_spefs_parallel(path1: str, path2: str) -> Tuple["SpefFile", "SpefFile"]:
+def parse_spefs_parallel(path1: str, path2: str):
     """Parse two SPEF files concurrently using C++ multithreaded backend.
 
     Optimized for 1M+ nets: keeps data in C++ format, no Python conversion.
+    Returns a pair of ParsedSpef objects.
     """
     if not HAS_CPP:
         raise RuntimeError("C++ extension not available")
     print(f"Parsing {path1} and {path2} in parallel (C++ threads)...")
     try:
         cpp_spefs = spef_core.parse_spef_parallel([path1, path2], 2)
-
-        s1 = SpefFile(path1)
-        s1._cpp_spef = cpp_spefs[0]
-        s1.name_map = dict(cpp_spefs[0].name_map)
-        s1.t_unit = cpp_spefs[0].t_unit
-        s1.c_unit = cpp_spefs[0].c_unit
-        s1.r_unit = cpp_spefs[0].r_unit
-        s1.l_unit = cpp_spefs[0].l_unit
-        s1._net_count = len(cpp_spefs[0].nets)
-
-        s2 = SpefFile(path2)
-        s2._cpp_spef = cpp_spefs[1]
-        s2.name_map = dict(cpp_spefs[1].name_map)
-        s2.t_unit = cpp_spefs[1].t_unit
-        s2.c_unit = cpp_spefs[1].c_unit
-        s2.r_unit = cpp_spefs[1].r_unit
-        s2.l_unit = cpp_spefs[1].l_unit
-        s2._net_count = len(cpp_spefs[1].nets)
-
-        return s1, s2
+        return cpp_spefs[0], cpp_spefs[1]
     except Exception as exc:
         print(f"[warn] C++ parallel parse failed ({exc}), falling back to sequential")
-        s1 = SpefFile(path1)
-        s1.parse()
-        s2 = SpefFile(path2)
-        s2.parse()
+        s1 = spef_core.parse_spef(path1)
+        print(f"[{path1}] parsed {len(s1.nets)} nets (C++)")
+        s2 = spef_core.parse_spef(path2)
+        print(f"[{path2}] parsed {len(s2.nets)} nets (C++)")
         return s1, s2
-
-
-class SpefFile:
-    """Simple SPEF wrapper that uses C++ backend."""
-    def __init__(self, path: str):
-        self.path = path
-        self.name_map: Dict[str, str] = {}
-        self.t_unit = 'NS'
-        self.c_unit = 'PF'
-        self.r_unit = 'OHM'
-        self.l_unit = 'HENRY'
-        self._cpp_spef = None
-        self._net_count = 0
-
-    def parse(self) -> None:
-        """Parse SPEF file using C++ backend."""
-        if not HAS_CPP:
-            raise RuntimeError("C++ extension required for parsing")
-        print(f"[{self.path}] parsing with C++ extension...")
-        self._cpp_spef = spef_core.parse_spef(self.path)
-        self.name_map = dict(self._cpp_spef.name_map)
-        self.t_unit = self._cpp_spef.t_unit
-        self.c_unit = self._cpp_spef.c_unit
-        self.r_unit = self._cpp_spef.r_unit
-        self.l_unit = self._cpp_spef.l_unit
-        self._net_count = len(self._cpp_spef.nets)
-        print(f"[{self.path}] parsed {self._net_count} nets... (C++)")
-
-    def __len__(self) -> int:
-        if self._cpp_spef is not None:
-            return len(self._cpp_spef.nets)
-        return 0
-
-    def get_net_count(self) -> int:
-        """Get net count without building Python dict - optimized for 1M+ nets."""
-        if self._net_count > 0:
-            return self._net_count
-        if self._cpp_spef is not None:
-            return len(self._cpp_spef.nets)
-        return 0
 
 
 def _write_plot_data_csvs(prefix: str, plot_data, r_agg: str) -> None:
@@ -245,19 +187,19 @@ def main() -> None:
     if args.spef1 and args.spef2:
         s1, s2 = parse_spefs_parallel(args.spef1, args.spef2)
         if args.gui or args.gui_auto_run:
-            plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads, _res_method_int) if args.gui_auto_run else None
+            plot_data = spef_core.export_plot_data(s1, s2, args.threads, _res_method_int) if args.gui_auto_run else None
             launch_gui(
                 preload_paths=None,
                 auto_run=args.gui_auto_run,
                 preload_spef_objs=[
-                    (os.path.splitext(os.path.basename(args.spef1))[0], s1),
-                    (os.path.splitext(os.path.basename(args.spef2))[0], s2)
+                    (os.path.splitext(os.path.basename(args.spef1))[0], args.spef1, s1),
+                    (os.path.splitext(os.path.basename(args.spef2))[0], args.spef2, s2)
                 ],
                 preload_cpp_result=plot_data,
             )
             return
         else:
-            plot_data = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, args.threads, _res_method_int)
+            plot_data = spef_core.export_plot_data(s1, s2, args.threads, _res_method_int)
             summarize_and_print(plot_data, args.spef1, args.spef2)
 
             cap_out = args.net_cap_data or "net_cap.data"
@@ -385,7 +327,8 @@ class RcCorrApp:
                  preload_spef_objs=None, preload_cpp_result=None):
         self.root = root
         self.root.title("SPEF RC Correlation")
-        self.spefs: Dict[str, SpefFile] = {}
+        self.spefs: Dict[str, Any] = {}  # name -> ParsedSpef (spef_core.ParsedSpef)
+        self.spef_paths: Dict[str, str] = {}
         self._cpp_result = preload_cpp_result  # PlotData from C++
         self._fanout_cache: Optional[Dict[str, int]] = None  # net_name -> fanout count
         self._fanout_cache_ref: Optional[str] = None  # ref SPEF name for cache
@@ -399,10 +342,11 @@ class RcCorrApp:
         self._build_ui()
 
         if preload_spef_objs:
-            for name, spef in preload_spef_objs:
+            for name, path, spef in preload_spef_objs:
                 self.spefs[name] = spef
-                net_count = spef.get_net_count() if hasattr(spef, 'get_net_count') else 0
-                self.tree.insert("", "end", iid=name, values=(name, net_count, spef.path))
+                self.spef_paths[name] = path
+                net_count = len(spef.nets)
+                self.tree.insert("", "end", iid=name, values=(name, net_count, path))
             self._refresh_choices()
         elif preload_paths:
             self._preload_spefs(preload_paths)
@@ -828,12 +772,11 @@ class RcCorrApp:
         cache: Dict[str, int] = {}
         if ref_name and ref_name in self.spefs:
             spef = self.spefs[ref_name]
-            if hasattr(spef, '_cpp_spef') and spef._cpp_spef is not None:
-                try:
-                    for net_name, net_data in spef._cpp_spef.nets.items():
-                        cache[net_name] = len(net_data.sinks)
-                except Exception as exc:
-                    print(f"[warn] Failed to build fanout cache: {exc}")
+            try:
+                for net_name, net_data in spef.nets.items():
+                    cache[net_name] = len(net_data.sinks)
+            except Exception as exc:
+                print(f"[warn] Failed to build fanout cache: {exc}")
         self._fanout_cache = cache
         self._fanout_cache_ref = ref_name
         return cache
@@ -889,8 +832,9 @@ class RcCorrApp:
         try:
             self.root.config(cursor="watch")
             self.root.update_idletasks()
-            spef = SpefFile(path)
-            spef.parse()
+            print(f"[{path}] parsing with C++ extension...")
+            spef = spef_core.parse_spef(path)
+            print(f"[{path}] parsed {len(spef.nets)} nets (C++)")
         except Exception as exc:
             messagebox.showerror("Error", f"Parse failed:\n{exc}")
             return
@@ -898,9 +842,8 @@ class RcCorrApp:
             self.root.config(cursor="")
             self.root.update_idletasks()
         self.spefs[name] = spef
-        # Use get_net_count() for efficiency with 1M+ nets
-        net_count = spef.get_net_count() if hasattr(spef, 'get_net_count') else len(spef.nets)
-        self.tree.insert("", "end", iid=name, values=(name, net_count, path))
+        self.spef_paths[name] = path
+        self.tree.insert("", "end", iid=name, values=(name, len(spef.nets), path))
         self._refresh_choices()
 
     def _remove_selected(self) -> None:
@@ -908,6 +851,8 @@ class RcCorrApp:
             name = self.tree.item(item, "values")[0]
             if name in self.spefs:
                 del self.spefs[name]
+            if name in self.spef_paths:
+                del self.spef_paths[name]
             self.tree.delete(item)
         self._refresh_choices()
 
@@ -930,15 +875,15 @@ class RcCorrApp:
         self.root.config(cursor="watch")
         self.root.update_idletasks()
         try:
-            spef = SpefFile(path)
-            spef.parse()
+            print(f"[{path}] parsing with C++ extension...")
+            spef = spef_core.parse_spef(path)
+            print(f"[{path}] parsed {len(spef.nets)} nets (C++)")
         finally:
             self.root.config(cursor="")
             self.root.update_idletasks()
         self.spefs[name] = spef
-        # Use get_net_count() for efficiency with 1M+ nets
-        net_count = spef.get_net_count() if hasattr(spef, 'get_net_count') else len(spef.nets)
-        self.tree.insert("", "end", iid=name, values=(name, net_count, path))
+        self.spef_paths[name] = path
+        self.tree.insert("", "end", iid=name, values=(name, len(spef.nets), path))
         self._refresh_choices()
     def _refresh_choices(self) -> None:
         names = list(self.spefs.keys())
@@ -1059,13 +1004,10 @@ class RcCorrApp:
         try:
             s1 = self.spefs[ref]
             s2 = self.spefs[fit]
-            if hasattr(s1, '_cpp_spef') and s1._cpp_spef is not None and hasattr(s2, '_cpp_spef') and s2._cpp_spef is not None:
-                res_method_int = 1 if self.res_method_var.get() == "equivalent" else 0
-                self._cpp_result = spef_core.export_plot_data(s1._cpp_spef, s2._cpp_spef, 0, res_method_int)
-                self._fanout_cache = None
-                self._update_plot()
-            else:
-                messagebox.showerror("Error", "SPEF files not parsed with C++ backend")
+            res_method_int = 1 if self.res_method_var.get() == "equivalent" else 0
+            self._cpp_result = spef_core.export_plot_data(s1, s2, 0, res_method_int)
+            self._fanout_cache = None
+            self._update_plot()
         except Exception as exc:
             messagebox.showerror("Error", f"Analysis failed:\n{exc}")
 
@@ -1214,20 +1156,18 @@ class RcCorrApp:
         fit_name = self.fit_var.get()
         if ref_name and ref_name in self.spefs:
             spef = self.spefs[ref_name]
-            if hasattr(spef, '_cpp_spef') and spef._cpp_spef is not None:
-                try:
-                    for net_name, net_data in spef._cpp_spef.nets.items():
-                        total_cap_map_ref[net_name] = net_data.total_cap
-                except Exception:
-                    pass
+            try:
+                for net_name, net_data in spef.nets.items():
+                    total_cap_map_ref[net_name] = net_data.total_cap
+            except Exception:
+                pass
         if fit_name and fit_name in self.spefs:
             spef = self.spefs[fit_name]
-            if hasattr(spef, '_cpp_spef') and spef._cpp_spef is not None:
-                try:
-                    for net_name, net_data in spef._cpp_spef.nets.items():
-                        total_cap_map_fit[net_name] = net_data.total_cap
-                except Exception:
-                    pass
+            try:
+                for net_name, net_data in spef.nets.items():
+                    total_cap_map_fit[net_name] = net_data.total_cap
+            except Exception:
+                pass
 
         points = []
         for i in range(len(net1s)):
