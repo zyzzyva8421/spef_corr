@@ -76,72 +76,6 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     }
 }
 
-// ============== Coupling Capacitance Comparison ==============
-std::vector<CouplingCapComparison> compare_coupling_caps(
-    const ParsedSpef& spef1,
-    const ParsedSpef& spef2
-) {
-    std::vector<CouplingCapComparison> results;
-    
-    // Build lookup maps for quick access
-    std::unordered_map<std::string, double> caps1, caps2;
-    
-    // Create normalized pair keys: sort(net1, net2)
-    auto make_pair_key = [](const std::string& a, const std::string& b) -> std::string {
-        if (a < b) return a + "|" + b;
-        return b + "|" + a;
-    };
-    
-    // Populate maps from spef1
-    for (const auto& cc : spef1.coupling_caps) {
-        std::string key = make_pair_key(cc.net1, cc.net2);
-        // If same pair appears multiple times, accumulate
-        caps1[key] += cc.cap_value;
-    }
-    
-    // Populate maps from spef2
-    for (const auto& cc : spef2.coupling_caps) {
-        std::string key = make_pair_key(cc.net1, cc.net2);
-        caps2[key] += cc.cap_value;
-    }
-    
-    // Only keep pairs present in both SPEFs (intersection); print unmatched pairs.
-    std::vector<std::string> only_in_spef1, only_in_spef2;
-
-    for (const auto& [key, c1] : caps1) {
-        size_t pos = key.find('|');
-        if (pos == std::string::npos) continue;
-        std::string net1 = key.substr(0, pos);
-        std::string net2 = key.substr(pos + 1);
-        auto it = caps2.find(key);
-        if (it != caps2.end()) {
-            results.push_back({net1, net2, c1, it->second});
-        } else {
-            only_in_spef1.push_back(net1 + " " + net2);
-        }
-    }
-
-    for (const auto& [key, _] : caps2) {
-        if (caps1.find(key) == caps1.end()) {
-            size_t pos = key.find('|');
-            if (pos != std::string::npos)
-                only_in_spef2.push_back(key.substr(0, pos) + " " + key.substr(pos + 1));
-        }
-    }
-
-    if (!only_in_spef1.empty() || !only_in_spef2.empty()) {
-        std::sort(only_in_spef1.begin(), only_in_spef1.end());
-        std::sort(only_in_spef2.begin(), only_in_spef2.end());
-        std::cout << "[ccap] Unmatched net pairs (only in spef1, count=" << only_in_spef1.size() << "):\n";
-        for (const auto& s : only_in_spef1) std::cout << "  " << s << "\n";
-        std::cout << "[ccap] Unmatched net pairs (only in spef2, count=" << only_in_spef2.size() << "):\n";
-        for (const auto& s : only_in_spef2) std::cout << "  " << s << "\n";
-        std::cout << "[ccap] Matched pairs: " << results.size() << "\n";
-    }
-
-    return results;
-}
-
 // ============== Dijkstra Implementation ==============
 std::unordered_map<std::string, double> dijkstra_shortest_paths(
     const std::unordered_map<std::string, std::vector<Edge>>& graph,
@@ -419,253 +353,41 @@ std::unordered_map<std::string, double> compute_driver_sink_res_by_method(
 }
 
 
-void build_pin_to_node_map(NetData& net) {
-    if (net.pin_map_built) return;
-    
-    net.pin_to_node_cache.clear();
-    
-    // Helper: find best matching node for a pin
-    auto find_best_match = [&](const std::string& pin) -> std::string {
-        if (pin.empty()) return pin;
-        
-        // Try exact match first
-        if (net.res_graph.find(pin) != net.res_graph.end()) {
-            return pin;
-        }
-        
-        // Try prefix match: split by ':' and match the base
-        size_t colon_pos = pin.find(':');
-        std::string base = (colon_pos != std::string::npos) ? 
-            pin.substr(0, colon_pos) : pin;
-        
-        for (const auto& [node, _] : net.res_graph) {
-            size_t node_colon = node.find(':');
-            std::string node_base = (node_colon != std::string::npos) ?
-                node.substr(0, node_colon) : node;
-            if (node_base == base) {
-                return node;
-            }
-        }
-        return pin;  // Return original if no match
-    };
-    
-    // Pre-compute for driver
-    net.pin_to_node_cache[net.driver] = find_best_match(net.driver);
-    
-    // Pre-compute for all sinks
-    for (const auto& sink : net.sinks) {
-        net.pin_to_node_cache[sink] = find_best_match(sink);
-    }
-    
-    net.pin_map_built = true;
-}
-
-// ============== RECOMMENDATION 1: Batch Resistance Computation ==============
-std::vector<ResistanceResult> compute_batch_driver_sink_resistances(
-    const std::vector<std::string>& net_names,
-    ParsedSpef& spef,
-    int num_threads
-) {
-    if (num_threads <= 0) {
-        num_threads = std::thread::hardware_concurrency();
-        if (num_threads <= 0) num_threads = 4;
-    }
-    
-    std::vector<ResistanceResult> results;
-    std::mutex results_mutex;
-    size_t net_count = net_names.size();
-    
-    // Worker function for each thread
-    auto worker = [&](int thread_id) {
-        std::vector<ResistanceResult> local_results;
-        local_results.reserve(100);  // Pre-allocate
-        
-        // Simple work distribution: each thread processes nets % num_threads == thread_id
-        for (size_t i = thread_id; i < net_count; i += num_threads) {
-            const auto& net_name = net_names[i];
-            auto it = spef.nets.find(net_name);
-            if (it == spef.nets.end()) continue;
-            
-            auto& net = it->second;
-            
-            // Build pin map if not already done
-            if (!net.pin_map_built) {
-                build_pin_to_node_map(net);
-            }
-            
-            // Compute driver-sink resistances for this net
-            auto dists = dijkstra_shortest_paths(net.res_graph, 
-                net.pin_to_node_cache[net.driver]);
-            
-            for (const auto& sink : net.sinks) {
-                std::string sink_node = net.pin_to_node_cache[sink];
-                auto sink_it = dists.find(sink_node);
-                if (sink_it != dists.end()) {
-                    local_results.push_back(ResistanceResult{
-                        net_name,
-                        sink,
-                        sink_it->second
-                    });
-                }
-            }
-        }
-        
-        // Merge local results into global results (thread-safe)
-        {
-            std::lock_guard<std::mutex> lock(results_mutex);
-            results.insert(results.end(), local_results.begin(), local_results.end());
-        }
-    };
-    
-    // Create and join threads
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-    for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(worker, i);
-    }
-    
-    for (auto& t : threads) {
-        t.join();
-    }
-    
-    return results;
-}
-
 // ============== RECOMMENDATION 2: Vectorized Correlation Computation ==============
-CorrelationResult compute_pearson_correlation(
+static double compute_pearson_correlation(
     const std::vector<double>& xs,
     const std::vector<double>& ys
 ) {
-    CorrelationResult result{0.0, 0.0, 0.0, 0.0, 0.0, false};
-    
     size_t n = xs.size();
-    if (n != ys.size() || n < 2) {
-        return result;
-    }
-    
-    // Single pass: compute mean, sum of squares, and covariance
+    if (n != ys.size() || n < 2) return 0.0;
+
     double sum_x = 0.0, sum_y = 0.0;
     double sum_xy = 0.0, sum_x2 = 0.0, sum_y2 = 0.0;
-    
-    // Use pointers for faster access
+
     const double* x_ptr = xs.data();
     const double* y_ptr = ys.data();
-    
+
     for (size_t i = 0; i < n; ++i) {
         double x = x_ptr[i];
         double y = y_ptr[i];
-        sum_x += x;
-        sum_y += y;
+        sum_x  += x;
+        sum_y  += y;
         sum_xy += x * y;
         sum_x2 += x * x;
         sum_y2 += y * y;
     }
-    
+
     double mean_x = sum_x / n;
     double mean_y = sum_y / n;
-    
-    double cov_xy = (sum_xy - n * mean_x * mean_y);
-    double var_x = (sum_x2 - n * mean_x * mean_x);
-    double var_y = (sum_y2 - n * mean_y * mean_y);
-    
-    result.mean_x = mean_x;
-    result.mean_y = mean_y;
-    result.std_dev_x = std::sqrt(std::max(0.0, var_x / n));
-    result.std_dev_y = std::sqrt(std::max(0.0, var_y / n));
-    
-    // Check for sufficient variance
-    if (result.std_dev_x < 1e-15 || result.std_dev_y < 1e-15) {
-        return result;  // Not enough variance
-    }
-    
-    result.pearson = cov_xy / (std::sqrt(std::max(0.0, var_x)) * std::sqrt(std::max(0.0, var_y)));
-    result.valid = true;
-    
-    return result;
-}
+    double cov_xy = sum_xy - n * mean_x * mean_y;
+    double var_x  = sum_x2 - n * mean_x * mean_x;
+    double var_y  = sum_y2 - n * mean_y * mean_y;
 
-// ============== RECOMMENDATION 4: Streaming Comparison Mode ==============
-void compare_spef_streaming(
-    ParsedSpef& spef1,
-    ParsedSpef& spef2,
-    CapCallback on_cap,
-    ResCallback on_res,
-    int num_threads
-) {
-    if (num_threads <= 0) {
-        num_threads = std::thread::hardware_concurrency();
-        if (num_threads <= 0) num_threads = 4;
-    }
-    
-    // Find common nets
-    std::vector<std::string> common_nets;
-    for (const auto& [name, _] : spef1.nets) {
-        if (spef2.nets.find(name) != spef2.nets.end()) {
-            common_nets.push_back(name);
-        }
-    }
-    
-    std::sort(common_nets.begin(), common_nets.end());
-    
-    // Process in parallel
-    std::mutex callback_mutex;
-    
-    auto worker = [&](int thread_id) {
-        for (size_t i = thread_id; i < common_nets.size(); i += num_threads) {
-            const auto& net_name = common_nets[i];
-            auto& net1 = spef1.nets[net_name];
-            auto& net2 = spef2.nets[net_name];
-            
-            // Capacitance comparison
-            {
-                std::lock_guard<std::mutex> lock(callback_mutex);
-                on_cap(CapComparisonData{net_name, net1.total_cap, net2.total_cap});
-            }
-            
-            // Resistance comparison
-            auto res1 = compute_driver_sink_resistances(net1);
-            auto res2 = compute_driver_sink_resistances(net2);
-            
-            // Find common sinks by extracting keys
-            std::vector<std::string> sinks1_vec, sinks2_vec;
-            for (const auto& [sink, _] : res1) {
-                sinks1_vec.push_back(sink);
-            }
-            for (const auto& [sink, _] : res2) {
-                sinks2_vec.push_back(sink);
-            }
-            
-            std::sort(sinks1_vec.begin(), sinks1_vec.end());
-            std::sort(sinks2_vec.begin(), sinks2_vec.end());
-            
-            std::vector<std::string> common_sinks;
-            std::set_intersection(
-                sinks1_vec.begin(), sinks1_vec.end(),
-                sinks2_vec.begin(), sinks2_vec.end(),
-                std::back_inserter(common_sinks)
-            );
-            
-            for (const auto& sink : common_sinks) {
-                {
-                    std::lock_guard<std::mutex> lock(callback_mutex);
-                    on_res(ResComparisonData{
-                        net_name, net1.driver, sink, res1[sink], res2[sink]
-                    });
-                }
-            }
-        }
-    };
-    
-    // Create and join threads
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-    for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(worker, i);
-    }
-    
-    for (auto& t : threads) {
-        t.join();
-    }
+    double std_x = std::sqrt(std::max(0.0, var_x / n));
+    double std_y = std::sqrt(std::max(0.0, var_y / n));
+    if (std_x < 1e-15 || std_y < 1e-15) return 0.0;
+
+    return cov_xy / (std::sqrt(std::max(0.0, var_x)) * std::sqrt(std::max(0.0, var_y)));
 }
 
 // ============== SPEF Parser ==============
@@ -1488,8 +1210,7 @@ PlotData create_plot_data_from_files(const std::string& cap_path, const std::str
         
         // Compute correlation
         if (!c1_vec.empty()) {
-            auto corr = compute_pearson_correlation(c1_vec, c2_vec);
-            result.cap_correlation = corr.valid ? corr.pearson : 0.0;
+            result.cap_correlation = compute_pearson_correlation(c1_vec, c2_vec);
         }
     }
     
@@ -1520,8 +1241,7 @@ PlotData create_plot_data_from_files(const std::string& cap_path, const std::str
         
         // Compute correlation
         if (!r1_vec.empty()) {
-            auto corr = compute_pearson_correlation(r1_vec, r2_vec);
-            result.res_correlation = corr.valid ? corr.pearson : 0.0;
+            result.res_correlation = compute_pearson_correlation(r1_vec, r2_vec);
         }
     }
 
@@ -1548,8 +1268,7 @@ PlotData create_plot_data_from_files(const std::string& cap_path, const std::str
         result.ccap_c2 = py::array_t<double>(c2_vec.size(), c2_vec.data());
 
         if (!c1_vec.empty()) {
-            auto corr = compute_pearson_correlation(c1_vec, c2_vec);
-            result.ccap_correlation = corr.valid ? corr.pearson : 0.0;
+            result.ccap_correlation = compute_pearson_correlation(c1_vec, c2_vec);
         }
     }
     
@@ -2375,181 +2094,6 @@ double convert_resistance(double value, const std::string& from_unit) {
 
 // ============== CORRELATION IMPLEMENTATIONS ==============
 
-ComparisonResult compare_spef_full(
-    ParsedSpef& spef1,
-    ParsedSpef& spef2,
-    int num_threads,
-    int res_method
-) {
-    std::cout << "[compare] Starting comparison with " << num_threads << " threads..." << std::endl;
-    ComparisonResult result;
-    
-    if (num_threads <= 0) {
-        num_threads = std::thread::hardware_concurrency();
-        if (num_threads <= 0) num_threads = 4;
-    }
-    
-    // Find common nets
-    std::vector<std::string> common_nets;
-    for (const auto& [name, _] : spef1.nets) {
-        if (spef2.nets.find(name) != spef2.nets.end()) {
-            common_nets.push_back(name);
-        }
-    }
-    std::sort(common_nets.begin(), common_nets.end());
-    result.common_nets = common_nets;
-    
-    // Parallel processing
-    std::mutex result_mutex;
-    std::vector<CapComparisonData> cap_rows_local;
-    std::vector<ResComparisonData> res_rows_local;
-    
-    cap_rows_local.reserve(common_nets.size());
-    res_rows_local.reserve(common_nets.size() * 4);  // Estimate
-    
-    auto worker = [&](int thread_id) {
-        std::vector<CapComparisonData> local_caps;
-        std::vector<ResComparisonData> local_ress;
-        
-        for (size_t i = thread_id; i < common_nets.size(); i += num_threads) {
-            const std::string& net_name = common_nets[i];
-            auto& net1 = spef1.nets[net_name];
-            auto& net2 = spef2.nets[net_name];
-            
-            // Capacitance comparison - convert to standard unit (PF)
-            {
-                double c1 = convert_capacitance(net1.total_cap, spef1.c_unit);
-                double c2 = convert_capacitance(net2.total_cap, spef2.c_unit);
-                local_caps.push_back({net_name, c1, c2});
-            }
-            
-            // Resistance comparison - convert to standard unit (OHM)
-            auto res1 = compute_driver_sink_res_by_method(net1, res_method);
-            auto res2 = compute_driver_sink_res_by_method(net2, res_method);
-            
-            // Find common sinks
-            std::vector<std::string> sinks1_vec, sinks2_vec;
-            for (const auto& [sink, _] : res1) sinks1_vec.push_back(sink);
-            for (const auto& [sink, _] : res2) sinks2_vec.push_back(sink);
-            std::sort(sinks1_vec.begin(), sinks1_vec.end());
-            std::sort(sinks2_vec.begin(), sinks2_vec.end());
-            
-            std::vector<std::string> common_sinks;
-            std::set_intersection(
-                sinks1_vec.begin(), sinks1_vec.end(),
-                sinks2_vec.begin(), sinks2_vec.end(),
-                std::back_inserter(common_sinks)
-            );
-            
-            for (const auto& sink : common_sinks) {
-                // Convert resistance to standard unit (OHM)
-                double r1 = convert_resistance(res1[sink], spef1.r_unit);
-                double r2 = convert_resistance(res2[sink], spef2.r_unit);
-                local_ress.push_back({
-                    net_name,
-                    net1.driver,
-                    sink,
-                    r1,
-                    r2
-                });
-            }
-        }
-        
-        std::lock_guard<std::mutex> lock(result_mutex);
-        cap_rows_local.insert(cap_rows_local.end(), local_caps.begin(), local_caps.end());
-        res_rows_local.insert(res_rows_local.end(), local_ress.begin(), local_ress.end());
-    };
-    
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-    for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(worker, i);
-    }
-    for (auto& t : threads) {
-        t.join();
-    }
-    
-    result.cap_rows = std::move(cap_rows_local);
-    result.res_rows = std::move(res_rows_local);
-    result.cap_count = result.cap_rows.size();
-    result.res_count = result.res_rows.size();
-    
-    // Compute correlations
-    if (result.cap_count > 0) {
-        std::vector<double> xs, ys;
-        xs.reserve(result.cap_count);
-        ys.reserve(result.cap_count);
-        for (const auto& row : result.cap_rows) {
-            xs.push_back(row.c1);
-            ys.push_back(row.c2);
-        }
-        auto corr = compute_pearson_correlation(xs, ys);
-        result.cap_correlation = corr.valid ? corr.pearson : 0.0;
-    }
-    
-    if (result.res_count > 0) {
-        std::vector<double> xs, ys;
-        xs.reserve(result.res_count);
-        ys.reserve(result.res_count);
-        for (const auto& row : result.res_rows) {
-            xs.push_back(row.r1);
-            ys.push_back(row.r2);
-        }
-        auto corr = compute_pearson_correlation(xs, ys);
-        result.res_correlation = corr.valid ? corr.pearson : 0.0;
-    }
-    
-    // Find top 10 cap deviations
-    std::vector<std::pair<double, size_t>> cap_dev_idx;
-    for (size_t i = 0; i < result.cap_rows.size(); ++i) {
-        double dev = std::abs(result.cap_rows[i].c1 - result.cap_rows[i].c2);
-        cap_dev_idx.push_back({dev, i});
-    }
-    std::nth_element(cap_dev_idx.begin(), cap_dev_idx.begin() + std::min((size_t)10, cap_dev_idx.size()),
-                     cap_dev_idx.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    
-    for (size_t i = 0; i < std::min((size_t)10, cap_dev_idx.size()); ++i) {
-        result.top_10_cap.push_back(result.cap_rows[cap_dev_idx[i].second]);
-    }
-    
-    // Find top 10 res deviations
-    std::vector<std::pair<double, size_t>> res_dev_idx;
-    for (size_t i = 0; i < result.res_rows.size(); ++i) {
-        double dev = std::abs(result.res_rows[i].r1 - result.res_rows[i].r2);
-        res_dev_idx.push_back({dev, i});
-    }
-    std::nth_element(res_dev_idx.begin(), res_dev_idx.begin() + std::min((size_t)10, res_dev_idx.size()),
-                     res_dev_idx.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    
-    for (size_t i = 0; i < std::min((size_t)10, res_dev_idx.size()); ++i) {
-        result.top_10_res.push_back(result.res_rows[res_dev_idx[i].second]);
-    }
-    
-    return result;
-}
-
-std::string summarize_comparison(const ComparisonResult& result) {
-    std::ostringstream oss;
-    oss << "=== SPEF RC Correlation Summary ===\n";
-    oss << "Common nets: " << result.common_nets.size() << "\n";
-    oss << "Cap rows: " << result.cap_count << ", Res rows: " << result.res_count << "\n";
-    oss << "Cap correlation (Pearson): " << result.cap_correlation << "\n";
-    oss << "Res correlation (Pearson): " << result.res_correlation << "\n";
-    oss << "\nTop 10 Cap Deviations:\n";
-    for (size_t i = 0; i < result.top_10_cap.size(); ++i) {
-        const auto& row = result.top_10_cap[i];
-        oss << "  " << row.net_name << ": " << row.c1 << " vs " << row.c2 
-            << " (delta=" << (row.c2 - row.c1) << ")\n";
-    }
-    oss << "\nTop 10 Res Deviations:\n";
-    for (size_t i = 0; i < result.top_10_res.size(); ++i) {
-        const auto& row = result.top_10_res[i];
-        oss << "  " << row.net_name << " / " << row.sink << ": " << row.r1 << " vs " << row.r2
-            << " (delta=" << (row.r2 - row.r1) << ")\n";
-    }
-    return oss.str();
-}
-
 // Parse multiple SPEF files in parallel using C++ threads
 std::vector<ParsedSpef> parse_spef_parallel(
     const std::vector<std::string>& filepaths,
@@ -2751,113 +2295,45 @@ PlotData export_plot_data(
     result.res_driver_names = std::move(res_driver_names);
     
     // Compute correlations
-    auto corr_c = compute_pearson_correlation(cap_c1_vec, cap_c2_vec);
-    result.cap_correlation = corr_c.valid ? corr_c.pearson : 0.0;
-    
+    result.cap_correlation = compute_pearson_correlation(cap_c1_vec, cap_c2_vec);
     if (result.res_count > 0) {
-        auto corr_r = compute_pearson_correlation(res_r1_vec, res_r2_vec);
-        result.res_correlation = corr_r.valid ? corr_r.pearson : 0.0;
+        result.res_correlation = compute_pearson_correlation(res_r1_vec, res_r2_vec);
     }
-    
+
+    // Coupling capacitance comparison (intersection of pairs present in both SPEFs)
+    {
+        auto make_pair_key = [](const std::string& a, const std::string& b) -> std::string {
+            return (a < b) ? (a + "|" + b) : (b + "|" + a);
+        };
+
+        std::unordered_map<std::string, double> caps1, caps2;
+        for (const auto& cc : spef1.coupling_caps) {
+            caps1[make_pair_key(cc.net1, cc.net2)] += cc.cap_value;
+        }
+        for (const auto& cc : spef2.coupling_caps) {
+            caps2[make_pair_key(cc.net1, cc.net2)] += cc.cap_value;
+        }
+
+        std::vector<double> cc1_vec, cc2_vec;
+        for (const auto& [key, c1] : caps1) {
+            auto it = caps2.find(key);
+            if (it == caps2.end()) continue;
+            size_t pos = key.find('|');
+            if (pos == std::string::npos) continue;
+            result.ccap_net1_names.push_back(key.substr(0, pos));
+            result.ccap_net2_names.push_back(key.substr(pos + 1));
+            cc1_vec.push_back(c1);
+            cc2_vec.push_back(it->second);
+        }
+
+        result.ccap_count = cc1_vec.size();
+        result.ccap_c1 = py::array_t<double>(cc1_vec.size(), cc1_vec.data());
+        result.ccap_c2 = py::array_t<double>(cc2_vec.size(), cc2_vec.data());
+        if (!cc1_vec.empty()) {
+            result.ccap_correlation = compute_pearson_correlation(cc1_vec, cc2_vec);
+        }
+    }
+
     return result;
 }
 
-// Chunked comparison for large datasets
-ComparisonChunk compare_spef_chunk(
-    ParsedSpef& spef1,
-    ParsedSpef& spef2,
-    size_t start_idx,
-    size_t chunk_size,
-    int num_threads
-) {
-    ComparisonChunk chunk;
-    
-    if (num_threads <= 0) {
-        num_threads = std::thread::hardware_concurrency();
-        if (num_threads <= 0) num_threads = 4;
-    }
-    
-    // Find common nets
-    std::vector<std::string> common_nets;
-    for (const auto& [name, _] : spef1.nets) {
-        if (spef2.nets.find(name) != spef2.nets.end()) {
-            common_nets.push_back(name);
-        }
-    }
-    std::sort(common_nets.begin(), common_nets.end());
-    
-    size_t total_nets = common_nets.size();
-    size_t end_idx = std::min(start_idx + chunk_size, total_nets);
-    chunk.is_last = (end_idx >= total_nets);
-    
-    // Process only the chunk
-    std::vector<CapComparisonData> local_caps;
-    std::vector<ResComparisonData> local_ress;
-    local_caps.reserve(chunk_size);
-    local_ress.reserve(chunk_size * 4);
-    
-    for (size_t i = start_idx; i < end_idx; ++i) {
-        const std::string& net_name = common_nets[i];
-        auto& net1 = spef1.nets[net_name];
-        auto& net2 = spef2.nets[net_name];
-        
-        local_caps.push_back({net_name, net1.total_cap, net2.total_cap});
-        
-        auto res1 = compute_driver_sink_resistances(net1);
-        auto res2 = compute_driver_sink_resistances(net2);
-        
-        std::vector<std::string> sinks1_vec, sinks2_vec;
-        for (const auto& [sink, _] : res1) sinks1_vec.push_back(sink);
-        for (const auto& [sink, _] : res2) sinks2_vec.push_back(sink);
-        std::sort(sinks1_vec.begin(), sinks1_vec.end());
-        std::sort(sinks2_vec.begin(), sinks2_vec.end());
-        
-        std::vector<std::string> common_sinks;
-        std::set_intersection(
-            sinks1_vec.begin(), sinks1_vec.end(),
-            sinks2_vec.begin(), sinks2_vec.end(),
-            std::back_inserter(common_sinks)
-        );
-        
-        for (const auto& sink : common_sinks) {
-            local_ress.push_back({net_name, net1.driver, sink, res1[sink], res2[sink]});
-        }
-    }
-    
-    // Convert to numpy arrays
-    size_t n_cap = local_caps.size();
-    size_t n_res = local_ress.size();
-    
-    chunk.cap_c1 = py::array_t<double>(n_cap);
-    chunk.cap_c2 = py::array_t<double>(n_cap);
-    auto c1_buf = chunk.cap_c1.request();
-    auto c2_buf = chunk.cap_c2.request();
-    double* c1_ptr = static_cast<double*>(c1_buf.ptr);
-    double* c2_ptr = static_cast<double*>(c2_buf.ptr);
-    
-    chunk.res_r1 = py::array_t<double>(n_res);
-    chunk.res_r2 = py::array_t<double>(n_res);
-    auto r1_buf = chunk.res_r1.request();
-    auto r2_buf = chunk.res_r2.request();
-    double* r1_ptr = static_cast<double*>(r1_buf.ptr);
-    double* r2_ptr = static_cast<double*>(r2_buf.ptr);
-    
-    chunk.cap_net_names.reserve(n_cap);
-    chunk.res_net_names.reserve(n_res);
-    chunk.res_sink_names.reserve(n_res);
-    
-    for (size_t i = 0; i < n_cap; ++i) {
-        c1_ptr[i] = local_caps[i].c1;
-        c2_ptr[i] = local_caps[i].c2;
-        chunk.cap_net_names.push_back(local_caps[i].net_name);
-    }
-    
-    for (size_t i = 0; i < n_res; ++i) {
-        r1_ptr[i] = local_ress[i].r1;
-        r2_ptr[i] = local_ress[i].r2;
-        chunk.res_net_names.push_back(local_ress[i].net_name);
-        chunk.res_sink_names.push_back(local_ress[i].sink);
-    }
-    
-    return chunk;
-}
