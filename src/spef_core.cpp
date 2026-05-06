@@ -653,7 +653,10 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 std::string token, num, unit;
                 iss >> token >> num >> unit;
                 spef.r_unit = unit;
-                try { spef.r_scale = std::stod(num); } catch (...) { spef.r_scale = 1.0; }
+                try { spef.r_scale = std::stod(num); } catch (...) {
+                    std::cerr << "[warn] " << filepath << ": failed to parse *R_UNIT coefficient '" << num << "', defaulting to 1.0\n";
+                    spef.r_scale = 1.0;
+                }
                 continue;
             }
             if (code_part.find("*C_UNIT") == 0) {
@@ -661,7 +664,10 @@ ParsedSpef parse_spef(const std::string& filepath) {
                 std::string token, num, unit;
                 iss >> token >> num >> unit;
                 spef.c_unit = unit;
-                try { spef.c_scale = std::stod(num); } catch (...) { spef.c_scale = 1.0; }
+                try { spef.c_scale = std::stod(num); } catch (...) {
+                    std::cerr << "[warn] " << filepath << ": failed to parse *C_UNIT coefficient '" << num << "', defaulting to 1.0\n";
+                    spef.c_scale = 1.0;
+                }
                 continue;
             }
             if (code_part.find("*T_UNIT") == 0) {
@@ -745,8 +751,9 @@ ParsedSpef parse_spef(const std::string& filepath) {
                     std::string node2_raw = resolve_name_token(tokens[2]);
                     double cap_val = parse_float(tokens[3]);
                     
-                    // Store in temporary format for later resolution
-                    // Use full double precision to avoid rounding very small values to zero
+                    // Store in temporary format for later resolution.
+                    // Use %.17g for full double precision: up to 24 chars for any finite double,
+                    // so 32 bytes is always sufficient.
                     char cap_buf[32];
                     std::snprintf(cap_buf, sizeof(cap_buf), "%.17g", cap_val);
                     std::string temp_entry = node1_raw + "|" + node2_raw + "|" + cap_buf;
