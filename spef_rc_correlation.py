@@ -1131,6 +1131,9 @@ class RcCorrApp:
             self.ax_c.set_title("No coupling cap data after filtering")
             return
 
+        ref_name = self.ref_var.get() if hasattr(self, "ref_var") and self.ref_var.get() else "tool1"
+        fit_name = self.fit_var.get() if hasattr(self, "fit_var") and self.fit_var.get() else "tool2"
+
         c1_arr = np.array([p["c_ref"] for p in coupling_points])
         c2_arr = np.array([p["c_fit"] for p in coupling_points])
         
