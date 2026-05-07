@@ -38,28 +38,22 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     // that the symmetric entry in the other net's CAP section is ignored.
     // This ensures each pair is counted exactly once.
     std::unordered_map<std::string, double> cap_accumulator;
+    cap_accumulator.reserve(spef.nets.size() / 4 + 64);
 
     for (const auto& [net_name, net_data] : spef.nets) {
+        if (net_data.raw_coupling_caps.empty()) continue;
         std::unordered_map<std::string, double> local_caps;
-        for (const auto& raw_entry : net_data.raw_coupling_caps) {
-            size_t pos1 = raw_entry.find('|');
-            size_t pos2 = raw_entry.rfind('|');
-            if (pos1 == std::string::npos || pos2 == std::string::npos || pos1 == pos2) {
-                continue;  // Malformed entry
-            }
-
-            std::string node1_raw = raw_entry.substr(0, pos1);
-            std::string node2_raw = raw_entry.substr(pos1 + 1, pos2 - pos1 - 1);
-            double cap_val = std::stod(raw_entry.substr(pos2 + 1));
-
-            std::string net1 = resolve_node_to_net(node1_raw);
-            std::string net2 = resolve_node_to_net(node2_raw);
+        local_caps.reserve(net_data.raw_coupling_caps.size());
+        for (const auto& entry : net_data.raw_coupling_caps) {
+            // Use pre-parsed struct fields directly – no string splitting or stod call needed.
+            std::string net1 = resolve_node_to_net(entry.node1);
+            std::string net2 = resolve_node_to_net(entry.node2);
             if (net1.empty()) net1 = net_name;
             if (net1.empty() || net2.empty()) continue;
 
             if (net1 != net2) {
                 std::string pair_key = make_pair_key(net1, net2);
-                double cap_converted = spef.c_scale * convert_capacitance(cap_val, spef.c_unit);
+                double cap_converted = spef.c_scale * convert_capacitance(entry.cap_val, spef.c_unit);
                 local_caps[pair_key] += cap_converted;
             }
         }
@@ -72,6 +66,7 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     }
 
     // Second pass: store the accumulated totals
+    spef.coupling_caps.reserve(cap_accumulator.size());
     for (const auto& [pair_key, cap_total] : cap_accumulator) {
         size_t sep = pair_key.find('|');
         std::string net1 = pair_key.substr(0, sep);
@@ -82,6 +77,7 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     // Clear temporary storage
     for (auto& [net_name, net_data] : spef.nets) {
         net_data.raw_coupling_caps.clear();
+        net_data.raw_coupling_caps.shrink_to_fit();
     }
 }
 
@@ -414,410 +410,454 @@ static inline std::string strip_quotes(const std::string& s) {
     return s;
 }
 
+// ============== Fast low-level helpers ==============
+
+// Read entire file into heap buffer with two null sentinel bytes.
+// Single I/O call eliminates per-line syscall overhead.
+static std::vector<char> read_file_buffer(const std::string& filepath) {
+    FILE* f = fopen(filepath.c_str(), "rb");
+    if (!f) throw std::runtime_error("Cannot open file: " + filepath);
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<char> file_buf((size_t)std::max(0L, sz) + 2, '\0');
+    if (sz > 0) {
+        size_t n = fread(file_buf.data(), 1, (size_t)sz, f);
+        (void)n;
+    }
+    fclose(f);
+    return file_buf;
+}
+
+// Split up to max_n whitespace-delimited tokens from [begin, end).
+// Writes string_views into out[]; returns actual token count.
+// Zero-allocation — views point directly into the caller's buffer.
+static inline int fast_split_sv(const char* begin, const char* end,
+                                  std::string_view out[], int max_tokens) {
+    int n = 0;
+    const char* p = begin;
+    while (p < end && n < max_tokens) {
+        while (p < end && (*p == ' ' || *p == '\t')) ++p;
+        if (p >= end) break;
+        const char* s = p;
+        while (p < end && *p != ' ' && *p != '\t') ++p;
+        out[n++] = std::string_view(s, (size_t)(p - s));
+    }
+    return n;
+}
+
+// Fast float parse from string_view: uses strtod (no locale, no exceptions).
+static inline double parse_float_sv(std::string_view sv) {
+    if (sv.empty()) return 0.0;
+    // Stack buffer covers almost all SPEF numeric tokens.
+    char buf[64];
+    const char* src = sv.data();
+    size_t len = sv.size();
+    if (len < sizeof(buf)) {
+        memcpy(buf, src, len);
+        buf[len] = '\0';
+        char* endp;
+        double val = strtod(buf, &endp);
+        if (endp != buf) return val;
+        // Fallback: strip non-numeric characters for malformed inputs (e.g., units
+        // accidentally attached to a value).  This two-pass strategy keeps the fast
+        // path allocation-free while still handling edge-cases gracefully.
+        char clean[64];
+        int clean_idx = 0;
+        for (size_t i = 0; i < len && clean_idx < 62; ++i) {
+            char c = src[i];
+            if (c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' ||
+                (c >= '0' && c <= '9'))
+                clean[clean_idx++] = c;
+        }
+        if (clean_idx == 0) return 0.0;
+        clean[clean_idx] = '\0';
+        return strtod(clean, nullptr);
+    }
+    // Long token: heap-allocate (rare path).
+    std::string tmp(src, len);
+    char* endp;
+    double val = strtod(tmp.c_str(), &endp);
+    return (endp != tmp.c_str()) ? val : 0.0;
+}
+
+// Legacy std::string wrapper — keeps existing call-sites unchanged.
 static inline double parse_float(const std::string& s) {
-    try {
-        return std::stod(s);
-    } catch (...) {
-        // Remove non-numeric characters
-        std::string cleaned;
-        for (char c : s) {
-            if (c == '-' || c == '.' || c == 'e' || c == 'E' || std::isdigit(c)) {
-                cleaned += c;
+    return parse_float_sv(std::string_view(s.data(), s.size()));
+}
+
+// Resolve a name-map token to its actual net/node name.
+// Fast path: tokens without '*' or '\\' are returned as-is (no extra allocation).
+static std::string resolve_token_sv(std::string_view tok,
+                                     const std::unordered_map<std::string, std::string>& name_map) {
+    if (tok.empty()) return {};
+    bool has_star      = (tok[0] == '*');
+    bool has_backslash = (tok.find('\\') != std::string_view::npos);
+    if (!has_star && !has_backslash) return std::string(tok);
+
+    std::string out(tok);
+    if (has_star) {
+        size_t colon = out.find(':');
+        if (colon != std::string::npos) {
+            std::string base   = out.substr(0, colon);
+            std::string suffix = out.substr(colon);
+            auto it = name_map.find(base);
+            if (it != name_map.end()) out = it->second + suffix;
+        } else {
+            auto it = name_map.find(out);
+            if (it != name_map.end()) out = it->second;
+        }
+    }
+    size_t pos;
+    while ((pos = out.find("\\[")) != std::string::npos) out.replace(pos, 2, "[");
+    while ((pos = out.find("\\]")) != std::string::npos) out.replace(pos, 2, "]");
+    return out;
+}
+
+// ============== Header parser (NAME_MAP, units) ==============
+
+// Parse the SPEF header from buffer [buf, buf+buf_size).
+// Fills name_map, units, and scale factors into spef.
+// Returns the buffer offset where the first *D_NET line begins
+// (or buf_size if no *D_NET is found).
+static size_t parse_spef_header_from_buf(const char* buf, size_t buf_size,
+                                          ParsedSpef& spef) {
+    bool in_name_map = false;
+    const char* p   = buf;
+    const char* end = buf + buf_size;
+
+    while (p < end) {
+        const char* nl           = (const char*)memchr(p, '\n', (size_t)(end - p));
+        const char* line_end_raw = nl ? nl : end;
+        const char* next_line    = nl ? nl + 1 : end;
+
+        // Strip inline comment (//)
+        const char* line_end = line_end_raw;
+        for (const char* c = p; c + 1 < line_end_raw; ++c) {
+            if (c[0] == '/' && c[1] == '/') { line_end = c; break; }
+        }
+        while (line_end > p &&
+               (*(line_end - 1) == ' ' || *(line_end - 1) == '\t' ||
+                *(line_end - 1) == '\r'))
+            --line_end;
+        const char* lstart = p;
+        while (lstart < line_end && (*lstart == ' ' || *lstart == '\t')) ++lstart;
+
+        p = next_line;
+
+        size_t line_len = (size_t)(line_end - lstart);
+        if (line_len == 0) continue;
+
+        // Early exit: first *D_NET marks end of header
+        if (line_len >= 6 &&
+            lstart[0] == '*' && lstart[1] == 'D' && lstart[2] == '_' &&
+            lstart[3] == 'N' && lstart[4] == 'E' && lstart[5] == 'T' &&
+            (line_len == 6 || lstart[6] == ' ' || lstart[6] == '\t')) {
+            return (size_t)(lstart - buf);
+        }
+
+        std::string_view toks[4];
+        int ntok = fast_split_sv(lstart, line_end, toks, 4);
+        if (ntok == 0) continue;
+
+        const std::string_view& first = toks[0];
+
+        // NAME_MAP entry: *<digits>  name
+        if (in_name_map) {
+            if (ntok >= 2 && !first.empty() && first[0] == '*' &&
+                first.size() >= 2 && first[1] >= '0' && first[1] <= '9') {
+                std::string key(first);
+                std::string value(toks[1]);
+                if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+                    value = value.substr(1, value.size() - 2);
+                size_t pos;
+                while ((pos = value.find("\\[")) != std::string::npos) value.replace(pos, 2, "[");
+                while ((pos = value.find("\\]")) != std::string::npos) value.replace(pos, 2, "]");
+                spef.name_map.emplace(std::move(key), std::move(value));
+                continue;
+            } else {
+                in_name_map = false;
             }
         }
-        if (cleaned.empty()) return 0.0;
-        try {
-            return std::stod(cleaned);
-        } catch (...) {
-            return 0.0;
+
+        if (!first.empty() && first[0] == '*') {
+            if (first == "*NAME_MAP") {
+                in_name_map = true;
+            } else if (first == "*PORTS") {
+                in_name_map = false;
+            } else if (first == "*R_UNIT" && ntok >= 3) {
+                spef.r_unit  = std::string(toks[2]);
+                spef.r_scale = parse_float_sv(toks[1]);
+                if (spef.r_scale == 0.0) spef.r_scale = 1.0;
+            } else if (first == "*C_UNIT" && ntok >= 3) {
+                spef.c_unit  = std::string(toks[2]);
+                spef.c_scale = parse_float_sv(toks[1]);
+                if (spef.c_scale == 0.0) spef.c_scale = 1.0;
+            } else if (first == "*T_UNIT" && ntok >= 3) {
+                spef.t_unit = std::string(toks[2]);
+            } else if (first == "*L_UNIT" && ntok >= 3) {
+                spef.l_unit = std::string(toks[2]);
+            }
+        }
+    }
+    return buf_size;
+}
+
+// ============== Single net-block parser ==============
+
+// Parse one *D_NET ... *END block from buffer slice [block_begin, block_end).
+// Uses the shared (read-only) name_map for token resolution.
+// Output net data is written into out_spef.nets.
+static void parse_net_block(const char* block_begin, const char* block_end,
+                             const std::unordered_map<std::string, std::string>& name_map,
+                             ParsedSpef& out_spef) {
+    enum Section { SEC_NONE, SEC_CONN, SEC_CAP, SEC_RES };
+    Section section = SEC_NONE;
+    NetData* current_net = nullptr;
+
+    const char* p = block_begin;
+    while (p < block_end) {
+        const char* nl           = (const char*)memchr(p, '\n', (size_t)(block_end - p));
+        const char* line_end_raw = nl ? nl : block_end;
+        const char* next_line    = nl ? nl + 1 : block_end;
+
+        // Strip inline comment (//)
+        const char* line_end = line_end_raw;
+        for (const char* c = p; c + 1 < line_end_raw; ++c) {
+            if (c[0] == '/' && c[1] == '/') { line_end = c; break; }
+        }
+        while (line_end > p &&
+               (*(line_end - 1) == ' ' || *(line_end - 1) == '\t' ||
+                *(line_end - 1) == '\r'))
+            --line_end;
+        const char* lstart = p;
+        while (lstart < line_end && (*lstart == ' ' || *lstart == '\t')) ++lstart;
+
+        p = next_line;
+
+        size_t line_len = (size_t)(line_end - lstart);
+        if (line_len == 0) continue;
+
+        // 6 slots: enough for any SPEF data line
+        std::string_view toks[6];
+        int ntok = fast_split_sv(lstart, line_end, toks, 6);
+        if (ntok == 0) continue;
+
+        const std::string_view& first = toks[0];
+
+        if (first[0] == '*') {
+            if (first == "*D_NET") {
+                if (ntok >= 3) {
+                    std::string net_id(toks[1]);
+                    std::string resolved = net_id;
+                    if (!net_id.empty() && net_id[0] == '*') {
+                        auto it = name_map.find(net_id);
+                        if (it != name_map.end()) resolved = it->second;
+                    }
+                    current_net = &out_spef.nets[resolved];
+                    current_net->name       = resolved;
+                    current_net->total_cap  = parse_float_sv(toks[2]);
+                    section = SEC_NONE;
+                }
+            } else if (first == "*END") {
+                current_net = nullptr;
+                section     = SEC_NONE;
+            } else if (first == "*CONN") {
+                section = SEC_CONN;
+            } else if (first == "*CAP") {
+                section = SEC_CAP;
+            } else if (first == "*RES") {
+                section = SEC_RES;
+            } else if (current_net && ntok >= 3 &&
+                       (first == "*I" || first == "*P")) {
+                // CONN pin entry — may appear in SEC_CONN or SEC_NONE
+                if (section == SEC_NONE) section = SEC_CONN;
+                std::string pin = resolve_token_sv(toks[1], name_map);
+                char dir_char = '\0';
+                for (int i = 2; i < ntok; ++i) {
+                    if (!toks[i].empty() &&
+                        (toks[i][0] == 'O' || toks[i][0] == 'B' || toks[i][0] == 'I')) {
+                        dir_char = toks[i][0];
+                        break;
+                    }
+                }
+                if (dir_char) {
+                    bool is_port   = (first[1] == 'P');
+                    bool is_driver = (!is_port && dir_char == 'O') ||
+                                      (is_port  && dir_char == 'I') ||
+                                      dir_char == 'B';
+                    bool is_sink   = (!is_port && dir_char == 'I') ||
+                                      (is_port  && dir_char == 'O');
+                    if (is_driver && current_net->driver.empty())
+                        current_net->driver = pin;
+                    else if (is_sink)
+                        current_net->sinks.push_back(pin);
+                }
+            }
+        } else {
+            // Numeric-index data lines (CAP / RES entries)
+            if (current_net == nullptr) continue;
+
+            if (section == SEC_RES && ntok >= 4) {
+                std::string node1 = resolve_token_sv(toks[1], name_map);
+                std::string node2 = resolve_token_sv(toks[2], name_map);
+                double rval = parse_float_sv(toks[3]);
+                current_net->res_graph[node1].push_back({node2, rval});
+                current_net->res_graph[node2].push_back({node1, rval});
+            } else if (section == SEC_CAP && ntok >= 4) {
+                // Coupling cap: idx node1 node2 cap_value
+                // (3-token self-cap is skipped — total_cap already set from *D_NET header)
+                std::string node1 = resolve_token_sv(toks[1], name_map);
+                std::string node2 = resolve_token_sv(toks[2], name_map);
+                double cap_val = parse_float_sv(toks[3]);
+                current_net->raw_coupling_caps.push_back(
+                    {std::move(node1), std::move(node2), cap_val});
+            }
         }
     }
 }
 
+// ============== Intra-file parallel net parsing ==============
+
+// Find byte offsets of all *D_NET lines in buf[start_offset .. buf_size).
+// Uses memchr for fast newline scanning.
+static std::vector<size_t> find_dnet_offsets(const char* buf, size_t buf_size,
+                                               size_t start_offset) {
+    std::vector<size_t> offsets;
+    offsets.reserve(std::min<size_t>(1024 * 1024,
+                                     // Heuristic: ~200 bytes per net + 64-entry buffer for small files.
+                                     (buf_size > start_offset ?
+                                      buf_size - start_offset : 0) / 200 + 64));
+
+    const char* p   = buf + start_offset;
+    const char* end = buf + buf_size;
+
+    // Check if the content at start_offset is itself a *D_NET line
+    {
+        const char* ls = p;
+        while (ls < end && (*ls == ' ' || *ls == '\t')) ++ls;
+        if ((size_t)(end - ls) >= 6 &&
+            ls[0] == '*' && ls[1] == 'D' && ls[2] == '_' &&
+            ls[3] == 'N' && ls[4] == 'E' && ls[5] == 'T' &&
+            ((size_t)(end - ls) == 6 || ls[6] == ' ' || ls[6] == '\t' ||
+             ls[6] == '\r' || ls[6] == '\n'))
+            offsets.push_back((size_t)(ls - buf));
+    }
+
+    while (p < end) {
+        const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
+        if (!nl) break;
+        const char* next = nl + 1;
+        // Skip leading whitespace on next line
+        while (next < end && (*next == ' ' || *next == '\t')) ++next;
+        if ((size_t)(end - next) >= 6 &&
+            next[0] == '*' && next[1] == 'D' && next[2] == '_' &&
+            next[3] == 'N' && next[4] == 'E' && next[5] == 'T' &&
+            ((size_t)(end - next) == 6 || next[6] == ' ' || next[6] == '\t' ||
+             next[6] == '\r' || next[6] == '\n'))
+            offsets.push_back((size_t)(next - buf));
+        p = (next > nl + 1) ? next : nl + 1;
+    }
+    return offsets;
+}
+
+// Parse net blocks in parallel.
+// Thread i processes dnet_offsets[i], [i+N], [i+2N], ...
+// name_map is read-only; each thread writes into its own local ParsedSpef.
+static void parse_nets_parallel(const char* buf, size_t buf_size,
+                                  const std::vector<size_t>& dnet_offsets,
+                                  const std::unordered_map<std::string, std::string>& name_map,
+                                  ParsedSpef& out_spef, int n_threads) {
+    size_t n_nets    = dnet_offsets.size();
+    // Ceiling division: each thread gets at most ceil(n_nets / n_threads) blocks.
+    size_t per_thread = (n_nets + (size_t)n_threads - 1) / (size_t)n_threads;
+
+    std::vector<ParsedSpef> local_spefs((size_t)n_threads);
+    for (auto& ls : local_spefs) {
+        ls.c_scale = out_spef.c_scale;
+        ls.r_scale = out_spef.r_scale;
+        ls.c_unit  = out_spef.c_unit;
+        ls.r_unit  = out_spef.r_unit;
+        ls.nets.reserve(per_thread);
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve((size_t)n_threads);
+    for (int t = 0; t < n_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            ParsedSpef& local = local_spefs[(size_t)t];
+            for (size_t i = (size_t)t; i < n_nets; i += (size_t)n_threads) {
+                size_t block_start = dnet_offsets[i];
+                size_t block_end   = (i + 1 < n_nets) ? dnet_offsets[i + 1] : buf_size;
+                parse_net_block(buf + block_start, buf + block_end, name_map, local);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    // Merge local nets into out_spef (single-threaded after all threads join)
+    out_spef.nets.reserve(n_nets + n_nets / 4);
+    for (auto& ls : local_spefs) {
+        for (auto& [name, net] : ls.nets)
+            out_spef.nets.emplace(name, std::move(net));
+    }
+}
+
+// ============== Public parse_spef entry point ==============
+
 ParsedSpef parse_spef(const std::string& filepath) {
-    ParsedSpef spef;
-    
-    std::ifstream file(filepath);
-    if (!file.is_open()) {
-        throw std::runtime_error("Cannot open file: " + filepath);
-    }
-    
-    enum Section { SEC_NONE, SEC_CONN, SEC_CAP, SEC_RES };
-    Section section = SEC_NONE;
-    
-    bool in_name_map = false;
-    std::string current_net_name;
-    NetData* current_net = nullptr;
-    size_t net_count = 0;
     auto t_start = std::chrono::steady_clock::now();
-    
-    std::string line;
-    size_t line_num = 0;
 
-    // Resolve tokens like *123 or *123:A using NAME_MAP.
-    auto resolve_name_token = [&](const std::string& token) -> std::string {
-        if (token.empty()) return token;
+    // Read entire file into memory — one syscall, eliminates per-line I/O overhead.
+    std::vector<char> file_buf = read_file_buffer(filepath);
+    // Two null sentinel bytes are appended; usable content is file_buf.size()-2 bytes.
+    size_t buf_size = file_buf.size() >= 2 ? file_buf.size() - 2 : 0;
+    const char* data = file_buf.data();
 
-        std::string out = token;
-        if (out[0] == '*') {
-            size_t colon = out.find(':');
-            if (colon != std::string::npos) {
-                std::string base = out.substr(0, colon);
-                std::string suffix = out.substr(colon);  // keep ':' + suffix
-                auto it = spef.name_map.find(base);
-                if (it != spef.name_map.end()) {
-                    out = it->second + suffix;
-                }
-            } else {
-                auto it = spef.name_map.find(out);
-                if (it != spef.name_map.end()) {
-                    out = it->second;
-                }
-            }
-        }
+    ParsedSpef spef;
 
-        size_t pos;
-        while ((pos = out.find("\\[")) != std::string::npos) out.replace(pos, 2, "[");
-        while ((pos = out.find("\\]")) != std::string::npos) out.replace(pos, 2, "]");
-        return out;
-    };
+    // 1. Parse header section (NAME_MAP + units) — always single-threaded.
+    spef.name_map.reserve(128 * 1024);
+    size_t first_dnet_offset = parse_spef_header_from_buf(data, buf_size, spef);
 
-    auto process_conn_entry = [&](const std::vector<std::string> &tokens) {
+    // 2. Locate all *D_NET block positions with fast memchr-based scan.
+    std::vector<size_t> dnet_offsets = find_dnet_offsets(data, buf_size, first_dnet_offset);
+    size_t net_count = dnet_offsets.size();
 
-        if (current_net == nullptr || tokens.size() < 3)
+    if (net_count == 0) {
+        auto t_end = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(t_end - t_start).count();
+        std::cout << "[" << filepath << "] finished parsing 0 nets in "
+                  << elapsed << "s (C++/buffered)" << std::endl;
+        return spef;
+    }
 
-            return;
+    spef.nets.reserve(net_count + net_count / 4);
 
+    // 3. Choose parallelism — thread spawn overhead pays off at ~10 K nets.
+    int hw = (int)std::thread::hardware_concurrency();
+    if (hw <= 0) hw = 2;
+    int n_threads = (net_count >= 10000) ? std::min(hw, 8) : 1;
 
-
-        const std::string &header = tokens[0];
-
-        if (header != "*I" && header != "*P")
-
-            return;
-
-
-
-        std::string pin = resolve_name_token(tokens[1]);
-
-        std::string dir;
-
-        for (size_t i = 2; i < tokens.size(); i++)
-
-        {
-
-            if (!tokens[i].empty() && (tokens[i][0] == 'O' || tokens[i][0] == 'B' || tokens[i][0] == 'I'))
-
-            {
-
-                dir = tokens[i];
-
-                break;
-
-            }
-
-        }
-
-
-
-        if (dir.empty())
-
-            return;
-
-
-
-        bool is_driver = false;
-
-        bool is_sink = false;
-
-
-
-        if (dir[0] == 'B')
-
-        {
-
-            is_driver = true;
-
-        }
-
-        else if (header == "*I")
-
-        {
-
-            is_driver = (dir[0] == 'O');
-
-            is_sink = (dir[0] == 'I');
-
-        }
-
-        else if (header == "*P")
-
-        {
-
-            is_driver = (dir[0] == 'I');
-
-            is_sink = (dir[0] == 'O');
-
-        }
-
-
-
-        if (is_driver)
-
-        {
-
-            if (current_net->driver.empty())
-
-            {
-
-                current_net->driver = pin;
-
-            }
-
-        }
-
-        else if (is_sink)
-
-        {
-
-            current_net->sinks.push_back(pin);
-
-        }
-
-    };
-
-    while (std::getline(file, line)) {
-        line_num++;
-        // Skip empty lines
-        if (line.empty()) continue;
-        
-        // Find comment
-        size_t comment_pos = line.find("//");
-        std::string code_part = (comment_pos != std::string::npos) ? 
-            line.substr(0, comment_pos) : line;
-        std::string comment_part = (comment_pos != std::string::npos) ?
-            trim(line.substr(comment_pos + 2)) : "";
-        
-        code_part = trim(code_part);
-        if (code_part.empty()) continue;
-        
-        // Quick check for section headers
-        if (code_part[0] == '*') {
-            if (code_part.find("*NAME_MAP") == 0) {
-                in_name_map = true;
-                section = SEC_NONE;
-                continue;
-            }
-            if (code_part.find("*PORTS") == 0) {
-                in_name_map = false;
-                continue;
-            }
-            if (code_part.find("*D_NET") == 0) {
-                // New net
-                std::istringstream iss(code_part);
-                std::string token, net_id, net_name, total_cap_str;
-                iss >> token >> net_id >> total_cap_str;
-                
-                // Resolve net name
-                std::string resolved_name = net_id;
-                if (net_id[0] == '*') {
-                    auto it = spef.name_map.find(net_id);
-                    if (it != spef.name_map.end()) {
-                        resolved_name = it->second;
-                    }
-                }
-                
-                current_net_name = resolved_name;
-                current_net = &spef.nets[current_net_name];
-                current_net->name = resolved_name;
-                current_net->total_cap = parse_float(total_cap_str);
-                section = SEC_NONE;
-                net_count++;
-                if (net_count % 5000 == 0) {
-                    auto t_now = std::chrono::steady_clock::now();
-                    double elapsed = std::chrono::duration<double>(t_now - t_start).count();
-                    std::cout << "[" << filepath << "] parsed " << net_count << " nets... (C++/single, " << elapsed << "s)" << std::endl;
-                }
-                continue;
-            }
-            if (code_part.find("*END") == 0) {
-                current_net = nullptr;
-                section = SEC_NONE;
-                continue;
-            }
-            if (code_part.find("*CONN") == 0) {
-                section = SEC_CONN;
-                continue;
-            }
-            if (code_part.find("*CAP") == 0) {
-                section = SEC_CAP;
-                continue;
-            }
-            if (code_part.find("*RES") == 0) {
-                section = SEC_RES;
-                continue;
-            }
-            if (code_part.find("*R_UNIT") == 0) {
-                std::istringstream iss(code_part);
-                std::string token, num, unit;
-                iss >> token >> num >> unit;
-                spef.r_unit = unit;
-                try { spef.r_scale = std::stod(num); } catch (...) {
-                    std::cerr << "[warn] " << filepath << ": failed to parse *R_UNIT coefficient '" << num << "', defaulting to 1.0\n";
-                    spef.r_scale = 1.0;
-                }
-                continue;
-            }
-            if (code_part.find("*C_UNIT") == 0) {
-                std::istringstream iss(code_part);
-                std::string token, num, unit;
-                iss >> token >> num >> unit;
-                spef.c_unit = unit;
-                try { spef.c_scale = std::stod(num); } catch (...) {
-                    std::cerr << "[warn] " << filepath << ": failed to parse *C_UNIT coefficient '" << num << "', defaulting to 1.0\n";
-                    spef.c_scale = 1.0;
-                }
-                continue;
-            }
-            if (code_part.find("*T_UNIT") == 0) {
-                std::istringstream iss(code_part);
-                std::string token, num, unit;
-                iss >> token >> num >> unit;
-                spef.t_unit = unit;
-                continue;
-            }
-            if (code_part.find("*L_UNIT") == 0) {
-                std::istringstream iss(code_part);
-                std::string token, num, unit;
-                iss >> token >> num >> unit;
-                spef.l_unit = unit;
-                continue;
-            }
-        }
-        
-        // Handle NAME_MAP entries
-        if (in_name_map) {
-            if (!code_part.empty() && code_part[0] == '*') {
-                std::istringstream iss(code_part);
-                std::string key, value;
-                iss >> key >> value;
-                // Only process keys that look like *NUMBER (e.g., *1, *2)
-                if (!key.empty() && key.size() >= 2 && key[1] >= '0' && key[1] <= '9' && !value.empty()) {
-                    value = strip_quotes(value);
-                    // Unescape \[ and \]
-                    size_t pos;
-                    while ((pos = value.find("\\[")) != std::string::npos) {
-                        value.replace(pos, 2, "[");
-                    }
-                    while ((pos = value.find("\\]")) != std::string::npos) {
-                        value.replace(pos, 2, "]");
-                    }
-                    spef.name_map[key] = value;
-                }
-            } else {
-                in_name_map = false;
-            }
-            continue;
-        }
-        
-        // Process based on current section
-        if (current_net == nullptr) continue;
-        
-        std::istringstream iss(code_part);
-        std::vector<std::string> tokens;
-        std::string tok;
-        while (iss >> tok) {
-            tokens.push_back(tok);
-        }
-        
-        if (tokens.empty()) continue;
-        
-        if (section == SEC_RES && tokens.size() >= 4) {
-            // RES entry: *idx node1 node2 R_value
-            try {
-                int idx = std::stoi(tokens[0]);
-                std::string node1 = resolve_name_token(tokens[1]);
-                std::string node2 = resolve_name_token(tokens[2]);
-                double rval = parse_float(tokens[3]);
-                
-                current_net->res_graph[node1].push_back({node2, rval});
-                current_net->res_graph[node2].push_back({node1, rval});
-            } catch (...) {
-                // Not a RES entry, might be section header
-                if (tokens[0] == "*CAP") section = SEC_CAP;
-                else if (tokens[0] == "*CONN") section = SEC_CONN;
-                else if (tokens[0] == "*END") { current_net = nullptr; section = SEC_NONE; }
-            }
-        }
-        else if (section == SEC_CAP && tokens.size() >= 3) {
-            try {
-                int idx = std::stoi(tokens[0]);
-                // Check if this is a coupling capacitance (2 nodes) or self-capacitance (1 node)
-                if (tokens.size() >= 4) {
-                    // Potential coupling cap: idx node1 node2 cap_value
-                    // Don't resolve yet - store raw for post-processing
-                    std::string node1_raw = resolve_name_token(tokens[1]);
-                    std::string node2_raw = resolve_name_token(tokens[2]);
-                    double cap_val = parse_float(tokens[3]);
-                    
-                    // Store in temporary format for later resolution.
-                    // Use %.17g for full double precision: up to 24 chars for any finite double,
-                    // so 32 bytes is always sufficient.
-                    char cap_buf[32];
-                    std::snprintf(cap_buf, sizeof(cap_buf), "%.17g", cap_val);
-                    std::string temp_entry = node1_raw + "|" + node2_raw + "|" + cap_buf;
-                    if (current_net != nullptr) {
-                        current_net->raw_coupling_caps.push_back(temp_entry);
-                    }
-                }
-                // Else it's a self-cap, we don't store these (total_cap handles those)
-            } catch (...) {
-                if (tokens[0] == "*CONN") section = SEC_CONN;
-                else if (tokens[0] == "*RES") section = SEC_RES;
-                else if (tokens[0] == "*END") { current_net = nullptr; section = SEC_NONE; }
-            }
-        }
-        else if (section == SEC_CONN && tokens.size() >= 3) {
-            process_conn_entry(tokens);
-        }
-        else if (section == SEC_NONE) {
-            // Look for section header
-            if (!tokens.empty() && tokens[0][0] == '*') {
-                std::string header = tokens[0];
-                if (header == "*CONN") {
-                    section = SEC_CONN;
-                    continue;
-                }
-                else if (header == "*CAP") {
-                    section = SEC_CAP;
-                    continue;
-                }
-                else if (header == "*RES") {
-                    section = SEC_RES;
-                    continue;
-                }
-                else if (header == "*END") {
-                    current_net = nullptr;
-                    continue;
-                }
-                // Also handle *I (input) and *P (port) as CONN entries when no explicit *CONN header
-                else if ((header == "*I" || header == "*P") && tokens.size() >= 3) {
-                    section = SEC_CONN;
-                    process_conn_entry(tokens);
-                    continue;
-                }
-            }
+    if (n_threads > 1) {
+        parse_nets_parallel(data, buf_size, dnet_offsets, spef.name_map, spef, n_threads);
+    } else {
+        for (size_t i = 0; i < net_count; ++i) {
+            size_t block_start = dnet_offsets[i];
+            size_t block_end   = (i + 1 < net_count) ? dnet_offsets[i + 1] : buf_size;
+            parse_net_block(data + block_start, data + block_end, spef.name_map, spef);
         }
     }
-    
-    file.close();
+
+    // 4. Post-process coupling caps (single-threaded; net ordering is irrelevant).
+    resolve_coupling_caps_to_nets(spef);
+
     auto t_end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(t_end - t_start).count();
-    std::cout << "[" << filepath << "] finished parsing " << net_count << " nets in " << elapsed << "s (C++/single)" << std::endl;
-    
-    // Post-process coupling capacitances
-    resolve_coupling_caps_to_nets(spef);
-    
+    std::cout << "[" << filepath << "] finished parsing " << spef.nets.size()
+              << " nets in " << elapsed << "s (C++/buffered, "
+              << n_threads << " thread(s))" << std::endl;
+
     return spef;
 }
 
@@ -2035,7 +2075,7 @@ void backmark_spef(
                 
                 if (tokens.size() >= 4) {
                     try {
-                        int idx = std::stoi(tokens[0]);  // index
+                        (void)std::stoi(tokens[0]);  // validate index token, not otherwise used
                         
                         std::string n1 = resolve_spef_token(tokens[1], spef.name_map);
                         std::string n2 = resolve_spef_token(tokens[2], spef.name_map);
@@ -2247,24 +2287,13 @@ PlotData export_plot_data(
             auto res1 = compute_driver_sink_res_by_method(net1, res_method);
             auto res2 = compute_driver_sink_res_by_method(net2, res_method);
             
-            // Find common sinks
-            std::vector<std::string> sinks1_vec, sinks2_vec;
-            for (const auto& [sink, _] : res1) sinks1_vec.push_back(sink);
-            for (const auto& [sink, _] : res2) sinks2_vec.push_back(sink);
-            std::sort(sinks1_vec.begin(), sinks1_vec.end());
-            std::sort(sinks2_vec.begin(), sinks2_vec.end());
-            
-            std::vector<std::string> common_sinks;
-            std::set_intersection(
-                sinks1_vec.begin(), sinks1_vec.end(),
-                sinks2_vec.begin(), sinks2_vec.end(),
-                std::back_inserter(common_sinks)
-            );
-            
-            for (const auto& sink : common_sinks) {
+            // Find common sinks: O(k) hash lookup instead of O(k log k) sort + set_intersection
+            for (const auto& [sink, r1] : res1) {
+                auto it = res2.find(sink);
+                if (it == res2.end()) continue;
                 // Convert resistance to standard unit (OHM), apply *R_UNIT coefficient
-                local_res_r1.push_back(spef1.r_scale * convert_resistance(res1[sink], spef1.r_unit));
-                local_res_r2.push_back(spef2.r_scale * convert_resistance(res2[sink], spef2.r_unit));
+                local_res_r1.push_back(spef1.r_scale * convert_resistance(r1, spef1.r_unit));
+                local_res_r2.push_back(spef2.r_scale * convert_resistance(it->second, spef2.r_unit));
                 local_res_net_names.push_back(net_name);
                 local_res_sink_names.push_back(sink);
                 local_res_driver_names.push_back(net1.driver);

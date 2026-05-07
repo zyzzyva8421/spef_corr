@@ -1,0 +1,11 @@
+n_nets=100000
+n_runs=3
+file_kb=27201
+p50_ms=430.41
+p95_ms=451.4
+min_ms=403.72
+max_ms=451.4
+throughput_nets_per_s=232334
+peak_rss_kb=413572
+dual_p50_ms=455.26
+dual_throughput=219657
