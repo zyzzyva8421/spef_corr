@@ -6,6 +6,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -21,12 +22,25 @@
 #include <mutex>
 #include <functional>
 #include <set>
+#include <cstdlib>
+#include <cstring>
+#include <atomic>
+#include <chrono>
 
 namespace py = pybind11;
 
 struct Edge {
     std::string to;
     double weight;
+};
+
+// Structured intermediate coupling-cap entry stored during parse.
+// Replaces the former "node1|node2|cap_value" string encoding, eliminating
+// the serialize-then-parse round-trip in resolve_coupling_caps_to_nets.
+struct RawCouplingEntry {
+    std::string node1;
+    std::string node2;
+    double cap_val;
 };
 
 struct NetData {
@@ -37,8 +51,8 @@ struct NetData {
     std::unordered_map<std::string, std::vector<Edge>> res_graph;
     std::unordered_map<std::string, double> driver_sink_res_cache;
     std::unordered_map<std::string, double> driver_sink_equiv_res_cache;
-    // Temporary storage for coupling capacitances (raw format: node1|node2|cap_value)
-    std::vector<std::string> raw_coupling_caps;
+    // Structured coupling-cap entries accumulated during CAP section parsing.
+    std::vector<RawCouplingEntry> raw_coupling_caps;
     bool cache_valid;
     bool equiv_res_cache_valid;
 
