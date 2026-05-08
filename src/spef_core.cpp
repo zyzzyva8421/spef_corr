@@ -31,37 +31,97 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         return (a < b) ? (a + "|" + b) : (b + "|" + a);
     };
 
+    // Collect nets that actually contain coupling entries.
+    std::vector<std::pair<const std::string*, const NetData*>> work_items;
+    work_items.reserve(spef.nets.size());
+    for (const auto& [net_name, net_data] : spef.nets) {
+        if (!net_data.raw_coupling_caps.empty())
+            work_items.push_back({&net_name, &net_data});
+    }
+
     // First pass: accumulate capacitance for each pair across all nets.
     // Each net's section is summed into a local map first (handles multiple
     // entries for the same pair within one net's CAP section).  The local
-    // result is then merged into the global accumulator with try_emplace so
-    // that the symmetric entry in the other net's CAP section is ignored.
-    // This ensures each pair is counted exactly once.
+    // result is then merged into an accumulator with try_emplace so that the
+    // symmetric entry in the other net's CAP section is ignored.
     std::unordered_map<std::string, double> cap_accumulator;
-    cap_accumulator.reserve(spef.nets.size() / 4 + 64);
+    cap_accumulator.reserve(work_items.size() / 4 + 64);
 
-    for (const auto& [net_name, net_data] : spef.nets) {
-        if (net_data.raw_coupling_caps.empty()) continue;
-        std::unordered_map<std::string, double> local_caps;
-        local_caps.reserve(net_data.raw_coupling_caps.size());
-        for (const auto& entry : net_data.raw_coupling_caps) {
-            // Use pre-parsed struct fields directly – no string splitting or stod call needed.
-            std::string net1 = resolve_node_to_net(entry.node1);
-            std::string net2 = resolve_node_to_net(entry.node2);
-            if (net1.empty()) net1 = net_name;
-            if (net1.empty() || net2.empty()) continue;
+    // Parallel overhead (thread startup + per-thread map merge) starts to pay off
+    // only for larger workloads; keep small/medium parses on the sequential path.
+    constexpr size_t kMinWorkItemsForParallel = 4096;
+    // Align with parse_spef()'s existing cap to avoid oversubscription on large hosts.
+    constexpr int kMaxResolveThreads = 8;
+    int hw = (int)std::thread::hardware_concurrency();
+    // Conservative fallback when hardware_concurrency() is unavailable.
+    if (hw <= 0) hw = 2;
+    int n_threads = (work_items.size() >= kMinWorkItemsForParallel) ? std::min(hw, kMaxResolveThreads) : 1;
+    n_threads = std::min<int>(n_threads, (int)work_items.size());
 
-            if (net1 != net2) {
-                std::string pair_key = make_pair_key(net1, net2);
-                double cap_converted = spef.c_scale * convert_capacitance(entry.cap_val, spef.c_unit);
-                local_caps[pair_key] += cap_converted;
+    if (n_threads <= 1) {
+        for (const auto& item : work_items) {
+            const std::string& net_name = *item.first;
+            const NetData& net_data = *item.second;
+            std::unordered_map<std::string, double> local_caps;
+            local_caps.reserve(net_data.raw_coupling_caps.size());
+            for (const auto& entry : net_data.raw_coupling_caps) {
+                // Use pre-parsed struct fields directly – no string splitting or stod call needed.
+                std::string net1 = resolve_node_to_net(entry.node1);
+                std::string net2 = resolve_node_to_net(entry.node2);
+                if (net1.empty()) net1 = net_name;
+                if (net1.empty() || net2.empty()) continue;
+
+                if (net1 != net2) {
+                    std::string pair_key = make_pair_key(net1, net2);
+                    double cap_converted = spef.c_scale * convert_capacitance(entry.cap_val, spef.c_unit);
+                    local_caps[pair_key] += cap_converted;
+                }
             }
+            for (const auto& [key, val] : local_caps)
+                cap_accumulator.try_emplace(key, val);
         }
-        // Merge: only insert pairs not already present in the global accumulator.
-        // Because SPEF lists each coupling cap in both nets' CAP sections, the
-        // second net's entry would be a duplicate — try_emplace skips it.
-        for (const auto& [key, val] : local_caps) {
-            cap_accumulator.try_emplace(key, val);
+    } else {
+        std::vector<std::unordered_map<std::string, double>> thread_accumulators((size_t)n_threads);
+        size_t work_items_per_thread = (work_items.size() + (size_t)n_threads - 1) / (size_t)n_threads;
+        for (auto& m : thread_accumulators) {
+            m.reserve(work_items_per_thread / 4 + 64);
+        }
+        std::vector<std::thread> threads;
+        threads.reserve((size_t)n_threads);
+
+        for (int t = 0; t < n_threads; ++t) {
+            threads.emplace_back([&thread_accumulators, &work_items, &spef, &resolve_node_to_net, &make_pair_key, t, n_threads]() {
+                auto& thread_map = thread_accumulators[(size_t)t];
+                for (size_t i = (size_t)t; i < work_items.size(); i += (size_t)n_threads) {
+                    const std::string& net_name = *work_items[i].first;
+                    const NetData& net_data = *work_items[i].second;
+                    std::unordered_map<std::string, double> local_caps;
+                    local_caps.reserve(net_data.raw_coupling_caps.size());
+
+                    for (const auto& entry : net_data.raw_coupling_caps) {
+                        std::string net1 = resolve_node_to_net(entry.node1);
+                        std::string net2 = resolve_node_to_net(entry.node2);
+                        if (net1.empty()) net1 = net_name;
+                        if (net1.empty() || net2.empty()) continue;
+
+                        if (net1 != net2) {
+                            std::string pair_key = make_pair_key(net1, net2);
+                            double cap_converted = spef.c_scale * convert_capacitance(entry.cap_val, spef.c_unit);
+                            local_caps[pair_key] += cap_converted;
+                        }
+                    }
+
+                    for (const auto& [key, val] : local_caps)
+                        thread_map.try_emplace(key, val);
+                }
+            });
+        }
+
+        for (auto& th : threads) th.join();
+
+        for (auto& thread_map : thread_accumulators) {
+            for (auto& [key, val] : thread_map)
+                cap_accumulator.try_emplace(std::move(key), val);
         }
     }
 
@@ -2390,4 +2450,3 @@ PlotData export_plot_data(
 
     return result;
 }
-
