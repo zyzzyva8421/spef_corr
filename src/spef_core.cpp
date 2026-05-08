@@ -47,9 +47,13 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     std::unordered_map<std::string, double> cap_accumulator;
     cap_accumulator.reserve(work_items.size() / 4 + 64);
 
+    // Parallel overhead (thread startup + per-thread map merge) starts to pay off
+    // only for larger workloads; keep small/medium parses on the sequential path.
     constexpr size_t kMinWorkItemsForParallel = 4096;
+    // Align with parse_spef()'s existing cap to avoid oversubscription on large hosts.
     constexpr int kMaxResolveThreads = 8;
     int hw = (int)std::thread::hardware_concurrency();
+    // Conservative fallback when hardware_concurrency() is unavailable.
     if (hw <= 0) hw = 2;
     int n_threads = (work_items.size() >= kMinWorkItemsForParallel) ? std::min(hw, kMaxResolveThreads) : 1;
     n_threads = std::min<int>(n_threads, (int)work_items.size());
