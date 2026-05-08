@@ -70,6 +70,8 @@ def parse_spefs_parallel(path1: str, path2: str):
     """Parse two SPEF files concurrently using C++ multithreaded backend.
 
     Optimized for 1M+ nets: keeps data in C++ format, no Python conversion.
+    The C++ backend splits the host thread budget across concurrent files to
+    avoid each parse instance over-subscribing the machine.
     Returns a pair of ParsedSpef objects.
     """
     if not HAS_CPP:

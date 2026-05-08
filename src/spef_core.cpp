@@ -3,7 +3,7 @@
 #include <sstream>
 
 // ============== Coupling Capacitance Resolution ==============
-void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
+void resolve_coupling_caps_to_nets(ParsedSpef& spef, int max_threads) {
     const auto& nets     = spef.nets;
     const auto& global_name_map = spef.name_map;
     // Heuristic: coupling nodes are typically a small multiple of the net count;
@@ -35,7 +35,8 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     constexpr size_t kMinCcapNetsPerThread = 3000;
     int n_par = 1;
     if (net_ptrs.size() >= kCcapParallelThreshold) {
-        int hw = (int)std::thread::hardware_concurrency();
+        int hw = max_threads;
+        if (hw <= 0) hw = (int)std::thread::hardware_concurrency();
         if (hw <= 0) hw = 2;
         int max_useful_threads = std::max(1, (int)(net_ptrs.size() / kMinCcapNetsPerThread));
         n_par = std::max(1, std::min(hw, max_useful_threads));
@@ -1024,7 +1025,7 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
 
 // ============== Public parse_spef entry point ==============
 
-ParsedSpef parse_spef(const std::string& filepath) {
+ParsedSpef parse_spef(const std::string& filepath, int num_threads) {
     auto t_start = std::chrono::steady_clock::now();
 
     // Memory-map the file (mmap on POSIX, fread fallback elsewhere).
@@ -1053,7 +1054,8 @@ ParsedSpef parse_spef(const std::string& filepath) {
     spef.nets.reserve(net_count + net_count / 4);
 
     // 3. Choose parallelism — adaptive to workload size to avoid over-threading.
-    int hw = (int)std::thread::hardware_concurrency();
+    int hw = num_threads;
+    if (hw <= 0) hw = (int)std::thread::hardware_concurrency();
     if (hw <= 0) hw = 2;
     constexpr size_t kParseParallelThreshold = 10000;
     // Empirical sweet spot: ~4K nets/thread keeps parsing work coarse enough to pay threading cost.
@@ -1075,7 +1077,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
     }
 
     // 4. Post-process coupling caps — runs in parallel internally.
-    resolve_coupling_caps_to_nets(spef);
+    resolve_coupling_caps_to_nets(spef, hw);
 
     auto t_end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(t_end - t_start).count();
@@ -2402,6 +2404,10 @@ std::vector<ParsedSpef> parse_spef_parallel(
         num_threads = static_cast<int>(n);
     }
     
+    int hw = (int)std::thread::hardware_concurrency();
+    if (hw <= 0) hw = 2;
+    int per_file_thread_budget = std::max(1, hw / num_threads);
+
     std::vector<ParsedSpef> results(n);
     std::vector<std::thread> threads;
     std::mutex print_mutex;
@@ -2411,7 +2417,7 @@ std::vector<ParsedSpef> parse_spef_parallel(
         threads.emplace_back([&, t]() {
             for (size_t i = t; i < n; i += num_threads) {
                 auto t_start = std::chrono::steady_clock::now();
-                results[i] = parse_spef(filepaths[i]);
+                results[i] = parse_spef(filepaths[i], per_file_thread_budget);
                 auto t_end = std::chrono::steady_clock::now();
                 double elapsed = std::chrono::duration<double>(t_end - t_start).count();
                 elapsed_times[i] = elapsed;

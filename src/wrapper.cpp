@@ -66,7 +66,8 @@ PYBIND11_MODULE(spef_core, m) {
         .def_readwrite("ccap_count", &PlotData::ccap_count);
 
     // Module functions
-    m.def("parse_spef", &parse_spef, "Parse SPEF file", py::arg("filepath"));
+    m.def("parse_spef", &parse_spef, "Parse SPEF file",
+          py::arg("filepath"), py::arg("num_threads") = 0);
 
     m.def("shuffle_spef", &shuffle_spef, "Shuffle SPEF net IDs",
           py::arg("input_path"),
@@ -139,4 +140,3 @@ PYBIND11_MODULE(spef_core, m) {
           py::arg("value"),
           py::arg("unit"));
 }
-

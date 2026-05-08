@@ -107,7 +107,7 @@ double compute_equivalent_resistance(
 );
 
 // Post-process coupling capacitances to map nodes to net names
-void resolve_coupling_caps_to_nets(ParsedSpef& spef);
+void resolve_coupling_caps_to_nets(ParsedSpef& spef, int max_threads = 0);
 
 // Compute all driver->sink resistances for a net (Dijkstra shortest path)
 std::unordered_map<std::string, double> compute_driver_sink_resistances(
@@ -126,7 +126,7 @@ std::unordered_map<std::string, double> compute_driver_sink_res_by_method(
 );
 
 // Parse SPEF file - C++ optimized
-ParsedSpef parse_spef(const std::string& filepath);
+ParsedSpef parse_spef(const std::string& filepath, int num_threads = 0);
 
 // Shuffle net ID mapping
 void shuffle_spef(
