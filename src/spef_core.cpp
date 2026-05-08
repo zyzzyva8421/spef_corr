@@ -6,6 +6,8 @@
 void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     const auto& nets = spef.nets;
     const auto& name_map = spef.name_map;
+    // Heuristic: coupling nodes are typically a small multiple of the net count;
+    // this keeps the cache mostly rehash-free on large designs without overcommitting.
     constexpr size_t kNodeToNetCacheReserveMultiplier = 4;
     constexpr size_t kNodeToNetCacheReserveSlack = 64;
     std::unordered_map<std::string, std::string> node_to_net_cache;
@@ -14,11 +16,12 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         kNodeToNetCacheReserveSlack);
 
     auto resolve_node_to_net = [&](const std::string& node) -> const std::string& {
+        static const std::string kEmpty;
+        if (node.empty()) return kEmpty;
         auto [cache_it, inserted] = node_to_net_cache.try_emplace(node);
         if (!inserted) return cache_it->second;
 
         std::string& resolved = cache_it->second;
-        if (node.empty()) return resolved;
         if (nets.find(node) != nets.end()) {
             resolved = node;
             return resolved;
@@ -43,13 +46,13 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         std::string key;
         key.reserve(a.size() + b.size() + 1);
         if (a < b) {
-            key.append(a.data(), a.size());
+            key += a;
             key.push_back('|');
-            key.append(b.data(), b.size());
+            key += b;
         } else {
-            key.append(b.data(), b.size());
+            key += b;
             key.push_back('|');
-            key.append(a.data(), a.size());
+            key += a;
         }
         return key;
     };
