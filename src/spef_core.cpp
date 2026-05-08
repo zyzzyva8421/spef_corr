@@ -5,7 +5,7 @@
 // ============== Coupling Capacitance Resolution ==============
 void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     const auto& nets     = spef.nets;
-    const auto& name_map = spef.name_map;
+    const auto& global_name_map = spef.name_map;
     // Heuristic: coupling nodes are typically a small multiple of the net count;
     // this keeps the cache mostly rehash-free on large designs without overcommitting.
     constexpr size_t kNodeToNetCacheReserveMultiplier = 4;
@@ -31,6 +31,7 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     // All accesses to spef.nets and spef.name_map are read-only here.
     // Only spin up threads when the work is large enough to justify the overhead.
     constexpr size_t kCcapParallelThreshold = 8000;
+    // Empirical sweet spot: ~3K nets/thread amortizes thread+merge overhead on large ccap designs.
     constexpr size_t kMinCcapNetsPerThread = 3000;
     int n_par = 1;
     if (net_ptrs.size() >= kCcapParallelThreshold) {
@@ -65,8 +66,8 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
                 resolved = std::move(base); return resolved;
             }
             if (!base.empty() && base[0] == '*') {
-                auto it = name_map.find(base);
-                if (it != name_map.end() && nets.find(it->second) != nets.end())
+                auto it = global_name_map.find(base);
+                if (it != global_name_map.end() && nets.find(it->second) != nets.end())
                     resolved = it->second;
             }
             return resolved;
@@ -1055,6 +1056,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
     int hw = (int)std::thread::hardware_concurrency();
     if (hw <= 0) hw = 2;
     constexpr size_t kParseParallelThreshold = 10000;
+    // Empirical sweet spot: ~4K nets/thread keeps parsing work coarse enough to pay threading cost.
     constexpr size_t kMinNetsPerThread = 4000;
     int n_threads = 1;
     if (net_count >= kParseParallelThreshold) {
