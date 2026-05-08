@@ -29,8 +29,8 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     // ── Parallel phase ─────────────────────────────────────────────────────
     // Each thread owns a local accumulator and a local node→net cache.
     // All accesses to spef.nets and spef.name_map are read-only here.
-    int n_par = std::max(1, (int)std::thread::hardware_concurrency());
-    n_par = std::min(n_par, (int)net_ptrs.size());
+    int n_par = std::max(1, std::min((int)std::thread::hardware_concurrency(),
+                                     (int)net_ptrs.size()));
     std::vector<std::unordered_map<std::string, double>> thread_accumulators((size_t)n_par);
     std::atomic<size_t> next_net_idx{0};
 
@@ -497,7 +497,9 @@ static FileBuffer open_file_buffer(const std::string& filepath) {
     FileBuffer fb;
 #if defined(__unix__) || defined(__APPLE__)
     fb.mmap_fd = open(filepath.c_str(), O_RDONLY);
-    if (fb.mmap_fd < 0) throw std::runtime_error("Cannot open file: " + filepath);
+    if (fb.mmap_fd < 0) {
+        throw std::runtime_error("Cannot open file: " + filepath + ": " + strerror(errno));
+    }
     struct stat st{};
     if (fstat(fb.mmap_fd, &st) == 0 && st.st_size > 0) {
         void* ptr = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE,
@@ -508,7 +510,8 @@ static FileBuffer open_file_buffer(const std::string& filepath) {
             fb.is_mmap = true;
 #  if defined(__linux__)
             // Hint sequential access so the kernel pre-faults pages aggressively.
-            madvise(const_cast<char*>(fb.data), fb.size, MADV_SEQUENTIAL);
+            // madvise is best-effort; failure is non-fatal and intentionally ignored.
+            (void)madvise(const_cast<char*>(fb.data), fb.size, MADV_SEQUENTIAL);
 #  endif
             return fb;
         }
@@ -519,12 +522,21 @@ static FileBuffer open_file_buffer(const std::string& filepath) {
 #endif
     // fread fallback (Windows or mmap failure)
     FILE* f = fopen(filepath.c_str(), "rb");
-    if (!f) throw std::runtime_error("Cannot open file: " + filepath);
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (!f) {
+        throw std::runtime_error("Cannot open file: " + filepath + ": " + strerror(errno));
+    }
+    // Use fseeko/ftello to support files >2 GB on 32-bit platforms.
+#if defined(_WIN32)
+    _fseeki64(f, 0, SEEK_END);
+    long long sz = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+#else
+    fseeko(f, 0, SEEK_END);
+    off_t sz = ftello(f);
+    fseeko(f, 0, SEEK_SET);
+#endif
     // Two extra null bytes act as sentinels for any stray look-ahead.
-    fb.heap_buf.assign((size_t)std::max(0L, sz) + 2, '\0');
+    fb.heap_buf.assign((size_t)std::max((long long)0, (long long)sz) + 2, '\0');
     if (sz > 0) { size_t n = fread(fb.heap_buf.data(), 1, (size_t)sz, f); (void)n; }
     fclose(f);
     fb.data = fb.heap_buf.data();
@@ -569,9 +581,16 @@ static inline double inline_strtod(const char* s, const char* end) noexcept {
         else if (*p == '+') { ++p; }
     }
 
-    // Integer part
+    // Integer part — stop at 18 digits to avoid uint64_t overflow
+    // (18 decimal digits fit in 63 bits; SPEF values are never that large anyway).
     uint64_t ipart = 0;
-    while (p < end && (unsigned char)(*p - '0') <= 9u) ipart = ipart * 10 + (uint64_t)(*p++ - '0');
+    int idigits = 0;
+    while (p < end && (unsigned char)(*p - '0') <= 9u && idigits < 18) {
+        ipart = ipart * 10 + (uint64_t)(*p++ - '0');
+        ++idigits;
+    }
+    // skip any excess integer digits (shouldn't occur in valid SPEF, but be safe)
+    while (p < end && (unsigned char)(*p - '0') <= 9u) ++p;
 
     // Fractional part — accumulate as integer, scale once
     uint64_t fpart = 0;
@@ -598,7 +617,12 @@ static inline double inline_strtod(const char* s, const char* end) noexcept {
             else if (*p == '+') { ++p; }
         }
         unsigned exp = 0;
-        while (p < end && (unsigned char)(*p - '0') <= 9u) exp = exp * 10 + (unsigned)(*p++ - '0');
+        // Cap exponent accumulation to avoid unsigned overflow on malformed input
+        // (valid IEEE 754 doubles have exponents in [-308, 308]).
+        while (p < end && (unsigned char)(*p - '0') <= 9u) {
+            exp = (exp < 400u) ? (exp * 10u + (unsigned)(*p - '0')) : 400u;
+            ++p;
+        }
         if (exp <= kMaxPow10) {
             if (esign > 0) val *= kPow10[exp];
             else           val /= kPow10[exp];
@@ -939,7 +963,7 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
                                   const std::unordered_map<std::string, std::string>& name_map,
                                   ParsedSpef& out_spef, int n_threads) {
     size_t n_nets = dnet_offsets.size();
-    size_t per_thread = (n_nets + (size_t)n_threads - 1) / (size_t)n_threads;
+    size_t per_thread_reserve = (n_nets + (size_t)n_threads - 1) / (size_t)n_threads;
 
     std::vector<ParsedSpef> local_spefs((size_t)n_threads);
     for (auto& ls : local_spefs) {
@@ -947,7 +971,7 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
         ls.r_scale = out_spef.r_scale;
         ls.c_unit  = out_spef.c_unit;
         ls.r_unit  = out_spef.r_unit;
-        ls.nets.reserve(per_thread);
+        ls.nets.reserve(per_thread_reserve);
     }
 
     // Atomic index — each worker grabs the next unprocessed block.
