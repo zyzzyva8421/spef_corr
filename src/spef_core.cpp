@@ -30,11 +30,15 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     // Each thread owns a local accumulator and a local node→net cache.
     // All accesses to spef.nets and spef.name_map are read-only here.
     // Only spin up threads when the work is large enough to justify the overhead.
-    constexpr size_t kCcapParallelThreshold = 1000;
-    int n_par = (net_ptrs.size() >= kCcapParallelThreshold)
-        ? std::max(1, std::min((int)std::thread::hardware_concurrency(),
-                               (int)net_ptrs.size()))
-        : 1;
+    constexpr size_t kCcapParallelThreshold = 8000;
+    constexpr size_t kMinCcapNetsPerThread = 3000;
+    int n_par = 1;
+    if (net_ptrs.size() >= kCcapParallelThreshold) {
+        int hw = (int)std::thread::hardware_concurrency();
+        if (hw <= 0) hw = 2;
+        int max_useful_threads = std::max(1, (int)(net_ptrs.size() / kMinCcapNetsPerThread));
+        n_par = std::max(1, std::min(hw, max_useful_threads));
+    }
     std::vector<std::unordered_map<std::string, double>> thread_accumulators((size_t)n_par);
     std::atomic<size_t> next_net_idx{0};
 
@@ -1047,11 +1051,16 @@ ParsedSpef parse_spef(const std::string& filepath) {
 
     spef.nets.reserve(net_count + net_count / 4);
 
-    // 3. Choose parallelism — thread spawn overhead pays off at ~10 K nets.
-    //    No upper-bound cap: use all available hardware threads.
+    // 3. Choose parallelism — adaptive to workload size to avoid over-threading.
     int hw = (int)std::thread::hardware_concurrency();
     if (hw <= 0) hw = 2;
-    int n_threads = (net_count >= 10000) ? hw : 1;
+    constexpr size_t kParseParallelThreshold = 10000;
+    constexpr size_t kMinNetsPerThread = 4000;
+    int n_threads = 1;
+    if (net_count >= kParseParallelThreshold) {
+        int max_useful_threads = std::max(1, (int)(net_count / kMinNetsPerThread));
+        n_threads = std::max(1, std::min(hw, max_useful_threads));
+    }
 
     if (n_threads > 1) {
         parse_nets_parallel(data, buf_size, dnet_offsets, spef.name_map, spef, n_threads);
