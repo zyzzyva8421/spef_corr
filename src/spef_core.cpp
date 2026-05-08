@@ -868,21 +868,24 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
 ParsedSpef parse_spef(const std::string& filepath) {
     auto t_start = std::chrono::steady_clock::now();
 
-    // Read entire file into memory — one syscall, eliminates per-line I/O overhead.
+    // 1. Read entire file into memory — one syscall, eliminates per-line I/O overhead.
     std::vector<char> file_buf = read_file_buffer(filepath);
     // Two null sentinel bytes are appended; usable content is file_buf.size()-2 bytes.
     size_t buf_size = file_buf.size() >= 2 ? file_buf.size() - 2 : 0;
     const char* data = file_buf.data();
+    auto t_io = std::chrono::steady_clock::now();
 
     ParsedSpef spef;
 
-    // 1. Parse header section (NAME_MAP + units) — always single-threaded.
+    // 2. Parse header section (NAME_MAP + units) — always single-threaded.
     spef.name_map.reserve(128 * 1024);
     size_t first_dnet_offset = parse_spef_header_from_buf(data, buf_size, spef);
+    auto t_header = std::chrono::steady_clock::now();
 
-    // 2. Locate all *D_NET block positions with fast memchr-based scan.
+    // 3. Locate all *D_NET block positions with fast memchr-based scan.
     std::vector<size_t> dnet_offsets = find_dnet_offsets(data, buf_size, first_dnet_offset);
     size_t net_count = dnet_offsets.size();
+    auto t_scan = std::chrono::steady_clock::now();
 
     if (net_count == 0) {
         auto t_end = std::chrono::steady_clock::now();
@@ -894,7 +897,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
 
     spef.nets.reserve(net_count + net_count / 4);
 
-    // 3. Choose parallelism — thread spawn overhead pays off at ~10 K nets.
+    // 4. Choose parallelism — thread spawn overhead pays off at ~10 K nets.
     int hw = (int)std::thread::hardware_concurrency();
     if (hw <= 0) hw = 2;
     int n_threads = (net_count >= 10000) ? std::min(hw, 8) : 1;
@@ -908,15 +911,28 @@ ParsedSpef parse_spef(const std::string& filepath) {
             parse_net_block(data + block_start, data + block_end, spef.name_map, spef);
         }
     }
+    auto t_netparse = std::chrono::steady_clock::now();
 
-    // 4. Post-process coupling caps (single-threaded; net ordering is irrelevant).
+    // 5. Post-process coupling caps (single-threaded; net ordering is irrelevant).
     resolve_coupling_caps_to_nets(spef);
-
     auto t_end = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration<double>(t_end - t_start).count();
-    std::cout << "[" << filepath << "] finished parsing " << spef.nets.size()
-              << " nets in " << elapsed << "s (C++/buffered, "
-              << n_threads << " thread(s))" << std::endl;
+
+    double elapsed      = std::chrono::duration<double>(t_end    - t_start  ).count();
+    double t_io_s       = std::chrono::duration<double>(t_io     - t_start  ).count();
+    double t_header_s   = std::chrono::duration<double>(t_header - t_io     ).count();
+    double t_scan_s     = std::chrono::duration<double>(t_scan   - t_header ).count();
+    double t_netparse_s = std::chrono::duration<double>(t_netparse - t_scan ).count();
+    double t_ccap_s     = std::chrono::duration<double>(t_end    - t_netparse).count();
+
+    std::cout << "[parse_spef:" << filepath << "] total=" << elapsed << "s"
+              << "  file_io=" << t_io_s << "s"
+              << "  header/namemap=" << t_header_s << "s"
+              << "  dnet_scan=" << t_scan_s << "s"
+              << "  net_blocks(" << n_threads << "t)=" << t_netparse_s << "s"
+              << "  coupling_cap_resolve=" << t_ccap_s << "s"
+              << "  nets=" << spef.nets.size()
+              << "  ccaps=" << spef.coupling_caps.size()
+              << std::endl;
 
     return spef;
 }
@@ -2278,6 +2294,8 @@ PlotData export_plot_data(
     int num_threads,
     int res_method
 ) {
+    auto t_epd_start = std::chrono::steady_clock::now();
+
     PlotData result;
     
     if (num_threads <= 0) {
@@ -2293,6 +2311,7 @@ PlotData export_plot_data(
         }
     }
     std::sort(common_nets.begin(), common_nets.end());
+    auto t_common = std::chrono::steady_clock::now();
     
     size_t n_cap = common_nets.size();
     result.cap_count = n_cap;
@@ -2383,6 +2402,7 @@ PlotData export_plot_data(
     for (auto& t : threads) {
         t.join();
     }
+    auto t_capres = std::chrono::steady_clock::now();
     
     // Convert to numpy arrays with correct size
     result.cap_c1 = py::array_t<double>(cap_c1_vec.size());
@@ -2447,6 +2467,21 @@ PlotData export_plot_data(
             result.ccap_correlation = compute_pearson_correlation(cc1_vec, cc2_vec);
         }
     }
+    auto t_epd_end = std::chrono::steady_clock::now();
+
+    double epd_total     = std::chrono::duration<double>(t_epd_end - t_epd_start).count();
+    double epd_common_s  = std::chrono::duration<double>(t_common  - t_epd_start).count();
+    double epd_capres_s  = std::chrono::duration<double>(t_capres  - t_common   ).count();
+    double epd_ccap_s    = std::chrono::duration<double>(t_epd_end - t_capres   ).count();
+
+    std::cout << "[export_plot_data] total=" << epd_total << "s"
+              << "  common_nets=" << epd_common_s << "s"
+              << "  cap+res(" << num_threads << "t)=" << epd_capres_s << "s"
+              << "  ccap_compare+corr=" << epd_ccap_s << "s"
+              << "  nets=" << n_cap
+              << "  res_pairs=" << result.res_count
+              << "  ccaps=" << result.ccap_count
+              << std::endl;
 
     return result;
 }
