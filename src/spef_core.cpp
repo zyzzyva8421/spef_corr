@@ -70,8 +70,9 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         for (const auto& entry : net_data.raw_coupling_caps) {
             // Use pre-parsed struct fields directly – no string splitting or stod call needed.
             const std::string& resolved_net1 = resolve_node_to_net(entry.node1);
-            const std::string& net2 = resolve_node_to_net(entry.node2);
+            const std::string& resolved_net2 = resolve_node_to_net(entry.node2);
             const std::string& net1 = resolved_net1.empty() ? net_name : resolved_net1;
+            const std::string& net2 = resolved_net2;
             if (net1.empty() || net2.empty()) continue;
 
             if (net1 != net2) {
@@ -519,7 +520,9 @@ static std::string resolve_token_sv(std::string_view tok,
 
     if (has_star && !has_backslash) {
         size_t colon = tok.find(':');
-        std::string base(tok.substr(0, colon));
+        std::string base = (colon == std::string_view::npos)
+            ? std::string(tok)
+            : std::string(tok.substr(0, colon));
         auto it = name_map.find(base);
         if (it != name_map.end()) {
             if (colon == std::string_view::npos) return it->second;
