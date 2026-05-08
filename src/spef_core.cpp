@@ -6,8 +6,12 @@
 void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     const auto& nets = spef.nets;
     const auto& name_map = spef.name_map;
+    constexpr size_t kNodeToNetCacheReserveMultiplier = 4;
+    constexpr size_t kNodeToNetCacheReserveSlack = 64;
     std::unordered_map<std::string, std::string> node_to_net_cache;
-    node_to_net_cache.reserve(spef.nets.size() * 4 + 64);
+    node_to_net_cache.reserve(
+        spef.nets.size() * kNodeToNetCacheReserveMultiplier +
+        kNodeToNetCacheReserveSlack);
 
     auto resolve_node_to_net = [&](const std::string& node) -> const std::string& {
         auto [cache_it, inserted] = node_to_net_cache.try_emplace(node);
@@ -67,12 +71,10 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
             // Use pre-parsed struct fields directly – no string splitting or stod call needed.
             const std::string& resolved_net1 = resolve_node_to_net(entry.node1);
             const std::string& net2 = resolve_node_to_net(entry.node2);
-            std::string_view net1 = resolved_net1.empty()
-                ? std::string_view(net_name)
-                : std::string_view(resolved_net1);
+            const std::string& net1 = resolved_net1.empty() ? net_name : resolved_net1;
             if (net1.empty() || net2.empty()) continue;
 
-            if (net1 != std::string_view(net2)) {
+            if (net1 != net2) {
                 std::string pair_key = make_pair_key(net1, net2);
                 double cap_converted = spef.c_scale * convert_capacitance(entry.cap_val, spef.c_unit);
                 local_caps[pair_key] += cap_converted;
