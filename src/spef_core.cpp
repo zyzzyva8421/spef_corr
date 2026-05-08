@@ -4,31 +4,50 @@
 
 // ============== Coupling Capacitance Resolution ==============
 void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
-    auto resolve_node_to_net = [&](const std::string& node) -> std::string {
-        if (node.empty()) return "";
-        if (spef.nets.find(node) != spef.nets.end()) {
-            return node;
+    const auto& nets = spef.nets;
+    const auto& name_map = spef.name_map;
+    std::unordered_map<std::string, std::string> node_to_net_cache;
+    node_to_net_cache.reserve(spef.nets.size() * 4 + 64);
+
+    auto resolve_node_to_net = [&](const std::string& node) -> const std::string& {
+        auto [cache_it, inserted] = node_to_net_cache.try_emplace(node);
+        if (!inserted) return cache_it->second;
+
+        std::string& resolved = cache_it->second;
+        if (node.empty()) return resolved;
+        if (nets.find(node) != nets.end()) {
+            resolved = node;
+            return resolved;
         }
         size_t colon = node.find(':');
         std::string base = (colon == std::string::npos) ? node : node.substr(0, colon);
-        if (spef.nets.find(base) != spef.nets.end()) {
-            return base;
+        if (nets.find(base) != nets.end()) {
+            resolved = std::move(base);
+            return resolved;
         }
         if (!base.empty() && base[0] == '*') {
-            auto it = spef.name_map.find(base);
-            if (it != spef.name_map.end()) {
-                const std::string& mapped = it->second;
-                if (spef.nets.find(mapped) != spef.nets.end()) {
-                    return mapped;
-                }
+            auto it = name_map.find(base);
+            if (it != name_map.end() && nets.find(it->second) != nets.end()) {
+                resolved = it->second;
             }
         }
-        return "";
+        return resolved;
     };
 
     // Create normalized pair key (sort so A|B and B|A map to the same key)
-    auto make_pair_key = [](const std::string& a, const std::string& b) -> std::string {
-        return (a < b) ? (a + "|" + b) : (b + "|" + a);
+    auto make_pair_key = [](std::string_view a, std::string_view b) -> std::string {
+        std::string key;
+        key.reserve(a.size() + b.size() + 1);
+        if (a < b) {
+            key.append(a.data(), a.size());
+            key.push_back('|');
+            key.append(b.data(), b.size());
+        } else {
+            key.append(b.data(), b.size());
+            key.push_back('|');
+            key.append(a.data(), a.size());
+        }
+        return key;
     };
 
     // First pass: accumulate capacitance for each pair across all nets.
@@ -46,12 +65,14 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         local_caps.reserve(net_data.raw_coupling_caps.size());
         for (const auto& entry : net_data.raw_coupling_caps) {
             // Use pre-parsed struct fields directly – no string splitting or stod call needed.
-            std::string net1 = resolve_node_to_net(entry.node1);
-            std::string net2 = resolve_node_to_net(entry.node2);
-            if (net1.empty()) net1 = net_name;
+            const std::string& resolved_net1 = resolve_node_to_net(entry.node1);
+            const std::string& net2 = resolve_node_to_net(entry.node2);
+            std::string_view net1 = resolved_net1.empty()
+                ? std::string_view(net_name)
+                : std::string_view(resolved_net1);
             if (net1.empty() || net2.empty()) continue;
 
-            if (net1 != net2) {
+            if (net1 != std::string_view(net2)) {
                 std::string pair_key = make_pair_key(net1, net2);
                 double cap_converted = spef.c_scale * convert_capacitance(entry.cap_val, spef.c_unit);
                 local_caps[pair_key] += cap_converted;
@@ -77,7 +98,6 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     // Clear temporary storage
     for (auto& [net_name, net_data] : spef.nets) {
         net_data.raw_coupling_caps.clear();
-        net_data.raw_coupling_caps.shrink_to_fit();
     }
 }
 
@@ -495,6 +515,21 @@ static std::string resolve_token_sv(std::string_view tok,
     bool has_backslash = (tok.find('\\') != std::string_view::npos);
     if (!has_star && !has_backslash) return std::string(tok);
 
+    if (has_star && !has_backslash) {
+        size_t colon = tok.find(':');
+        std::string base(tok.substr(0, colon));
+        auto it = name_map.find(base);
+        if (it != name_map.end()) {
+            if (colon == std::string_view::npos) return it->second;
+            std::string out;
+            out.reserve(it->second.size() + tok.size() - colon);
+            out += it->second;
+            out.append(tok.data() + colon, tok.size() - colon);
+            return out;
+        }
+        return std::string(tok);
+    }
+
     std::string out(tok);
     if (has_star) {
         size_t colon = out.find(':');
@@ -786,7 +821,9 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
     for (int t = 0; t < n_threads; ++t) {
         threads.emplace_back([&, t]() {
             ParsedSpef& local = local_spefs[(size_t)t];
-            for (size_t i = (size_t)t; i < n_nets; i += (size_t)n_threads) {
+            size_t start = (size_t)t * per_thread;
+            size_t end = std::min(start + per_thread, n_nets);
+            for (size_t i = start; i < end; ++i) {
                 size_t block_start = dnet_offsets[i];
                 size_t block_end   = (i + 1 < n_nets) ? dnet_offsets[i + 1] : buf_size;
                 parse_net_block(buf + block_start, buf + block_end, name_map, local);
@@ -798,8 +835,7 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
     // Merge local nets into out_spef (single-threaded after all threads join)
     out_spef.nets.reserve(n_nets + n_nets / 4);
     for (auto& ls : local_spefs) {
-        for (auto& [name, net] : ls.nets)
-            out_spef.nets.emplace(name, std::move(net));
+        out_spef.nets.merge(ls.nets);
     }
 }
 
@@ -2390,4 +2426,3 @@ PlotData export_plot_data(
 
     return result;
 }
-
