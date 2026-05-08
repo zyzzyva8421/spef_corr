@@ -82,15 +82,15 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         }
     } else {
         std::vector<std::unordered_map<std::string, double>> thread_accumulators((size_t)n_threads);
-        size_t per_thread_hint = (work_items.size() + (size_t)n_threads - 1) / (size_t)n_threads;
+        size_t work_items_per_thread = (work_items.size() + (size_t)n_threads - 1) / (size_t)n_threads;
         for (auto& m : thread_accumulators) {
-            m.reserve(per_thread_hint / 4 + 64);
+            m.reserve(work_items_per_thread / 4 + 64);
         }
         std::vector<std::thread> threads;
         threads.reserve((size_t)n_threads);
 
         for (int t = 0; t < n_threads; ++t) {
-            threads.emplace_back([&, t]() {
+            threads.emplace_back([&thread_accumulators, &work_items, &spef, &resolve_node_to_net, &make_pair_key, t, n_threads]() {
                 auto& thread_map = thread_accumulators[(size_t)t];
                 for (size_t i = (size_t)t; i < work_items.size(); i += (size_t)n_threads) {
                     const std::string& net_name = *work_items[i].first;
