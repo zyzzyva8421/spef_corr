@@ -4,95 +4,112 @@
 
 // ============== Coupling Capacitance Resolution ==============
 void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
-    const auto& nets = spef.nets;
+    const auto& nets     = spef.nets;
     const auto& name_map = spef.name_map;
     // Heuristic: coupling nodes are typically a small multiple of the net count;
     // this keeps the cache mostly rehash-free on large designs without overcommitting.
     constexpr size_t kNodeToNetCacheReserveMultiplier = 4;
     constexpr size_t kNodeToNetCacheReserveSlack = 64;
-    std::unordered_map<std::string, std::string> node_to_net_cache;
-    node_to_net_cache.reserve(
-        spef.nets.size() * kNodeToNetCacheReserveMultiplier +
-        kNodeToNetCacheReserveSlack);
-
-    auto resolve_node_to_net = [&](const std::string& node) -> const std::string& {
-        static const std::string kEmpty;
-        if (node.empty()) return kEmpty;
-        auto [cache_it, inserted] = node_to_net_cache.try_emplace(node);
-        if (!inserted) return cache_it->second;
-
-        std::string& resolved = cache_it->second;
-        if (nets.find(node) != nets.end()) {
-            resolved = node;
-            return resolved;
-        }
-        size_t colon = node.find(':');
-        std::string base = (colon == std::string::npos) ? node : node.substr(0, colon);
-        if (nets.find(base) != nets.end()) {
-            resolved = std::move(base);
-            return resolved;
-        }
-        if (!base.empty() && base[0] == '*') {
-            auto it = name_map.find(base);
-            if (it != name_map.end() && nets.find(it->second) != nets.end()) {
-                resolved = it->second;
-            }
-        }
-        return resolved;
-    };
 
     // Create normalized pair key (sort so A|B and B|A map to the same key)
     auto make_pair_key = [](std::string_view a, std::string_view b) -> std::string {
         std::string key;
         key.reserve(a.size() + b.size() + 1);
-        if (a < b) {
-            key += a;
-            key.push_back('|');
-            key += b;
-        } else {
-            key += b;
-            key.push_back('|');
-            key += a;
-        }
+        if (a < b) { key += a; key.push_back('|'); key += b; }
+        else        { key += b; key.push_back('|'); key += a; }
         return key;
     };
 
-    // First pass: accumulate capacitance for each pair across all nets.
-    // Each net's section is summed into a local map first (handles multiple
-    // entries for the same pair within one net's CAP section).  The local
-    // result is then merged into the global accumulator with try_emplace so
-    // that the symmetric entry in the other net's CAP section is ignored.
-    // This ensures each pair is counted exactly once.
-    std::unordered_map<std::string, double> cap_accumulator;
-    cap_accumulator.reserve(spef.nets.size() / 4 + 64);
+    // Build an indexed list so threads can address nets by integer index.
+    std::vector<std::pair<const std::string*, const NetData*>> net_ptrs;
+    net_ptrs.reserve(spef.nets.size());
+    for (const auto& [nm, nd] : spef.nets)
+        net_ptrs.push_back({&nm, &nd});
 
-    for (const auto& [net_name, net_data] : spef.nets) {
-        if (net_data.raw_coupling_caps.empty()) continue;
-        std::unordered_map<std::string, double> local_caps;
-        local_caps.reserve(net_data.raw_coupling_caps.size());
-        for (const auto& entry : net_data.raw_coupling_caps) {
-            // Use pre-parsed struct fields directly – no string splitting or stod call needed.
-            const std::string& resolved_net1 = resolve_node_to_net(entry.node1);
-            const std::string& resolved_net2 = resolve_node_to_net(entry.node2);
-            const std::string& net1 = resolved_net1.empty() ? net_name : resolved_net1;
-            const std::string& net2 = resolved_net2;
-            if (net1.empty() || net2.empty()) continue;
+    // ── Parallel phase ─────────────────────────────────────────────────────
+    // Each thread owns a local accumulator and a local node→net cache.
+    // All accesses to spef.nets and spef.name_map are read-only here.
+    int n_par = std::max(1, (int)std::thread::hardware_concurrency());
+    n_par = std::min(n_par, (int)net_ptrs.size());
+    std::vector<std::unordered_map<std::string, double>> thread_accumulators((size_t)n_par);
+    std::atomic<size_t> next_net_idx{0};
 
-            if (net1 != net2) {
-                std::string pair_key = make_pair_key(net1, net2);
-                double cap_converted = spef.c_scale * convert_capacitance(entry.cap_val, spef.c_unit);
-                local_caps[pair_key] += cap_converted;
+    auto worker = [&](int t) {
+        auto& local_acc = thread_accumulators[(size_t)t];
+        std::unordered_map<std::string, std::string> local_cache;
+        local_cache.reserve(
+            spef.nets.size() * kNodeToNetCacheReserveMultiplier / (size_t)n_par +
+            kNodeToNetCacheReserveSlack);
+
+        auto resolve_node_to_net = [&](const std::string& node) -> const std::string& {
+            static const std::string kEmpty;
+            if (node.empty()) return kEmpty;
+            auto [cache_it, inserted] = local_cache.try_emplace(node);
+            if (!inserted) return cache_it->second;
+            std::string& resolved = cache_it->second;
+            if (nets.find(node) != nets.end()) {
+                resolved = node; return resolved;
             }
+            size_t colon = node.find(':');
+            std::string base = (colon == std::string::npos) ? node : node.substr(0, colon);
+            if (nets.find(base) != nets.end()) {
+                resolved = std::move(base); return resolved;
+            }
+            if (!base.empty() && base[0] == '*') {
+                auto it = name_map.find(base);
+                if (it != name_map.end() && nets.find(it->second) != nets.end())
+                    resolved = it->second;
+            }
+            return resolved;
+        };
+
+        size_t idx;
+        while ((idx = next_net_idx.fetch_add(1, std::memory_order_relaxed)) < net_ptrs.size()) {
+            const std::string& net_name = *net_ptrs[idx].first;
+            const NetData&     net_data = *net_ptrs[idx].second;
+            if (net_data.raw_coupling_caps.empty()) continue;
+
+            // Sum coupling caps within this net's CAP section first,
+            // then try_emplace into the thread-local accumulator.
+            std::unordered_map<std::string, double> local_caps;
+            local_caps.reserve(net_data.raw_coupling_caps.size());
+            for (const auto& entry : net_data.raw_coupling_caps) {
+                const std::string& resolved_net1 = resolve_node_to_net(entry.node1);
+                const std::string& resolved_net2 = resolve_node_to_net(entry.node2);
+                const std::string& net1 = resolved_net1.empty() ? net_name : resolved_net1;
+                const std::string& net2 = resolved_net2;
+                if (net1.empty() || net2.empty()) continue;
+                if (net1 != net2) {
+                    std::string pair_key = make_pair_key(net1, net2);
+                    double cap_converted = spef.c_scale * convert_capacitance(entry.cap_val, spef.c_unit);
+                    local_caps[pair_key] += cap_converted;
+                }
+            }
+            // Merge into thread accumulator (first occurrence of each pair wins).
+            for (const auto& [key, val] : local_caps)
+                local_acc.try_emplace(key, val);
         }
-        // Merge: only insert pairs not already present in the global accumulator.
-        // Because SPEF lists each coupling cap in both nets' CAP sections, the
-        // second net's entry would be a duplicate — try_emplace skips it.
-        for (const auto& [key, val] : local_caps) {
-            cap_accumulator.try_emplace(key, val);
-        }
+    };
+
+    if (n_par > 1) {
+        std::vector<std::thread> threads;
+        threads.reserve((size_t)n_par);
+        for (int t = 0; t < n_par; ++t) threads.emplace_back(worker, t);
+        for (auto& th : threads) th.join();
+    } else {
+        worker(0);
     }
 
-    // Second pass: store the accumulated totals
+    // ── Serial merge ───────────────────────────────────────────────────────
+    // Merge all per-thread accumulators using try_emplace so that the
+    // symmetric duplicate (net B lists the A-B pair too) is silently dropped.
+    std::unordered_map<std::string, double> cap_accumulator;
+    cap_accumulator.reserve(spef.nets.size() / 4 + 64);
+    for (auto& local_acc : thread_accumulators)
+        for (const auto& [key, val] : local_acc)
+            cap_accumulator.try_emplace(key, val);
+
+    // Build final coupling_caps vector
     spef.coupling_caps.reserve(cap_accumulator.size());
     for (const auto& [pair_key, cap_total] : cap_accumulator) {
         size_t sep = pair_key.find('|');
@@ -100,12 +117,12 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         std::string net2 = pair_key.substr(sep + 1);
         spef.coupling_caps.push_back({net1, net2, cap_total});
     }
-    
-    // Clear temporary storage
-    for (auto& [net_name, net_data] : spef.nets) {
+
+    // Clear temporary per-net storage
+    for (auto& [net_name, net_data] : spef.nets)
         net_data.raw_coupling_caps.clear();
-    }
 }
+
 
 // ============== Dijkstra Implementation ==============
 std::unordered_map<std::string, double> dijkstra_shortest_paths(
@@ -438,21 +455,81 @@ static inline std::string strip_quotes(const std::string& s) {
 
 // ============== Fast low-level helpers ==============
 
-// Read entire file into heap buffer with two null sentinel bytes.
-// Single I/O call eliminates per-line syscall overhead.
-static std::vector<char> read_file_buffer(const std::string& filepath) {
+// RAII wrapper for the file mapping.  On POSIX systems the file is memory-
+// mapped (MAP_PRIVATE); on Windows or if mmap fails we fall back to fread.
+struct FileBuffer {
+    const char* data = nullptr;
+    size_t       size = 0;
+#if defined(__unix__) || defined(__APPLE__)
+    bool  is_mmap = false;
+    int   mmap_fd = -1;
+#endif
+    std::vector<char> heap_buf;   // populated only on the fread path
+
+    FileBuffer() = default;
+    FileBuffer(const FileBuffer&) = delete;
+    FileBuffer& operator=(const FileBuffer&) = delete;
+    FileBuffer(FileBuffer&& o) noexcept
+        : data(o.data), size(o.size)
+#if defined(__unix__) || defined(__APPLE__)
+        , is_mmap(o.is_mmap), mmap_fd(o.mmap_fd)
+#endif
+        , heap_buf(std::move(o.heap_buf))
+    {
+        o.data = nullptr; o.size = 0;
+#if defined(__unix__) || defined(__APPLE__)
+        o.is_mmap = false; o.mmap_fd = -1;
+#endif
+    }
+    FileBuffer& operator=(FileBuffer&&) = delete;
+
+    ~FileBuffer() {
+#if defined(__unix__) || defined(__APPLE__)
+        if (is_mmap && data) munmap(const_cast<char*>(data), size);
+        if (mmap_fd >= 0) close(mmap_fd);
+#endif
+    }
+};
+
+// Open a SPEF file and return a FileBuffer with (data, size) ready for parsing.
+// Tries mmap first; falls back to fread so the caller's hot path is identical.
+static FileBuffer open_file_buffer(const std::string& filepath) {
+    FileBuffer fb;
+#if defined(__unix__) || defined(__APPLE__)
+    fb.mmap_fd = open(filepath.c_str(), O_RDONLY);
+    if (fb.mmap_fd < 0) throw std::runtime_error("Cannot open file: " + filepath);
+    struct stat st{};
+    if (fstat(fb.mmap_fd, &st) == 0 && st.st_size > 0) {
+        void* ptr = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE,
+                         fb.mmap_fd, 0);
+        if (ptr != MAP_FAILED) {
+            fb.data    = static_cast<const char*>(ptr);
+            fb.size    = (size_t)st.st_size;
+            fb.is_mmap = true;
+#  if defined(__linux__)
+            // Hint sequential access so the kernel pre-faults pages aggressively.
+            madvise(const_cast<char*>(fb.data), fb.size, MADV_SEQUENTIAL);
+#  endif
+            return fb;
+        }
+    }
+    // mmap unavailable or empty file — fall through to fread
+    close(fb.mmap_fd);
+    fb.mmap_fd = -1;
+#endif
+    // fread fallback (Windows or mmap failure)
     FILE* f = fopen(filepath.c_str(), "rb");
     if (!f) throw std::runtime_error("Cannot open file: " + filepath);
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    std::vector<char> file_buf((size_t)std::max(0L, sz) + 2, '\0');
-    if (sz > 0) {
-        size_t n = fread(file_buf.data(), 1, (size_t)sz, f);
-        (void)n;
-    }
+    // Two extra null bytes act as sentinels for any stray look-ahead.
+    fb.heap_buf.assign((size_t)std::max(0L, sz) + 2, '\0');
+    if (sz > 0) { size_t n = fread(fb.heap_buf.data(), 1, (size_t)sz, f); (void)n; }
     fclose(f);
-    return file_buf;
+    fb.data = fb.heap_buf.data();
+    fb.size = fb.heap_buf.size() >= 2 ? fb.heap_buf.size() - 2 : 0;
+    return fb;
 }
 
 // Split up to max_n whitespace-delimited tokens from [begin, end).
@@ -472,39 +549,88 @@ static inline int fast_split_sv(const char* begin, const char* end,
     return n;
 }
 
-// Fast float parse from string_view: uses strtod (no locale, no exceptions).
+// Inline fast float parser — avoids locale lookups in glibc strtod.
+// Handles all numeric formats found in SPEF files:
+//   [+-]?[0-9]*\.?[0-9]*([eE][+-]?[0-9]+)?
+// Accumulates integer and fractional parts as uint64_t, then does a single
+// conversion to double to minimise rounding error from repeated scaling.
+static inline double inline_strtod(const char* s, const char* end) noexcept {
+    static const double kPow10[] = {
+        1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
+        1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+        1e20, 1e21, 1e22, 1e23, 1e24
+    };
+    constexpr unsigned kMaxPow10 = 24;
+
+    const char* p = s;
+    double sign = 1.0;
+    if (p < end) {
+        if (*p == '-') { sign = -1.0; ++p; }
+        else if (*p == '+') { ++p; }
+    }
+
+    // Integer part
+    uint64_t ipart = 0;
+    while (p < end && (unsigned char)(*p - '0') <= 9u) ipart = ipart * 10 + (uint64_t)(*p++ - '0');
+
+    // Fractional part — accumulate as integer, scale once
+    uint64_t fpart = 0;
+    unsigned fdigits = 0;
+    if (p < end && *p == '.') {
+        ++p;
+        while (p < end && (unsigned char)(*p - '0') <= 9u && fdigits < kMaxPow10) {
+            fpart = fpart * 10 + (uint64_t)(*p++ - '0');
+            ++fdigits;
+        }
+        // skip any excess fractional digits
+        while (p < end && (unsigned char)(*p - '0') <= 9u) ++p;
+    }
+
+    double val = (double)ipart;
+    if (fdigits > 0) val += (double)fpart / kPow10[fdigits];
+
+    // Exponent
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        ++p;
+        int esign = 1;
+        if (p < end) {
+            if (*p == '-') { esign = -1; ++p; }
+            else if (*p == '+') { ++p; }
+        }
+        unsigned exp = 0;
+        while (p < end && (unsigned char)(*p - '0') <= 9u) exp = exp * 10 + (unsigned)(*p++ - '0');
+        if (exp <= kMaxPow10) {
+            if (esign > 0) val *= kPow10[exp];
+            else           val /= kPow10[exp];
+        } else {
+            val *= std::pow(10.0, (double)(esign * (int)exp));
+        }
+    }
+
+    return sign * val;
+}
+
+// Fast float parse from string_view — locale-free, zero-allocation.
 static inline double parse_float_sv(std::string_view sv) {
     if (sv.empty()) return 0.0;
-    // Stack buffer covers almost all SPEF numeric tokens.
-    char buf[64];
     const char* src = sv.data();
-    size_t len = sv.size();
-    if (len < sizeof(buf)) {
-        memcpy(buf, src, len);
-        buf[len] = '\0';
-        char* endp;
-        double val = strtod(buf, &endp);
-        if (endp != buf) return val;
-        // Fallback: strip non-numeric characters for malformed inputs (e.g., units
-        // accidentally attached to a value).  This two-pass strategy keeps the fast
-        // path allocation-free while still handling edge-cases gracefully.
-        char clean[64];
-        int clean_idx = 0;
-        for (size_t i = 0; i < len && clean_idx < 62; ++i) {
-            char c = src[i];
-            if (c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' ||
-                (c >= '0' && c <= '9'))
-                clean[clean_idx++] = c;
-        }
-        if (clean_idx == 0) return 0.0;
-        clean[clean_idx] = '\0';
-        return strtod(clean, nullptr);
+    const char* end = src + sv.size();
+    double val = inline_strtod(src, end);
+    if (val != 0.0) return val;
+
+    // Fallback: strip non-numeric characters for malformed inputs (e.g. units
+    // accidentally concatenated to a value).
+    char clean[64];
+    int clean_idx = 0;
+    for (size_t i = 0; i < sv.size() && clean_idx < 62; ++i) {
+        char c = src[i];
+        if (c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' ||
+            (c >= '0' && c <= '9'))
+            clean[clean_idx++] = c;
     }
-    // Long token: heap-allocate (rare path).
-    std::string tmp(src, len);
-    char* endp;
-    double val = strtod(tmp.c_str(), &endp);
-    return (endp != tmp.c_str()) ? val : 0.0;
+    if (clean_idx == 0) return 0.0;
+    clean[clean_idx] = '\0';
+    return inline_strtod(clean, clean + clean_idx);
 }
 
 // Legacy std::string wrapper — keeps existing call-sites unchanged.
@@ -804,15 +930,15 @@ static std::vector<size_t> find_dnet_offsets(const char* buf, size_t buf_size,
     return offsets;
 }
 
-// Parse net blocks in parallel.
-// Thread i processes dnet_offsets[i], [i+N], [i+2N], ...
+// Parse net blocks in parallel using a dynamic work queue.
+// An atomic counter hands out *D_NET block indices on demand, eliminating
+// load imbalance that arises when nets have very different sizes.
 // name_map is read-only; each thread writes into its own local ParsedSpef.
 static void parse_nets_parallel(const char* buf, size_t buf_size,
                                   const std::vector<size_t>& dnet_offsets,
                                   const std::unordered_map<std::string, std::string>& name_map,
                                   ParsedSpef& out_spef, int n_threads) {
-    size_t n_nets    = dnet_offsets.size();
-    // Ceiling division: each thread gets at most ceil(n_nets / n_threads) blocks.
+    size_t n_nets = dnet_offsets.size();
     size_t per_thread = (n_nets + (size_t)n_threads - 1) / (size_t)n_threads;
 
     std::vector<ParsedSpef> local_spefs((size_t)n_threads);
@@ -824,14 +950,16 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
         ls.nets.reserve(per_thread);
     }
 
+    // Atomic index — each worker grabs the next unprocessed block.
+    std::atomic<size_t> next_block{0};
+
     std::vector<std::thread> threads;
     threads.reserve((size_t)n_threads);
     for (int t = 0; t < n_threads; ++t) {
         threads.emplace_back([&, t]() {
             ParsedSpef& local = local_spefs[(size_t)t];
-            size_t start = (size_t)t * per_thread;
-            size_t end = std::min(start + per_thread, n_nets);
-            for (size_t i = start; i < end; ++i) {
+            size_t i;
+            while ((i = next_block.fetch_add(1, std::memory_order_relaxed)) < n_nets) {
                 size_t block_start = dnet_offsets[i];
                 size_t block_end   = (i + 1 < n_nets) ? dnet_offsets[i + 1] : buf_size;
                 parse_net_block(buf + block_start, buf + block_end, name_map, local);
@@ -852,11 +980,10 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
 ParsedSpef parse_spef(const std::string& filepath) {
     auto t_start = std::chrono::steady_clock::now();
 
-    // Read entire file into memory — one syscall, eliminates per-line I/O overhead.
-    std::vector<char> file_buf = read_file_buffer(filepath);
-    // Two null sentinel bytes are appended; usable content is file_buf.size()-2 bytes.
-    size_t buf_size = file_buf.size() >= 2 ? file_buf.size() - 2 : 0;
-    const char* data = file_buf.data();
+    // Memory-map the file (mmap on POSIX, fread fallback elsewhere).
+    FileBuffer file_buf = open_file_buffer(filepath);
+    size_t buf_size = file_buf.size;
+    const char* data = file_buf.data;
 
     ParsedSpef spef;
 
@@ -879,9 +1006,10 @@ ParsedSpef parse_spef(const std::string& filepath) {
     spef.nets.reserve(net_count + net_count / 4);
 
     // 3. Choose parallelism — thread spawn overhead pays off at ~10 K nets.
+    //    No upper-bound cap: use all available hardware threads.
     int hw = (int)std::thread::hardware_concurrency();
     if (hw <= 0) hw = 2;
-    int n_threads = (net_count >= 10000) ? std::min(hw, 8) : 1;
+    int n_threads = (net_count >= 10000) ? hw : 1;
 
     if (n_threads > 1) {
         parse_nets_parallel(data, buf_size, dnet_offsets, spef.name_map, spef, n_threads);
@@ -893,13 +1021,13 @@ ParsedSpef parse_spef(const std::string& filepath) {
         }
     }
 
-    // 4. Post-process coupling caps (single-threaded; net ordering is irrelevant).
+    // 4. Post-process coupling caps — runs in parallel internally.
     resolve_coupling_caps_to_nets(spef);
 
     auto t_end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(t_end - t_start).count();
     std::cout << "[" << filepath << "] finished parsing " << spef.nets.size()
-              << " nets in " << elapsed << "s (C++/buffered, "
+              << " nets in " << elapsed << "s (C++/mmap, "
               << n_threads << " thread(s))" << std::endl;
 
     return spef;
