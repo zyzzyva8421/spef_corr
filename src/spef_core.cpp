@@ -581,6 +581,9 @@ static inline double inline_strtod(const char* s, const char* end) noexcept {
     // Headroom beyond IEEE 754 double exponent range [-308, 308] to safely
     // cap malformed exponent strings before unsigned integer wraps around.
     constexpr unsigned kMaxExponentCap = 400u;
+    // Maximum decimal digits we accumulate for the integer part to stay within
+    // uint64_t range without overflow (uint64_t holds up to ~18.4 × 10^18).
+    constexpr int kMaxSafeDigits = 18;
 
     // Helper: true iff *p is an ASCII digit.
     auto is_digit = [](const char* p) noexcept -> bool {
@@ -594,11 +597,10 @@ static inline double inline_strtod(const char* s, const char* end) noexcept {
         else if (*p == '+') { ++p; }
     }
 
-    // Integer part — stop at 18 digits to avoid uint64_t overflow
-    // (18 decimal digits fit in 63 bits; SPEF values are never that large anyway).
+    // Integer part — stop at kMaxSafeDigits to avoid uint64_t overflow.
     uint64_t ipart = 0;
     int idigits = 0;
-    while (p < end && is_digit(p) && idigits < 18) {
+    while (p < end && is_digit(p) && idigits < kMaxSafeDigits) {
         ipart = ipart * 10 + (uint64_t)(*p++ - '0');
         ++idigits;
     }
@@ -631,10 +633,14 @@ static inline double inline_strtod(const char* s, const char* end) noexcept {
         }
         unsigned exp = 0;
         // Cap accumulation to avoid unsigned overflow on malformed exponents.
+        // Check before the multiplication so exp*10 cannot wrap even at the limit.
         while (p < end && is_digit(p)) {
-            exp = (exp < kMaxExponentCap) ? (exp * 10u + (unsigned)(*p - '0')) : kMaxExponentCap;
-            ++p;
+            if (exp >= kMaxExponentCap / 10u) { exp = kMaxExponentCap; ++p; break; }
+            exp = exp * 10u + (unsigned)(*p++ - '0');
+            if (exp > kMaxExponentCap) exp = kMaxExponentCap;
         }
+        // skip any remaining exponent digits after cap
+        while (p < end && is_digit(p)) ++p;
         if (exp <= kMaxPow10) {
             if (esign > 0) val *= kPow10[exp];
             else           val /= kPow10[exp];
