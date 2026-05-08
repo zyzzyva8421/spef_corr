@@ -47,9 +47,11 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     std::unordered_map<std::string, double> cap_accumulator;
     cap_accumulator.reserve(work_items.size() / 4 + 64);
 
+    constexpr size_t kMinWorkItemsForParallel = 4096;
+    constexpr int kMaxResolveThreads = 8;
     int hw = (int)std::thread::hardware_concurrency();
     if (hw <= 0) hw = 2;
-    int n_threads = (work_items.size() >= 4096) ? std::min(hw, 8) : 1;
+    int n_threads = (work_items.size() >= kMinWorkItemsForParallel) ? std::min(hw, kMaxResolveThreads) : 1;
     n_threads = std::min<int>(n_threads, (int)work_items.size());
 
     if (n_threads <= 1) {
@@ -76,6 +78,10 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         }
     } else {
         std::vector<std::unordered_map<std::string, double>> thread_accumulators((size_t)n_threads);
+        size_t per_thread_hint = (work_items.size() + (size_t)n_threads - 1) / (size_t)n_threads;
+        for (auto& m : thread_accumulators) {
+            m.reserve(per_thread_hint / 4 + 64);
+        }
         std::vector<std::thread> threads;
         threads.reserve((size_t)n_threads);
 
