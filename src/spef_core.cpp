@@ -57,21 +57,21 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef, int max_threads) {
             if (node.empty()) return kEmpty;
             auto [cache_it, inserted] = local_cache.try_emplace(node);
             if (!inserted) return cache_it->second;
-            std::string& resolved = cache_it->second;
+            std::string& resolved_net = cache_it->second;
             if (nets.find(node) != nets.end()) {
-                resolved = node; return resolved;
+                resolved_net = node; return resolved_net;
             }
             size_t colon = node.find(':');
             std::string base = (colon == std::string::npos) ? node : node.substr(0, colon);
             if (nets.find(base) != nets.end()) {
-                resolved = std::move(base); return resolved;
+                resolved_net = std::move(base); return resolved_net;
             }
             if (!base.empty() && base[0] == '*') {
                 auto it = global_name_map.find(base);
                 if (it != global_name_map.end() && nets.find(it->second) != nets.end())
-                    resolved = it->second;
+                    resolved_net = it->second;
             }
-            return resolved;
+            return resolved_net;
         };
 
         size_t idx;
