@@ -29,16 +29,21 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     // ── Parallel phase ─────────────────────────────────────────────────────
     // Each thread owns a local accumulator and a local node→net cache.
     // All accesses to spef.nets and spef.name_map are read-only here.
-    int n_par = std::max(1, std::min((int)std::thread::hardware_concurrency(),
-                                     (int)net_ptrs.size()));
+    // Only spin up threads when the work is large enough to justify the overhead.
+    constexpr size_t kCcapParallelThreshold = 1000;
+    int n_par = (net_ptrs.size() >= kCcapParallelThreshold)
+        ? std::max(1, std::min((int)std::thread::hardware_concurrency(),
+                               (int)net_ptrs.size()))
+        : 1;
     std::vector<std::unordered_map<std::string, double>> thread_accumulators((size_t)n_par);
     std::atomic<size_t> next_net_idx{0};
 
     auto worker = [&](int t) {
         auto& local_acc = thread_accumulators[(size_t)t];
         std::unordered_map<std::string, std::string> local_cache;
+        // Each thread may observe most unique nodes, so reserve generously to avoid rehashing.
         local_cache.reserve(
-            spef.nets.size() * kNodeToNetCacheReserveMultiplier / (size_t)n_par +
+            spef.nets.size() * kNodeToNetCacheReserveMultiplier +
             kNodeToNetCacheReserveSlack);
 
         auto resolve_node_to_net = [&](const std::string& node) -> const std::string& {
@@ -536,7 +541,7 @@ static FileBuffer open_file_buffer(const std::string& filepath) {
     fseeko(f, 0, SEEK_SET);
 #endif
     // Two extra null bytes act as sentinels for any stray look-ahead.
-    fb.heap_buf.assign((size_t)std::max((long long)0, (long long)sz) + 2, '\0');
+    fb.heap_buf.assign(sz > 0 ? (size_t)sz + 2 : 2, '\0');
     if (sz > 0) { size_t n = fread(fb.heap_buf.data(), 1, (size_t)sz, f); (void)n; }
     fclose(f);
     fb.data = fb.heap_buf.data();
@@ -573,6 +578,14 @@ static inline double inline_strtod(const char* s, const char* end) noexcept {
         1e20, 1e21, 1e22, 1e23, 1e24
     };
     constexpr unsigned kMaxPow10 = 24;
+    // Headroom beyond IEEE 754 double exponent range [-308, 308] to safely
+    // cap malformed exponent strings before unsigned integer wraps around.
+    constexpr unsigned kMaxExponentCap = 400u;
+
+    // Helper: true iff *p is an ASCII digit.
+    auto is_digit = [](const char* p) noexcept -> bool {
+        return (unsigned char)(*p - '0') <= 9u;
+    };
 
     const char* p = s;
     double sign = 1.0;
@@ -585,24 +598,24 @@ static inline double inline_strtod(const char* s, const char* end) noexcept {
     // (18 decimal digits fit in 63 bits; SPEF values are never that large anyway).
     uint64_t ipart = 0;
     int idigits = 0;
-    while (p < end && (unsigned char)(*p - '0') <= 9u && idigits < 18) {
+    while (p < end && is_digit(p) && idigits < 18) {
         ipart = ipart * 10 + (uint64_t)(*p++ - '0');
         ++idigits;
     }
     // skip any excess integer digits (shouldn't occur in valid SPEF, but be safe)
-    while (p < end && (unsigned char)(*p - '0') <= 9u) ++p;
+    while (p < end && is_digit(p)) ++p;
 
     // Fractional part — accumulate as integer, scale once
     uint64_t fpart = 0;
     unsigned fdigits = 0;
     if (p < end && *p == '.') {
         ++p;
-        while (p < end && (unsigned char)(*p - '0') <= 9u && fdigits < kMaxPow10) {
+        while (p < end && is_digit(p) && fdigits < kMaxPow10) {
             fpart = fpart * 10 + (uint64_t)(*p++ - '0');
             ++fdigits;
         }
         // skip any excess fractional digits
-        while (p < end && (unsigned char)(*p - '0') <= 9u) ++p;
+        while (p < end && is_digit(p)) ++p;
     }
 
     double val = (double)ipart;
@@ -617,10 +630,9 @@ static inline double inline_strtod(const char* s, const char* end) noexcept {
             else if (*p == '+') { ++p; }
         }
         unsigned exp = 0;
-        // Cap exponent accumulation to avoid unsigned overflow on malformed input
-        // (valid IEEE 754 doubles have exponents in [-308, 308]).
-        while (p < end && (unsigned char)(*p - '0') <= 9u) {
-            exp = (exp < 400u) ? (exp * 10u + (unsigned)(*p - '0')) : 400u;
+        // Cap accumulation to avoid unsigned overflow on malformed exponents.
+        while (p < end && is_digit(p)) {
+            exp = (exp < kMaxExponentCap) ? (exp * 10u + (unsigned)(*p - '0')) : kMaxExponentCap;
             ++p;
         }
         if (exp <= kMaxPow10) {
