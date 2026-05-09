@@ -4,12 +4,10 @@
 #include <cstdint>
 
 namespace {
-thread_local int g_parse_thread_budget = 0;
-
 static inline uint64_t make_sorted_pair_key(uint32_t a, uint32_t b) {
     const uint64_t lo = (a < b) ? a : b;
     const uint64_t hi = (a < b) ? b : a;
-    return (lo << 32) | hi;
+    return (static_cast<uint64_t>(lo) << 32) | hi;
 }
 }
 
@@ -897,7 +895,7 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
 
 // ============== Public parse_spef entry point ==============
 
-ParsedSpef parse_spef(const std::string& filepath) {
+ParsedSpef parse_spef(const std::string& filepath, int thread_budget) {
     auto t_start = std::chrono::steady_clock::now();
 
     // 1. Read entire file into memory — one syscall, eliminates per-line I/O overhead.
@@ -932,7 +930,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
     // 4. Choose parallelism — thread spawn overhead pays off at ~10 K nets.
     int hw = (int)std::thread::hardware_concurrency();
     if (hw <= 0) hw = 2;
-    if (g_parse_thread_budget > 0) hw = std::min(hw, g_parse_thread_budget);
+    if (thread_budget > 0) hw = std::min(hw, thread_budget);
     int n_threads = (net_count >= 10000) ? std::min(hw, 8) : 1;
 
     if (n_threads > 1) {
@@ -2299,14 +2297,7 @@ std::vector<ParsedSpef> parse_spef_parallel(
         threads.emplace_back([&, t]() {
             for (size_t i = t; i < n; i += num_threads) {
                 auto t_start = std::chrono::steady_clock::now();
-                g_parse_thread_budget = parse_thread_budget_per_file;
-                try {
-                    results[i] = parse_spef(filepaths[i]);
-                } catch (...) {
-                    g_parse_thread_budget = 0;
-                    throw;
-                }
-                g_parse_thread_budget = 0;
+                results[i] = parse_spef(filepaths[i], parse_thread_budget_per_file);
                 auto t_end = std::chrono::steady_clock::now();
                 double elapsed = std::chrono::duration<double>(t_end - t_start).count();
                 elapsed_times[i] = elapsed;
@@ -2465,18 +2456,18 @@ PlotData export_plot_data(
     size_t res_offset = 0;
     for (auto& chunk : chunks) {
         if (!chunk.cap_c1.empty()) {
-            std::copy(chunk.cap_c1.begin(), chunk.cap_c1.end(), cap_c1_vec.begin() + (ptrdiff_t)cap_offset);
-            std::copy(chunk.cap_c2.begin(), chunk.cap_c2.end(), cap_c2_vec.begin() + (ptrdiff_t)cap_offset);
-            std::move(chunk.cap_names.begin(), chunk.cap_names.end(), result.cap_net_names.begin() + (ptrdiff_t)cap_offset);
+            std::copy(chunk.cap_c1.begin(), chunk.cap_c1.end(), cap_c1_vec.begin() + cap_offset);
+            std::copy(chunk.cap_c2.begin(), chunk.cap_c2.end(), cap_c2_vec.begin() + cap_offset);
+            std::move(chunk.cap_names.begin(), chunk.cap_names.end(), result.cap_net_names.begin() + cap_offset);
             cap_offset += chunk.cap_c1.size();
         }
 
         if (!chunk.res_r1.empty()) {
-            std::copy(chunk.res_r1.begin(), chunk.res_r1.end(), res_r1_vec.begin() + (ptrdiff_t)res_offset);
-            std::copy(chunk.res_r2.begin(), chunk.res_r2.end(), res_r2_vec.begin() + (ptrdiff_t)res_offset);
-            std::move(chunk.res_net_names.begin(), chunk.res_net_names.end(), res_net_names.begin() + (ptrdiff_t)res_offset);
-            std::move(chunk.res_sink_names.begin(), chunk.res_sink_names.end(), res_sink_names.begin() + (ptrdiff_t)res_offset);
-            std::move(chunk.res_driver_names.begin(), chunk.res_driver_names.end(), res_driver_names.begin() + (ptrdiff_t)res_offset);
+            std::copy(chunk.res_r1.begin(), chunk.res_r1.end(), res_r1_vec.begin() + res_offset);
+            std::copy(chunk.res_r2.begin(), chunk.res_r2.end(), res_r2_vec.begin() + res_offset);
+            std::move(chunk.res_net_names.begin(), chunk.res_net_names.end(), res_net_names.begin() + res_offset);
+            std::move(chunk.res_sink_names.begin(), chunk.res_sink_names.end(), res_sink_names.begin() + res_offset);
+            std::move(chunk.res_driver_names.begin(), chunk.res_driver_names.end(), res_driver_names.begin() + res_offset);
             res_offset += chunk.res_r1.size();
         }
     }
