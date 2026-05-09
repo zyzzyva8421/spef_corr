@@ -5,7 +5,7 @@ Compare RC parasitic data between two SPEF files from different extraction tools
 ## Features
 
 - **Fast SPEF Parsing**: Optimized single-pass parser (~900ms for 62K nets)
-- **Parallel Loading**: Extract two SPEF files concurrently
+- **Thread-Saturated Single Parse**: Parse each SPEF with full intra-file threading
 - **GUI Analysis**: Interactive multi-SPEF correlation visualization using Tkinter + Matplotlib
 - **CLI Mode**: Batch analysis with CSV export
 - **Correlation Computing**: Pearson correlation for capacitance and resistance
@@ -64,7 +64,7 @@ Coverage: 47 regression tests covering parse, compare, GUI wiring, CSV export, e
 ## Performance
 
 - **Optimized Parse**: 2.4s for two 62K-net SPEF files (parse + compare)
-- **Parallel Loading**: ~13% speedup via ProcessPoolExecutor
+- **Sequential Multi-File Parse**: Parse files one-by-one to avoid inter-file oversubscription
 - **Single-Pass Parser**: Regex-free hot path, local variable caching, early termination
 
 ## Key Improvements
@@ -75,10 +75,10 @@ Coverage: 47 regression tests covering parse, compare, GUI wiring, CSV export, e
    - Local variable binding to reduce attribute lookup
    - Bounded `split(None, N)` to avoid tail parsing
 
-2. **Parallel SPEF Loading**:
-   - Two files parse concurrently via `ProcessPoolExecutor`
-   - Automatic fallback to sequential on subprocess errors
-   - Works in both CLI and GUI modes
+2. **Single-File Parallel Parse + Sequential File Ordering**:
+   - Multiple SPEF files are parsed one-by-one
+   - Each single SPEF parse uses full available C++ threads
+   - Better stability by avoiding cross-file thread contention
 
 3. **Comprehensive Testing**:
    - 47 regression tests (pearson_corr, parse, compare, CSV, GUI wiring)

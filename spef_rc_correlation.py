@@ -67,19 +67,19 @@ def shuffle_spef_cpp(spef_path: str, output_path: str, seed: Optional[int] = Non
 
 
 def parse_spefs_parallel(path1: str, path2: str):
-    """Parse two SPEF files concurrently using C++ multithreaded backend.
+    """Parse SPEF files sequentially; each file parse uses C++ multithreading.
 
     Optimized for 1M+ nets: keeps data in C++ format, no Python conversion.
     Returns a pair of ParsedSpef objects.
     """
     if not HAS_CPP:
         raise RuntimeError("C++ extension not available")
-    print(f"Parsing {path1} and {path2} in parallel (C++ threads)...")
+    print(f"Parsing {path1} then {path2} (sequential files, C++ intra-file threads)...")
     try:
-        cpp_spefs = spef_core.parse_spef_parallel([path1, path2], 2)
+        cpp_spefs = spef_core.parse_spef_parallel([path1, path2], 0)
         return cpp_spefs[0], cpp_spefs[1]
     except Exception as exc:
-        print(f"[warn] C++ parallel parse failed ({exc}), falling back to sequential")
+        print(f"[warn] C++ sequential parse helper failed ({exc}), falling back to individual parse_spef calls")
         s1 = spef_core.parse_spef(path1)
         print(f"[{path1}] parsed {len(s1.nets)} nets (C++)")
         s2 = spef_core.parse_spef(path2)

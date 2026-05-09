@@ -871,15 +871,24 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
         ls.nets.reserve(per_thread);
     }
 
+    std::atomic<size_t> next_idx{0};
+    // Small chunk keeps load balancing responsive for uneven D_NET sizes
+    // while limiting atomic fetch_add overhead.
+    constexpr size_t kChunkSize = 4;
     std::vector<std::thread> threads;
     threads.reserve((size_t)n_threads);
     for (int t = 0; t < n_threads; ++t) {
         threads.emplace_back([&, t]() {
             ParsedSpef& local = local_spefs[(size_t)t];
-            for (size_t i = (size_t)t; i < n_nets; i += (size_t)n_threads) {
-                size_t block_start = dnet_offsets[i];
-                size_t block_end   = (i + 1 < n_nets) ? dnet_offsets[i + 1] : buf_size;
-                parse_net_block(buf + block_start, buf + block_end, name_map, local);
+            while (true) {
+                size_t begin = next_idx.fetch_add(kChunkSize, std::memory_order_relaxed);
+                if (begin >= n_nets) break;
+                size_t end = std::min(begin + kChunkSize, n_nets);
+                for (size_t i = begin; i < end; ++i) {
+                    size_t block_start = dnet_offsets[i];
+                    size_t block_end   = (i + 1 < n_nets) ? dnet_offsets[i + 1] : buf_size;
+                    parse_net_block(buf + block_start, buf + block_end, name_map, local);
+                }
             }
         });
     }
@@ -927,11 +936,11 @@ ParsedSpef parse_spef(const std::string& filepath, int thread_budget) {
 
     spef.nets.reserve(net_count + net_count / 4);
 
-    // 4. Choose parallelism — thread spawn overhead pays off at ~10 K nets.
+    // 4. Choose parallelism for single-file parse.
     int hw = (int)std::thread::hardware_concurrency();
     if (hw <= 0) hw = 2;
     if (thread_budget > 0) hw = std::min(hw, thread_budget);
-    int n_threads = (net_count >= 10000) ? std::min(hw, 8) : 1;
+    int n_threads = std::max(1, std::min(hw, (int)net_count));
 
     if (n_threads > 1) {
         parse_nets_parallel(data, buf_size, dnet_offsets, spef.name_map, spef, n_threads);
@@ -2266,58 +2275,42 @@ double convert_resistance(double value, const std::string& from_unit) {
 
 // ============== CORRELATION IMPLEMENTATIONS ==============
 
-// Parse multiple SPEF files in parallel using C++ threads
+// Parse multiple SPEF files sequentially; intra-file parsing remains parallel.
 std::vector<ParsedSpef> parse_spef_parallel(
     const std::vector<std::string>& filepaths,
     int num_threads
 ) {
-    std::cout << "[parse_spef_parallel] Starting parallel parsing of " << filepaths.size() << " files with " << num_threads << " threads..." << std::endl;
+    std::cout << "[parse_spef_parallel] Parsing " << filepaths.size()
+              << " files sequentially (intra-file threading only)." << std::endl;
     size_t n = filepaths.size();
     if (n == 0) return {};
-    
-    // Determine number of threads
-    if (num_threads <= 0) {
-        num_threads = std::thread::hardware_concurrency();
-        if (num_threads == 0) num_threads = 2;
-    }
-    if (num_threads > static_cast<int>(n)) {
-        num_threads = static_cast<int>(n);
-    }
 
-    int hw_total = (int)std::thread::hardware_concurrency();
-    if (hw_total <= 0) hw_total = 2;
-    const int parse_thread_budget_per_file = std::max(1, hw_total / std::max(1, num_threads));
-    
+    if (num_threads > 0) {
+        std::cout << "[parse_spef_parallel] note: legacy num_threads parameter is ignored; "
+                  << "files are parsed sequentially and each file uses full intra-file threads."
+                  << std::endl;
+    }
     std::vector<ParsedSpef> results(n);
-    std::vector<std::thread> threads;
-    std::mutex print_mutex;
     std::vector<double> elapsed_times(n, 0.0);
+    auto t_all_start = std::chrono::steady_clock::now();
 
-    for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&, t]() {
-            for (size_t i = t; i < n; i += num_threads) {
-                auto t_start = std::chrono::steady_clock::now();
-                results[i] = parse_spef(filepaths[i], parse_thread_budget_per_file);
-                auto t_end = std::chrono::steady_clock::now();
-                double elapsed = std::chrono::duration<double>(t_end - t_start).count();
-                elapsed_times[i] = elapsed;
-                {
-                    std::lock_guard<std::mutex> lock(print_mutex);
-                    std::cout << "[" << filepaths[i] << "] finished parsing "
-                              << results[i].nets.size() << " nets in " << elapsed << "s (C++/parallel, thread " << t << ")" << std::endl;
-                }
-            }
-        });
-    }
-
-    for (auto& th : threads) {
-        th.join();
+    for (size_t i = 0; i < n; ++i) {
+        auto t_start = std::chrono::steady_clock::now();
+        results[i] = parse_spef(filepaths[i], 0);
+        auto t_end = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(t_end - t_start).count();
+        elapsed_times[i] = elapsed;
+        std::cout << "[" << filepaths[i] << "] finished parsing "
+                  << results[i].nets.size() << " nets in " << elapsed
+                  << "s (C++/sequential-files)" << std::endl;
     }
 
     // Print summary
     double total = 0.0;
     for (size_t i = 0; i < n; ++i) total += elapsed_times[i];
-    std::cout << "[parse_spef_parallel] Parsed " << n << " files in total " << total << "s (sum of wall times)" << std::endl;
+    double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_all_start).count();
+    std::cout << "[parse_spef_parallel] Parsed " << n << " files in wall " << wall
+              << "s (sum single-file times=" << total << "s)" << std::endl;
     return results;
 }
 
