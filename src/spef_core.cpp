@@ -1,42 +1,69 @@
 #include "spef_core.h"
 #include <iomanip>
 #include <sstream>
+#include <cstdint>
+
+namespace {
+static inline uint64_t make_sorted_pair_key(uint32_t a, uint32_t b) {
+    const uint64_t lo = (a < b) ? a : b;
+    const uint64_t hi = (a < b) ? b : a;
+    return (static_cast<uint64_t>(lo) << 32) | hi;
+}
+}
 
 // ============== Coupling Capacitance Resolution ==============
 void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
-    auto resolve_node_to_net = [&](const std::string& node) -> std::string {
-        if (node.empty()) return "";
-        if (spef.nets.find(node) != spef.nets.end()) {
-            return node;
-        }
-        size_t colon = node.find(':');
-        std::string base = (colon == std::string::npos) ? node : node.substr(0, colon);
-        if (spef.nets.find(base) != spef.nets.end()) {
-            return base;
-        }
-        if (!base.empty() && base[0] == '*') {
-            auto it = spef.name_map.find(base);
-            if (it != spef.name_map.end()) {
-                const std::string& mapped = it->second;
-                if (spef.nets.find(mapped) != spef.nets.end()) {
-                    return mapped;
+    constexpr uint32_t kInvalidNetId = std::numeric_limits<uint32_t>::max();
+    std::unordered_map<std::string, uint32_t> net_name_to_id;
+    net_name_to_id.reserve(spef.nets.size() + spef.nets.size() / 4 + 1);
+    std::vector<const std::string*> id_to_net;
+    id_to_net.reserve(spef.nets.size());
+    uint32_t next_id = 0;
+    for (const auto& [net_name, _] : spef.nets) {
+        net_name_to_id.emplace(net_name, next_id++);
+        id_to_net.push_back(&net_name);
+    }
+
+    auto resolve_node_to_net_id = [&](const std::string& node,
+                                      std::unordered_map<std::string, uint32_t>& cache) -> uint32_t {
+        if (node.empty()) return kInvalidNetId;
+        auto c_it = cache.find(node);
+        if (c_it != cache.end()) return c_it->second;
+
+        uint32_t resolved = kInvalidNetId;
+        auto it_exact = net_name_to_id.find(node);
+        if (it_exact != net_name_to_id.end()) {
+            resolved = it_exact->second;
+        } else {
+            size_t colon = node.find(':');
+            std::string base = (colon == std::string::npos) ? node : node.substr(0, colon);
+            auto it_base = net_name_to_id.find(base);
+            if (it_base != net_name_to_id.end()) {
+                resolved = it_base->second;
+            } else if (!base.empty() && base[0] == '*') {
+                auto it_nm = spef.name_map.find(base);
+                if (it_nm != spef.name_map.end()) {
+                    auto it_mapped = net_name_to_id.find(it_nm->second);
+                    if (it_mapped != net_name_to_id.end()) {
+                        resolved = it_mapped->second;
+                    }
                 }
             }
         }
-        return "";
-    };
 
-    // Create normalized pair key (sort so A|B and B|A map to the same key)
-    auto make_pair_key = [](const std::string& a, const std::string& b) -> std::string {
-        return (a < b) ? (a + "|" + b) : (b + "|" + a);
+        cache.emplace(node, resolved);
+        return resolved;
     };
 
     // Collect nets that actually contain coupling entries.
-    std::vector<std::pair<const std::string*, const NetData*>> work_items;
+    std::vector<std::pair<uint32_t, const NetData*>> work_items;
     work_items.reserve(spef.nets.size());
     for (const auto& [net_name, net_data] : spef.nets) {
-        if (!net_data.raw_coupling_caps.empty())
-            work_items.push_back({&net_name, &net_data});
+        if (net_data.raw_coupling_caps.empty()) continue;
+        auto it = net_name_to_id.find(net_name);
+        if (it != net_name_to_id.end()) {
+            work_items.push_back({it->second, &net_data});
+        }
     }
 
     // First pass: accumulate capacitance for each pair across all nets.
@@ -44,8 +71,9 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     // entries for the same pair within one net's CAP section).  The local
     // result is then merged into an accumulator with try_emplace so that the
     // symmetric entry in the other net's CAP section is ignored.
-    std::unordered_map<std::string, double> cap_accumulator;
+    std::unordered_map<uint64_t, double> cap_accumulator;
     cap_accumulator.reserve(work_items.size() / 4 + 64);
+    const double cap_unit_factor = spef.c_scale * convert_capacitance(1.0, spef.c_unit);
 
     // Parallel overhead (thread startup + per-thread map merge) starts to pay off
     // only for larger workloads; keep small/medium parses on the sequential path.
@@ -59,29 +87,29 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
     n_threads = std::min<int>(n_threads, (int)work_items.size());
 
     if (n_threads <= 1) {
+        std::unordered_map<std::string, uint32_t> resolve_cache;
+        resolve_cache.reserve(work_items.size() + 64);
         for (const auto& item : work_items) {
-            const std::string& net_name = *item.first;
+            const uint32_t net_id = item.first;
             const NetData& net_data = *item.second;
-            std::unordered_map<std::string, double> local_caps;
+            std::unordered_map<uint64_t, double> local_caps;
             local_caps.reserve(net_data.raw_coupling_caps.size());
             for (const auto& entry : net_data.raw_coupling_caps) {
                 // Use pre-parsed struct fields directly – no string splitting or stod call needed.
-                std::string net1 = resolve_node_to_net(entry.node1);
-                std::string net2 = resolve_node_to_net(entry.node2);
-                if (net1.empty()) net1 = net_name;
-                if (net1.empty() || net2.empty()) continue;
+                uint32_t net1 = resolve_node_to_net_id(entry.node1, resolve_cache);
+                uint32_t net2 = resolve_node_to_net_id(entry.node2, resolve_cache);
+                if (net1 == kInvalidNetId) net1 = net_id;
+                if (net1 == kInvalidNetId || net2 == kInvalidNetId || net1 == net2) continue;
 
-                if (net1 != net2) {
-                    std::string pair_key = make_pair_key(net1, net2);
-                    double cap_converted = spef.c_scale * convert_capacitance(entry.cap_val, spef.c_unit);
-                    local_caps[pair_key] += cap_converted;
-                }
+                const uint64_t pair_key = make_sorted_pair_key(net1, net2);
+                local_caps[pair_key] += (entry.cap_val * cap_unit_factor);
             }
-            for (const auto& [key, val] : local_caps)
+            for (const auto& [key, val] : local_caps) {
                 cap_accumulator.try_emplace(key, val);
+            }
         }
     } else {
-        std::vector<std::unordered_map<std::string, double>> thread_accumulators((size_t)n_threads);
+        std::vector<std::unordered_map<uint64_t, double>> thread_accumulators((size_t)n_threads);
         size_t work_items_per_thread = (work_items.size() + (size_t)n_threads - 1) / (size_t)n_threads;
         for (auto& m : thread_accumulators) {
             m.reserve(work_items_per_thread / 4 + 64);
@@ -90,48 +118,50 @@ void resolve_coupling_caps_to_nets(ParsedSpef& spef) {
         threads.reserve((size_t)n_threads);
 
         for (int t = 0; t < n_threads; ++t) {
-            threads.emplace_back([&thread_accumulators, &work_items, &spef, &resolve_node_to_net, &make_pair_key, t, n_threads]() {
+            threads.emplace_back([&thread_accumulators, &work_items, &resolve_node_to_net_id, t, n_threads, cap_unit_factor]() {
                 auto& thread_map = thread_accumulators[(size_t)t];
+                std::unordered_map<std::string, uint32_t> resolve_cache;
+                resolve_cache.reserve(work_items.size() / (size_t)n_threads + 64);
                 for (size_t i = (size_t)t; i < work_items.size(); i += (size_t)n_threads) {
-                    const std::string& net_name = *work_items[i].first;
+                    const uint32_t net_id = work_items[i].first;
                     const NetData& net_data = *work_items[i].second;
-                    std::unordered_map<std::string, double> local_caps;
+                    std::unordered_map<uint64_t, double> local_caps;
                     local_caps.reserve(net_data.raw_coupling_caps.size());
 
                     for (const auto& entry : net_data.raw_coupling_caps) {
-                        std::string net1 = resolve_node_to_net(entry.node1);
-                        std::string net2 = resolve_node_to_net(entry.node2);
-                        if (net1.empty()) net1 = net_name;
-                        if (net1.empty() || net2.empty()) continue;
+                        uint32_t net1 = resolve_node_to_net_id(entry.node1, resolve_cache);
+                        uint32_t net2 = resolve_node_to_net_id(entry.node2, resolve_cache);
+                        if (net1 == kInvalidNetId) net1 = net_id;
+                        if (net1 == kInvalidNetId || net2 == kInvalidNetId || net1 == net2) continue;
 
-                        if (net1 != net2) {
-                            std::string pair_key = make_pair_key(net1, net2);
-                            double cap_converted = spef.c_scale * convert_capacitance(entry.cap_val, spef.c_unit);
-                            local_caps[pair_key] += cap_converted;
-                        }
+                        const uint64_t pair_key = make_sorted_pair_key(net1, net2);
+                        local_caps[pair_key] += (entry.cap_val * cap_unit_factor);
                     }
 
-                    for (const auto& [key, val] : local_caps)
+                    for (const auto& [key, val] : local_caps) {
                         thread_map.try_emplace(key, val);
+                    }
                 }
-            });
+            }
+            );
         }
 
         for (auto& th : threads) th.join();
 
         for (auto& thread_map : thread_accumulators) {
-            for (auto& [key, val] : thread_map)
+            for (auto& [key, val] : thread_map) {
                 cap_accumulator.try_emplace(std::move(key), val);
+            }
         }
     }
 
     // Second pass: store the accumulated totals
     spef.coupling_caps.reserve(cap_accumulator.size());
     for (const auto& [pair_key, cap_total] : cap_accumulator) {
-        size_t sep = pair_key.find('|');
-        std::string net1 = pair_key.substr(0, sep);
-        std::string net2 = pair_key.substr(sep + 1);
-        spef.coupling_caps.push_back({net1, net2, cap_total});
+        uint32_t net1_id = static_cast<uint32_t>(pair_key >> 32);
+        uint32_t net2_id = static_cast<uint32_t>(pair_key & 0xFFFFFFFFu);
+        if (net1_id >= id_to_net.size() || net2_id >= id_to_net.size()) continue;
+        spef.coupling_caps.push_back({*id_to_net[net1_id], *id_to_net[net2_id], cap_total});
     }
     
     // Clear temporary storage
@@ -865,7 +895,7 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
 
 // ============== Public parse_spef entry point ==============
 
-ParsedSpef parse_spef(const std::string& filepath) {
+ParsedSpef parse_spef(const std::string& filepath, int thread_budget) {
     auto t_start = std::chrono::steady_clock::now();
 
     // 1. Read entire file into memory — one syscall, eliminates per-line I/O overhead.
@@ -900,6 +930,7 @@ ParsedSpef parse_spef(const std::string& filepath) {
     // 4. Choose parallelism — thread spawn overhead pays off at ~10 K nets.
     int hw = (int)std::thread::hardware_concurrency();
     if (hw <= 0) hw = 2;
+    if (thread_budget > 0) hw = std::min(hw, thread_budget);
     int n_threads = (net_count >= 10000) ? std::min(hw, 8) : 1;
 
     if (n_threads > 1) {
@@ -2252,6 +2283,10 @@ std::vector<ParsedSpef> parse_spef_parallel(
     if (num_threads > static_cast<int>(n)) {
         num_threads = static_cast<int>(n);
     }
+
+    int hw_total = (int)std::thread::hardware_concurrency();
+    if (hw_total <= 0) hw_total = 2;
+    const int parse_thread_budget_per_file = std::max(1, hw_total / std::max(1, num_threads));
     
     std::vector<ParsedSpef> results(n);
     std::vector<std::thread> threads;
@@ -2262,7 +2297,7 @@ std::vector<ParsedSpef> parse_spef_parallel(
         threads.emplace_back([&, t]() {
             for (size_t i = t; i < n; i += num_threads) {
                 auto t_start = std::chrono::steady_clock::now();
-                results[i] = parse_spef(filepaths[i]);
+                results[i] = parse_spef(filepaths[i], parse_thread_budget_per_file);
                 auto t_end = std::chrono::steady_clock::now();
                 double elapsed = std::chrono::duration<double>(t_end - t_start).count();
                 elapsed_times[i] = elapsed;
@@ -2298,10 +2333,13 @@ PlotData export_plot_data(
 
     PlotData result;
     
+    int hw_threads = (int)std::thread::hardware_concurrency();
+    if (hw_threads <= 0) hw_threads = 4;
+    const int default_export_threads = std::max(1, (hw_threads * 3) / 4);
     if (num_threads <= 0) {
-        num_threads = std::thread::hardware_concurrency();
-        if (num_threads <= 0) num_threads = 4;
+        num_threads = default_export_threads;
     }
+    num_threads = std::max(1, std::min(num_threads, hw_threads));
     
     // Find common nets
     std::vector<std::string> common_nets;
@@ -2314,7 +2352,7 @@ PlotData export_plot_data(
     auto t_common = std::chrono::steady_clock::now();
     
     size_t n_cap = common_nets.size();
-    result.cap_count = n_cap;
+    const int worker_count = std::max(1, std::min<int>(num_threads, (int)std::max<size_t>(1, n_cap)));
     
     // Use std::vector for temporary storage, then convert to numpy
     std::vector<double> cap_c1_vec;
@@ -2333,34 +2371,43 @@ PlotData export_plot_data(
     res_net_names.reserve(n_cap * 4);
     res_sink_names.reserve(n_cap * 4);
     res_driver_names.reserve(n_cap * 4);
-    
+
+    struct ThreadChunk {
+        std::vector<double> cap_c1;
+        std::vector<double> cap_c2;
+        std::vector<std::string> cap_names;
+        std::vector<double> res_r1;
+        std::vector<double> res_r2;
+        std::vector<std::string> res_net_names;
+        std::vector<std::string> res_sink_names;
+        std::vector<std::string> res_driver_names;
+    };
+
+    std::vector<ThreadChunk> chunks((size_t)worker_count);
+    const double cap_factor_1 = spef1.c_scale * convert_capacitance(1.0, spef1.c_unit);
+    const double cap_factor_2 = spef2.c_scale * convert_capacitance(1.0, spef2.c_unit);
+    const double res_factor_1 = spef1.r_scale * convert_resistance(1.0, spef1.r_unit);
+    const double res_factor_2 = spef2.r_scale * convert_resistance(1.0, spef2.r_unit);
+
     // Parallel processing
-    std::mutex result_mutex;
-    
     auto worker = [&](int thread_id) {
-        std::vector<double> local_cap_c1;
-        std::vector<double> local_cap_c2;
-        std::vector<std::string> local_cap_names;
+        ThreadChunk& chunk = chunks[(size_t)thread_id];
+        chunk.cap_c1.reserve(n_cap / (size_t)worker_count + 1);
+        chunk.cap_c2.reserve(n_cap / (size_t)worker_count + 1);
+        chunk.cap_names.reserve(n_cap / (size_t)worker_count + 1);
         
-        std::vector<double> local_res_r1;
-        std::vector<double> local_res_r2;
-        std::vector<std::string> local_res_net_names;
-        std::vector<std::string> local_res_sink_names;
-        std::vector<std::string> local_res_driver_names;
-        
-        local_cap_c1.reserve(n_cap / num_threads + 1);
-        local_cap_c2.reserve(n_cap / num_threads + 1);
-        local_cap_names.reserve(n_cap / num_threads + 1);
-        
-        for (size_t i = thread_id; i < common_nets.size(); i += num_threads) {
+        for (size_t i = (size_t)thread_id; i < common_nets.size(); i += (size_t)worker_count) {
             const std::string& net_name = common_nets[i];
-            auto& net1 = spef1.nets[net_name];
-            auto& net2 = spef2.nets[net_name];
+            auto it1 = spef1.nets.find(net_name);
+            auto it2 = spef2.nets.find(net_name);
+            if (it1 == spef1.nets.end() || it2 == spef2.nets.end()) continue;
+            NetData& net1 = it1->second;
+            NetData& net2 = it2->second;
             
             // Capacitance - convert to standard unit (PF), apply *C_UNIT coefficient
-            local_cap_c1.push_back(spef1.c_scale * convert_capacitance(net1.total_cap, spef1.c_unit));
-            local_cap_c2.push_back(spef2.c_scale * convert_capacitance(net2.total_cap, spef2.c_unit));
-            local_cap_names.push_back(net_name);
+            chunk.cap_c1.push_back(net1.total_cap * cap_factor_1);
+            chunk.cap_c2.push_back(net2.total_cap * cap_factor_2);
+            chunk.cap_names.push_back(net_name);
             
             // Resistance - convert to standard unit (OHM)
             auto res1 = compute_driver_sink_res_by_method(net1, res_method);
@@ -2371,37 +2418,61 @@ PlotData export_plot_data(
                 auto it = res2.find(sink);
                 if (it == res2.end()) continue;
                 // Convert resistance to standard unit (OHM), apply *R_UNIT coefficient
-                local_res_r1.push_back(spef1.r_scale * convert_resistance(r1, spef1.r_unit));
-                local_res_r2.push_back(spef2.r_scale * convert_resistance(it->second, spef2.r_unit));
-                local_res_net_names.push_back(net_name);
-                local_res_sink_names.push_back(sink);
-                local_res_driver_names.push_back(net1.driver);
+                chunk.res_r1.push_back(r1 * res_factor_1);
+                chunk.res_r2.push_back(it->second * res_factor_2);
+                chunk.res_net_names.push_back(net_name);
+                chunk.res_sink_names.push_back(sink);
+                chunk.res_driver_names.push_back(net1.driver);
             }
-        }
-        
-        // Copy to shared vectors
-        {
-            std::lock_guard<std::mutex> lock(result_mutex);
-            cap_c1_vec.insert(cap_c1_vec.end(), local_cap_c1.begin(), local_cap_c1.end());
-            cap_c2_vec.insert(cap_c2_vec.end(), local_cap_c2.begin(), local_cap_c2.end());
-            result.cap_net_names.insert(result.cap_net_names.end(), local_cap_names.begin(), local_cap_names.end());
-            
-            res_r1_vec.insert(res_r1_vec.end(), local_res_r1.begin(), local_res_r1.end());
-            res_r2_vec.insert(res_r2_vec.end(), local_res_r2.begin(), local_res_r2.end());
-            res_net_names.insert(res_net_names.end(), local_res_net_names.begin(), local_res_net_names.end());
-            res_sink_names.insert(res_sink_names.end(), local_res_sink_names.begin(), local_res_sink_names.end());
-            res_driver_names.insert(res_driver_names.end(), local_res_driver_names.begin(), local_res_driver_names.end());
         }
     };
     
     std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-    for (int i = 0; i < num_threads; ++i) {
+    threads.reserve((size_t)worker_count);
+    for (int i = 0; i < worker_count; ++i) {
         threads.emplace_back(worker, i);
     }
     for (auto& t : threads) {
         t.join();
     }
+
+    size_t total_cap_rows = 0;
+    size_t total_res_rows = 0;
+    for (const auto& chunk : chunks) {
+        total_cap_rows += chunk.cap_c1.size();
+        total_res_rows += chunk.res_r1.size();
+    }
+
+    cap_c1_vec.resize(total_cap_rows);
+    cap_c2_vec.resize(total_cap_rows);
+    result.cap_net_names.resize(total_cap_rows);
+    res_r1_vec.resize(total_res_rows);
+    res_r2_vec.resize(total_res_rows);
+    res_net_names.resize(total_res_rows);
+    res_sink_names.resize(total_res_rows);
+    res_driver_names.resize(total_res_rows);
+
+    size_t cap_offset = 0;
+    size_t res_offset = 0;
+    for (auto& chunk : chunks) {
+        if (!chunk.cap_c1.empty()) {
+            std::copy(chunk.cap_c1.begin(), chunk.cap_c1.end(), cap_c1_vec.begin() + cap_offset);
+            std::copy(chunk.cap_c2.begin(), chunk.cap_c2.end(), cap_c2_vec.begin() + cap_offset);
+            std::move(chunk.cap_names.begin(), chunk.cap_names.end(), result.cap_net_names.begin() + cap_offset);
+            cap_offset += chunk.cap_c1.size();
+        }
+
+        if (!chunk.res_r1.empty()) {
+            std::copy(chunk.res_r1.begin(), chunk.res_r1.end(), res_r1_vec.begin() + res_offset);
+            std::copy(chunk.res_r2.begin(), chunk.res_r2.end(), res_r2_vec.begin() + res_offset);
+            std::move(chunk.res_net_names.begin(), chunk.res_net_names.end(), res_net_names.begin() + res_offset);
+            std::move(chunk.res_sink_names.begin(), chunk.res_sink_names.end(), res_sink_names.begin() + res_offset);
+            std::move(chunk.res_driver_names.begin(), chunk.res_driver_names.end(), res_driver_names.begin() + res_offset);
+            res_offset += chunk.res_r1.size();
+        }
+    }
+
+    result.cap_count = total_cap_rows;
     auto t_capres = std::chrono::steady_clock::now();
     
     // Convert to numpy arrays with correct size
@@ -2436,26 +2507,44 @@ PlotData export_plot_data(
 
     // Coupling capacitance comparison (intersection of pairs present in both SPEFs)
     {
-        auto make_pair_key = [](const std::string& a, const std::string& b) -> std::string {
-            return (a < b) ? (a + "|" + b) : (b + "|" + a);
+        std::unordered_map<std::string, uint32_t> net_to_id;
+        std::vector<std::string> id_to_net;
+        net_to_id.reserve(spef1.coupling_caps.size() + spef2.coupling_caps.size());
+        id_to_net.reserve((spef1.coupling_caps.size() + spef2.coupling_caps.size()) / 2 + 1);
+        auto net_id = [&](const std::string& name) -> uint32_t {
+            auto it = net_to_id.find(name);
+            if (it != net_to_id.end()) return it->second;
+            uint32_t id = static_cast<uint32_t>(id_to_net.size());
+            net_to_id.emplace(name, id);
+            id_to_net.push_back(name);
+            return id;
         };
 
-        std::unordered_map<std::string, double> caps1, caps2;
+        std::unordered_map<uint64_t, double> caps1, caps2;
+        caps1.reserve(spef1.coupling_caps.size() + 64);
+        caps2.reserve(spef2.coupling_caps.size() + 64);
         for (const auto& cc : spef1.coupling_caps) {
-            caps1[make_pair_key(cc.net1, cc.net2)] += cc.cap_value;
+            uint32_t id1 = net_id(cc.net1);
+            uint32_t id2 = net_id(cc.net2);
+            caps1[make_sorted_pair_key(id1, id2)] += cc.cap_value;
         }
         for (const auto& cc : spef2.coupling_caps) {
-            caps2[make_pair_key(cc.net1, cc.net2)] += cc.cap_value;
+            uint32_t id1 = net_id(cc.net1);
+            uint32_t id2 = net_id(cc.net2);
+            caps2[make_sorted_pair_key(id1, id2)] += cc.cap_value;
         }
 
         std::vector<double> cc1_vec, cc2_vec;
+        cc1_vec.reserve(std::min(caps1.size(), caps2.size()));
+        cc2_vec.reserve(std::min(caps1.size(), caps2.size()));
         for (const auto& [key, c1] : caps1) {
             auto it = caps2.find(key);
             if (it == caps2.end()) continue;
-            size_t pos = key.find('|');
-            if (pos == std::string::npos) continue;
-            result.ccap_net1_names.push_back(key.substr(0, pos));
-            result.ccap_net2_names.push_back(key.substr(pos + 1));
+            uint32_t id1 = static_cast<uint32_t>(key >> 32);
+            uint32_t id2 = static_cast<uint32_t>(key & 0xFFFFFFFFu);
+            if (id1 >= id_to_net.size() || id2 >= id_to_net.size()) continue;
+            result.ccap_net1_names.push_back(id_to_net[id1]);
+            result.ccap_net2_names.push_back(id_to_net[id2]);
             cc1_vec.push_back(c1);
             cc2_vec.push_back(it->second);
         }
@@ -2476,7 +2565,7 @@ PlotData export_plot_data(
 
     std::cout << "[export_plot_data] total=" << epd_total << "s"
               << "  common_nets=" << epd_common_s << "s"
-              << "  cap+res(" << num_threads << "t)=" << epd_capres_s << "s"
+              << "  cap+res(" << worker_count << "t)=" << epd_capres_s << "s"
               << "  ccap_compare+corr=" << epd_ccap_s << "s"
               << "  nets=" << n_cap
               << "  res_pairs=" << result.res_count

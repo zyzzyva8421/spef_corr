@@ -120,7 +120,7 @@ std::unordered_map<std::string, double> compute_driver_sink_res_by_method(
 );
 
 // Parse SPEF file - C++ optimized
-ParsedSpef parse_spef(const std::string& filepath);
+ParsedSpef parse_spef(const std::string& filepath, int thread_budget = 0);
 
 // Shuffle net ID mapping
 void shuffle_spef(
