@@ -79,7 +79,7 @@ def parse_spefs_parallel(path1: str, path2: str):
         cpp_spefs = spef_core.parse_spef_parallel([path1, path2], 0)
         return cpp_spefs[0], cpp_spefs[1]
     except Exception as exc:
-        print(f"[warn] C++ sequential parse helper failed ({exc}), falling back to direct sequential parse")
+        print(f"[warn] C++ sequential parse helper failed ({exc}), falling back to individual parse_spef calls")
         s1 = spef_core.parse_spef(path1)
         print(f"[{path1}] parsed {len(s1.nets)} nets (C++)")
         s2 = spef_core.parse_spef(path2)
