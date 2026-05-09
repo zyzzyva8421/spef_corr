@@ -872,6 +872,8 @@ static void parse_nets_parallel(const char* buf, size_t buf_size,
     }
 
     std::atomic<size_t> next_idx{0};
+    // Small chunk keeps load balancing responsive for uneven *D_NET sizes
+    // while limiting atomic fetch_add overhead.
     constexpr size_t kChunkSize = 4;
     std::vector<std::thread> threads;
     threads.reserve((size_t)n_threads);
@@ -2283,7 +2285,11 @@ std::vector<ParsedSpef> parse_spef_parallel(
     size_t n = filepaths.size();
     if (n == 0) return {};
 
-    (void)num_threads;  // Legacy arg kept for ABI compatibility.
+    if (num_threads > 0) {
+        std::cout << "[parse_spef_parallel] note: num_threads is ignored; "
+                  << "files are parsed sequentially and each file uses full intra-file threads."
+                  << std::endl;
+    }
     std::vector<ParsedSpef> results(n);
     std::vector<double> elapsed_times(n, 0.0);
     auto t_all_start = std::chrono::steady_clock::now();
