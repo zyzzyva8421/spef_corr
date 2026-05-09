@@ -185,7 +185,7 @@ std::unordered_map<std::string, std::unordered_map<std::string, double>> compute
 
 // ============== CORRELATION FUNCTIONS ==============
 
-// Parse multiple SPEF files in parallel using C++ threads
+// Parse multiple SPEF files sequentially (single-file parse stays parallel)
 std::vector<ParsedSpef> parse_spef_parallel(
     const std::vector<std::string>& filepaths,
     int num_threads = 0

@@ -119,7 +119,7 @@ PYBIND11_MODULE(spef_core, m) {
           py::arg("sink"));
 
     m.def("parse_spef_parallel", &parse_spef_parallel,
-          "Parse multiple SPEF files in parallel using C++ threads",
+          "Parse multiple SPEF files sequentially (single-file parse remains multithreaded)",
           py::arg("filepaths"),
           py::arg("num_threads") = 0);
 
