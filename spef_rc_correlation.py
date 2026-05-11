@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import atexit
 import csv
 import math
 import os
@@ -134,16 +135,38 @@ def summarize_and_print(plot_data, spef1_path: str, spef2_path: str) -> None:
         print("Driver->sink R correlation: N/A")
 
 
+_ORIG_STDOUT = sys.stdout
+_ORIG_STDERR = sys.stderr
+_LOG_HANDLE = None
+
+
+def _close_output_log() -> None:
+    global _LOG_HANDLE
+    if _LOG_HANDLE is None:
+        return
+    try:
+        _LOG_HANDLE.close()
+    except Exception:
+        pass
+    _LOG_HANDLE = None
+
+
 def configure_output_log(log_file: Optional[str]) -> None:
     """Redirect stdout/stderr to a log file when requested."""
+    global _LOG_HANDLE
     if not log_file:
         return
     log_path = os.path.abspath(log_file)
-    log_handle = open(log_path, "w", encoding="utf-8", buffering=1)
-    sys.stdout = log_handle
-    sys.stderr = log_handle
-    os.dup2(log_handle.fileno(), 1)
-    os.dup2(log_handle.fileno(), 2)
+    try:
+        _LOG_HANDLE = open(log_path, "w", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        print(f"[warn] failed to open log file '{log_path}': {exc}", file=_ORIG_STDERR)
+        return
+    sys.stdout = _LOG_HANDLE
+    sys.stderr = _LOG_HANDLE
+    os.dup2(_LOG_HANDLE.fileno(), 1)
+    os.dup2(_LOG_HANDLE.fileno(), 2)
+    atexit.register(_close_output_log)
 
 
 # ===================== Main CLI =====================
