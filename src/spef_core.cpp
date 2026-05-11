@@ -2527,6 +2527,40 @@ PlotData export_plot_data(
             caps2[make_sorted_pair_key(id1, id2)] += cc.cap_value;
         }
 
+        std::vector<uint64_t> only_in_spef1;
+        std::vector<uint64_t> only_in_spef2;
+        only_in_spef1.reserve(caps1.size());
+        only_in_spef2.reserve(caps2.size());
+
+        for (const auto& [key, _] : caps1) {
+            if (caps2.find(key) == caps2.end()) {
+                only_in_spef1.push_back(key);
+            }
+        }
+        for (const auto& [key, _] : caps2) {
+            if (caps1.find(key) == caps1.end()) {
+                only_in_spef2.push_back(key);
+            }
+        }
+
+        std::sort(only_in_spef1.begin(), only_in_spef1.end());
+        std::sort(only_in_spef2.begin(), only_in_spef2.end());
+
+        std::cout << "[ccap] net pairs only in spef1: " << only_in_spef1.size() << std::endl;
+        for (uint64_t key : only_in_spef1) {
+            uint32_t id1 = static_cast<uint32_t>(key >> 32);
+            uint32_t id2 = static_cast<uint32_t>(key & 0xFFFFFFFFu);
+            if (id1 >= id_to_net.size() || id2 >= id_to_net.size()) continue;
+            std::cout << "[ccap][only_spef1] " << id_to_net[id1] << " " << id_to_net[id2] << std::endl;
+        }
+        std::cout << "[ccap] net pairs only in spef2: " << only_in_spef2.size() << std::endl;
+        for (uint64_t key : only_in_spef2) {
+            uint32_t id1 = static_cast<uint32_t>(key >> 32);
+            uint32_t id2 = static_cast<uint32_t>(key & 0xFFFFFFFFu);
+            if (id1 >= id_to_net.size() || id2 >= id_to_net.size()) continue;
+            std::cout << "[ccap][only_spef2] " << id_to_net[id1] << " " << id_to_net[id2] << std::endl;
+        }
+
         std::vector<double> cc1_vec, cc2_vec;
         cc1_vec.reserve(std::min(caps1.size(), caps2.size()));
         cc2_vec.reserve(std::min(caps1.size(), caps2.size()));

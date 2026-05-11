@@ -23,6 +23,7 @@ import argparse
 import csv
 import math
 import os
+import sys
 from typing import Dict, List, Tuple, Optional, Iterable, Any
 try:
     import spef_core
@@ -133,6 +134,18 @@ def summarize_and_print(plot_data, spef1_path: str, spef2_path: str) -> None:
         print("Driver->sink R correlation: N/A")
 
 
+def configure_output_log(log_file: Optional[str]) -> None:
+    """Redirect stdout/stderr to a log file when requested."""
+    if not log_file:
+        return
+    log_path = os.path.abspath(log_file)
+    log_handle = open(log_path, "w", encoding="utf-8", buffering=1)
+    sys.stdout = log_handle
+    sys.stderr = log_handle
+    os.dup2(log_handle.fileno(), 1)
+    os.dup2(log_handle.fileno(), 2)
+
+
 # ===================== Main CLI =====================
 
 def main() -> None:
@@ -155,8 +168,11 @@ def main() -> None:
     parser.add_argument("--res-method", choices=["dijkstra", "equivalent"], default="dijkstra",
                         help="Driver-sink resistance method: 'dijkstra' (min-path, default) or "
                              "'equivalent' (Thevenin equivalent/nodal analysis)")
+    parser.add_argument("--log-file", metavar="FILE",
+                        help="Redirect all CLI output (Python + C++ prints) to this log file")
 
     args = parser.parse_args()
+    configure_output_log(args.log_file)
 
     # Translate res_method string to integer for C++
     _res_method_int = 1 if args.res_method == "equivalent" else 0
