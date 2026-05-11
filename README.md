@@ -41,7 +41,7 @@ python spef_rc_correlation.py ./netlists --gui --gui-auto-run
 ### CLI Mode (Batch)
 
 ```bash
-python spef_rc_correlation.py spef1.spef spef2.spef [--csv-prefix PREFIX] [--r-agg {max,avg,total}]
+python spef_rc_correlation.py spef1.spef spef2.spef [--csv-prefix PREFIX] [--r-agg {max,avg,total}] [--log-file LOG]
 ```
 
 Examples:
@@ -51,6 +51,9 @@ python spef_rc_correlation.py toolA.spef toolB.spef --csv-prefix results/compare
 
 # Change resistance aggregation mode to average
 python spef_rc_correlation.py toolA.spef toolB.spef --csv-prefix results/compare --r-agg avg
+
+# Redirect all runtime prints (including C++ extension output) to a log file
+python spef_rc_correlation.py toolA.spef toolB.spef --log-file run.log
 ```
 
 ## Testing

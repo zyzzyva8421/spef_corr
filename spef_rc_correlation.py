@@ -20,9 +20,11 @@ Usage:
 """
 
 import argparse
+import atexit
 import csv
 import math
 import os
+import sys
 from typing import Dict, List, Tuple, Optional, Iterable, Any
 try:
     import spef_core
@@ -133,6 +135,40 @@ def summarize_and_print(plot_data, spef1_path: str, spef2_path: str) -> None:
         print("Driver->sink R correlation: N/A")
 
 
+_ORIG_STDOUT = sys.stdout
+_ORIG_STDERR = sys.stderr
+_LOG_HANDLE = None
+
+
+def _close_output_log() -> None:
+    global _LOG_HANDLE
+    if _LOG_HANDLE is None:
+        return
+    try:
+        _LOG_HANDLE.close()
+    except Exception:
+        pass
+    _LOG_HANDLE = None
+
+
+def configure_output_log(log_file: Optional[str]) -> None:
+    """Redirect stdout/stderr to a log file when requested."""
+    global _LOG_HANDLE
+    if not log_file:
+        return
+    log_path = os.path.abspath(log_file)
+    try:
+        _LOG_HANDLE = open(log_path, "w", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        print(f"[warn] failed to open log file '{log_path}': {exc}", file=_ORIG_STDERR)
+        return
+    sys.stdout = _LOG_HANDLE
+    sys.stderr = _LOG_HANDLE
+    os.dup2(_LOG_HANDLE.fileno(), 1)
+    os.dup2(_LOG_HANDLE.fileno(), 2)
+    atexit.register(_close_output_log)
+
+
 # ===================== Main CLI =====================
 
 def main() -> None:
@@ -155,8 +191,11 @@ def main() -> None:
     parser.add_argument("--res-method", choices=["dijkstra", "equivalent"], default="dijkstra",
                         help="Driver-sink resistance method: 'dijkstra' (min-path, default) or "
                              "'equivalent' (Thevenin equivalent/nodal analysis)")
+    parser.add_argument("--log-file", metavar="FILE",
+                        help="Redirect all CLI output (Python + C++ prints) to this log file")
 
     args = parser.parse_args()
+    configure_output_log(args.log_file)
 
     # Translate res_method string to integer for C++
     _res_method_int = 1 if args.res_method == "equivalent" else 0
