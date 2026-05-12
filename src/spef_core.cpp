@@ -2498,14 +2498,14 @@ PlotData export_plot_data(
             tmp_r1[i]   = res_r1_vec[res_idx[i]];
             tmp_r2[i]   = res_r2_vec[res_idx[i]];
             tmp_rnet[i] = std::move(res_net_names[res_idx[i]]);
-            tmp_rsink[i]= std::move(res_sink_names[res_idx[i]]);
+            tmp_rsink[i] = std::move(res_sink_names[res_idx[i]]);
             tmp_rdrv[i] = std::move(res_driver_names[res_idx[i]]);
         }
         res_r1_vec      = std::move(tmp_r1);
         res_r2_vec      = std::move(tmp_r2);
         res_net_names   = std::move(tmp_rnet);
         res_sink_names  = std::move(tmp_rsink);
-        res_driver_names= std::move(tmp_rdrv);
+        res_driver_names = std::move(tmp_rdrv);
     }
 
     // Convert to numpy arrays with correct size
