@@ -1874,9 +1874,8 @@ void backmark_spef(
     // Format example: net1 net2 ccap1 ccap2 -> use ccap2
     const bool use_ccap_backmark = !ccap_data_path.empty();
     std::unordered_map<std::string, double> ccap_target_by_pair;
-    std::unordered_map<std::string, double> ccap_old_total_by_pair;
-    std::unordered_map<std::string, size_t> ccap_old_count_by_pair;
     std::unordered_map<std::string, std::unordered_map<std::string, double>> ccap_old_by_net_pair;
+    std::unordered_map<std::string, std::unordered_map<std::string, size_t>> ccap_old_count_by_net_pair;
     std::unordered_map<std::string, double> old_noncoupling_by_net;
     std::unordered_map<std::string, double> noncoupling_scale_by_net;
 
@@ -1955,9 +1954,8 @@ void backmark_spef(
                     std::string net2 = resolve_node_to_net(tokens[2]);
                     if (!net1.empty() && !net2.empty() && net1 != net2) {
                         std::string pair_key = make_pair_key(net1, net2);
-                        ccap_old_total_by_pair[pair_key] += old_v;
-                        ccap_old_count_by_pair[pair_key] += 1;
                         ccap_old_by_net_pair[current_net_scan][pair_key] += old_v;
+                        ccap_old_count_by_net_pair[current_net_scan][pair_key] += 1;
                     }
                 } else {
                     // Non-coupling CAP (e.g. self-cap): idx node value
@@ -1975,15 +1973,12 @@ void backmark_spef(
             auto it_net_pairs = ccap_old_by_net_pair.find(net_name);
             if (it_net_pairs != ccap_old_by_net_pair.end()) {
                 for (const auto& [pair_key, old_net_pair_sum] : it_net_pairs->second) {
-                    double old_pair_total = ccap_old_total_by_pair[pair_key];
-                    if (old_pair_total <= 0.0) continue;
-
                     auto it_target = ccap_target_by_pair.find(pair_key);
-                    double pair_target_total = (it_target != ccap_target_by_pair.end())
+                    // target ccap is treated as final per-pair value in each net CAP section.
+                    // For pairs not explicitly updated, keep original per-net-section sum.
+                    target_coupling_sum += (it_target != ccap_target_by_pair.end())
                         ? it_target->second
-                        : old_pair_total;
-
-                    target_coupling_sum += pair_target_total * (old_net_pair_sum / old_pair_total);
+                        : old_net_pair_sum;
                 }
             }
 
@@ -2128,15 +2123,15 @@ void backmark_spef(
                                     auto it_target = ccap_target_by_pair.find(pair_key);
                                     if (it_target != ccap_target_by_pair.end()) {
                                         double target_total = it_target->second;
-                                        double old_total = ccap_old_total_by_pair[pair_key];
-                                        size_t old_count = ccap_old_count_by_pair[pair_key];
+                                        double old_net_total = ccap_old_by_net_pair[current_net_name][pair_key];
+                                        size_t old_net_count = ccap_old_count_by_net_pair[current_net_name][pair_key];
 
-                                        if (old_total > 0.0) {
-                                            // Preserve original per-part ratio for this counterpart pair.
-                                            new_val = target_total * (old_val / old_total);
-                                        } else if (old_count > 0) {
-                                            // If original total is zero, split evenly as a fallback.
-                                            new_val = target_total / static_cast<double>(old_count);
+                                        if (old_net_total > 0.0) {
+                                            // Preserve original intra-net ratio for this pair.
+                                            new_val = target_total * (old_val / old_net_total);
+                                        } else if (old_net_count > 0) {
+                                            // If original net-local total is zero, split evenly as fallback.
+                                            new_val = target_total / static_cast<double>(old_net_count);
                                         } else {
                                             new_val = target_total;
                                         }
