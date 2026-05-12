@@ -1,5 +1,6 @@
 #include "spef_core.h"
 #include <iomanip>
+#include <numeric>
 #include <sstream>
 #include <cstdint>
 
@@ -2462,7 +2463,51 @@ PlotData export_plot_data(
 
     result.cap_count = total_cap_rows;
     auto t_capres = std::chrono::steady_clock::now();
-    
+
+    // Sort cap data by net name for deterministic output order.
+    {
+        std::vector<size_t> cap_idx(total_cap_rows);
+        std::iota(cap_idx.begin(), cap_idx.end(), 0);
+        std::sort(cap_idx.begin(), cap_idx.end(), [&](size_t a, size_t b) {
+            return result.cap_net_names[a] < result.cap_net_names[b];
+        });
+        std::vector<double> tmp_c1(total_cap_rows), tmp_c2(total_cap_rows);
+        std::vector<std::string> tmp_names(total_cap_rows);
+        for (size_t i = 0; i < total_cap_rows; ++i) {
+            tmp_c1[i]    = cap_c1_vec[cap_idx[i]];
+            tmp_c2[i]    = cap_c2_vec[cap_idx[i]];
+            tmp_names[i] = std::move(result.cap_net_names[cap_idx[i]]);
+        }
+        cap_c1_vec         = std::move(tmp_c1);
+        cap_c2_vec         = std::move(tmp_c2);
+        result.cap_net_names = std::move(tmp_names);
+    }
+
+    // Sort res data by (net_name, sink_name) for deterministic output order.
+    {
+        std::vector<size_t> res_idx(total_res_rows);
+        std::iota(res_idx.begin(), res_idx.end(), 0);
+        std::sort(res_idx.begin(), res_idx.end(), [&](size_t a, size_t b) {
+            if (res_net_names[a] != res_net_names[b])
+                return res_net_names[a] < res_net_names[b];
+            return res_sink_names[a] < res_sink_names[b];
+        });
+        std::vector<double> tmp_r1(total_res_rows), tmp_r2(total_res_rows);
+        std::vector<std::string> tmp_rnet(total_res_rows), tmp_rsink(total_res_rows), tmp_rdrv(total_res_rows);
+        for (size_t i = 0; i < total_res_rows; ++i) {
+            tmp_r1[i]   = res_r1_vec[res_idx[i]];
+            tmp_r2[i]   = res_r2_vec[res_idx[i]];
+            tmp_rnet[i] = std::move(res_net_names[res_idx[i]]);
+            tmp_rsink[i]= std::move(res_sink_names[res_idx[i]]);
+            tmp_rdrv[i] = std::move(res_driver_names[res_idx[i]]);
+        }
+        res_r1_vec      = std::move(tmp_r1);
+        res_r2_vec      = std::move(tmp_r2);
+        res_net_names   = std::move(tmp_rnet);
+        res_sink_names  = std::move(tmp_rsink);
+        res_driver_names= std::move(tmp_rdrv);
+    }
+
     // Convert to numpy arrays with correct size
     result.cap_c1 = py::array_t<double>(cap_c1_vec.size());
     result.cap_c2 = py::array_t<double>(cap_c2_vec.size());
@@ -2556,19 +2601,36 @@ PlotData export_plot_data(
             std::cout << "[ccap][only_spef2] " << id_to_net[id1] << " " << id_to_net[id2] << std::endl;
         }
 
+        // Collect common keys and sort them so ccap output order is deterministic.
+        std::vector<uint64_t> common_ccap_keys;
+        common_ccap_keys.reserve(std::min(caps1.size(), caps2.size()));
+        for (const auto& [key, _] : caps1) {
+            if (caps2.find(key) != caps2.end()) {
+                common_ccap_keys.push_back(key);
+            }
+        }
+        std::sort(common_ccap_keys.begin(), common_ccap_keys.end(), [&](uint64_t a, uint64_t b) {
+            uint32_t a1 = static_cast<uint32_t>(a >> 32), a2 = static_cast<uint32_t>(a & 0xFFFFFFFFu);
+            uint32_t b1 = static_cast<uint32_t>(b >> 32), b2 = static_cast<uint32_t>(b & 0xFFFFFFFFu);
+            const std::string& na1 = (a1 < id_to_net.size()) ? id_to_net[a1] : "";
+            const std::string& na2 = (a2 < id_to_net.size()) ? id_to_net[a2] : "";
+            const std::string& nb1 = (b1 < id_to_net.size()) ? id_to_net[b1] : "";
+            const std::string& nb2 = (b2 < id_to_net.size()) ? id_to_net[b2] : "";
+            if (na1 != nb1) return na1 < nb1;
+            return na2 < nb2;
+        });
+
         std::vector<double> cc1_vec, cc2_vec;
-        cc1_vec.reserve(std::min(caps1.size(), caps2.size()));
-        cc2_vec.reserve(std::min(caps1.size(), caps2.size()));
-        for (const auto& [key, c1] : caps1) {
-            auto it = caps2.find(key);
-            if (it == caps2.end()) continue;
+        cc1_vec.reserve(common_ccap_keys.size());
+        cc2_vec.reserve(common_ccap_keys.size());
+        for (uint64_t key : common_ccap_keys) {
             uint32_t id1 = static_cast<uint32_t>(key >> 32);
             uint32_t id2 = static_cast<uint32_t>(key & 0xFFFFFFFFu);
             if (id1 >= id_to_net.size() || id2 >= id_to_net.size()) continue;
             result.ccap_net1_names.push_back(id_to_net[id1]);
             result.ccap_net2_names.push_back(id_to_net[id2]);
-            cc1_vec.push_back(c1);
-            cc2_vec.push_back(it->second);
+            cc1_vec.push_back(caps1.at(key));
+            cc2_vec.push_back(caps2.at(key));
         }
 
         result.ccap_count = cc1_vec.size();
